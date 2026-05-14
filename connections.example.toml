@@ -1,0 +1,26 @@
+# Example: copy to your platform's user config dir as `connections.toml`.
+# Run `zed-ftp-mcp list-profiles` to see the exact target path.
+#   macOS:   ~/Library/Application Support/zed-ftp/connections.toml
+#   Linux:   ~/.config/zed-ftp/connections.toml
+#   Windows: %APPDATA%\zed-ftp\connections.toml
+#
+# Passwords are NOT stored here — set them with:
+#   zed-ftp-mcp set-password <profile>
+
+[profiles.staging]
+host = "ftp.example.com"
+port = 21
+user = "deploy"
+remote_root = "/var/www/staging"
+local_root = "."           # relative to cwd at agent invocation
+passive = true
+ignore = ["node_modules", "target", ".env", "*.log"]
+
+[profiles.prod]
+host = "ftp.example.com"
+port = 21
+user = "deploy"
+remote_root = "/var/www/html"
+local_root = "./dist"
+passive = true
+ignore = ["*.map", ".DS_Store"]

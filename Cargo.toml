@@ -1,0 +1,17 @@
+[workspace]
+members = ["extension", "mcp"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["bmurgic"]
+repository = "https://github.com/bmurgic/zed-ftp"
+
+# Optimize WASM extension for size
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true

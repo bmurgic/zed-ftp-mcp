@@ -1,0 +1,9 @@
+id = "zed-ftp"
+name = "Zed FTP"
+version = "0.1.0"
+schema_version = 1
+authors = ["bmurgic"]
+description = "Manage FTP connections and one-shot deploy from Zed via an MCP server."
+repository = "https://github.com/bmurgic/zed-ftp"
+
+[context_servers.zed-ftp]

@@ -1,0 +1,425 @@
+//! MCP tool definitions exposed to Zed's agent.
+//!
+//! Each tool is a thin async wrapper that loads config, then runs blocking
+//! FTP work on a tokio blocking thread (suppaftp is sync).
+
+use crate::{config::Config, deploy};
+use rmcp::handler::server::wrapper::{Json, Parameters};
+use rmcp::{tool, tool_handler, tool_router, ErrorData, ServerHandler};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone)]
+pub struct FtpServer;
+
+impl FtpServer {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+// ─── Tool argument types ─────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ProfileArg {
+    /// Connection profile name from ~/.config/zed-ftp/connections.toml
+    pub profile: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ListArgs {
+    /// Connection profile name.
+    pub profile: String,
+    /// Remote path. Defaults to the server's CWD after login if omitted.
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct UploadFileArgs {
+    pub profile: String,
+    /// Absolute or relative path to the local file to upload.
+    pub local_path: String,
+    /// Server-relative remote path (parent dirs created if missing).
+    pub remote_path: String,
+    /// If true, upload the last-committed version (git HEAD) instead of the
+    /// current working-tree content. Requires the file to be inside a git repo.
+    #[serde(default)]
+    pub before_changes: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DeleteFileArgs {
+    pub profile: String,
+    /// Server-absolute path of the file to delete (remote_root is prepended automatically).
+    pub remote_path: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DeployArgs {
+    pub profile: String,
+    /// If true, list what *would* be uploaded without sending anything.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DeployCommitsArgs {
+    pub profile: String,
+    /// One or more commit SHAs whose changed files should be uploaded.
+    pub commits: Vec<String>,
+    /// If true, list what *would* be uploaded without sending anything.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+// ─── Tool output types ───────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ProfileSummary {
+    pub name: String,
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    pub remote_root: String,
+    pub local_root: String,
+    pub password_stored: bool,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ProfilesResponse {
+    pub config_path: String,
+    pub profiles: Vec<ProfileSummary>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct TestResponse {
+    pub profile: String,
+    pub host: String,
+    pub pwd: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ListResponse {
+    pub profile: String,
+    pub path: Option<String>,
+    pub entries: Vec<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct UploadResponse {
+    pub profile: String,
+    pub local_path: String,
+    pub remote_path: String,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct DeleteResponse {
+    pub profile: String,
+    pub remote_path: String,
+}
+
+// ─── Tool implementations ────────────────────────────────────────────────────
+
+#[tool_router]
+impl FtpServer {
+    #[tool(
+        description = "List FTP connection profiles configured in \
+            ~/.config/zed-ftp/connections.toml, including whether each \
+            profile has a password stored in the OS keychain."
+    )]
+    async fn ftp_list_profiles(&self) -> Result<Json<ProfilesResponse>, ErrorData> {
+        let cfg = Config::load().map_err(internal)?;
+        let cfg_path = crate::config::path_hint();
+        let profiles = cfg
+            .profiles
+            .iter()
+            .map(|(name, p)| ProfileSummary {
+                name: name.clone(),
+                host: p.host.clone(),
+                port: p.port,
+                user: p.user.clone(),
+                remote_root: p.remote_root.clone(),
+                local_root: p.local_root.clone(),
+                password_stored: crate::config::has_password(name).unwrap_or(false),
+            })
+            .collect();
+        Ok(Json(ProfilesResponse {
+            config_path: cfg_path,
+            profiles,
+        }))
+    }
+
+    #[tool(
+        description = "Test an FTP connection profile by connecting, \
+            authenticating, and reporting the server's working directory."
+    )]
+    async fn ftp_test(
+        &self,
+        Parameters(ProfileArg { profile }): Parameters<ProfileArg>,
+    ) -> Result<Json<TestResponse>, ErrorData> {
+        let cfg = Config::load().map_err(internal)?;
+        let p = cfg
+            .profile(&profile)
+            .ok_or_else(|| invalid(format!("no profile '{profile}'")))?
+            .clone();
+        let pname = profile.clone();
+        let pwd = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+            let mut c = crate::ftp::FtpClient::connect(&pname, &p)?;
+            let pwd = c.pwd()?;
+            c.quit();
+            Ok(pwd)
+        })
+        .await
+        .map_err(internal)?
+        .map_err(internal)?;
+
+        Ok(Json(TestResponse {
+            host: cfg.profile(&profile).map(|p| p.host.clone()).unwrap_or_default(),
+            profile,
+            pwd,
+        }))
+    }
+
+    #[tool(description = "List a directory on the FTP server. \
+        path is relative to the profile's remote_root (prepended automatically). \
+        Omit path to list remote_root itself.")]
+    async fn ftp_list(
+        &self,
+        Parameters(ListArgs { profile, path }): Parameters<ListArgs>,
+    ) -> Result<Json<ListResponse>, ErrorData> {
+        let cfg = Config::load().map_err(internal)?;
+        let p = cfg
+            .profile(&profile)
+            .ok_or_else(|| invalid(format!("no profile '{profile}'")))?
+            .clone();
+        let pname = profile.clone();
+        let remote_root = p.remote_root.trim_end_matches('/').to_string();
+        let resolved_path: Option<String> = match &path {
+            Some(sub) => Some(if remote_root.is_empty() {
+                sub.clone()
+            } else {
+                format!("{remote_root}/{}", sub.trim_start_matches('/'))
+            }),
+            None => if remote_root.is_empty() { None } else { Some(remote_root) },
+        };
+        let path_for_blocking = resolved_path.clone();
+        let entries = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<String>> {
+            let mut c = crate::ftp::FtpClient::connect(&pname, &p)?;
+            let entries = c.list(path_for_blocking.as_deref())?;
+            c.quit();
+            Ok(entries)
+        })
+        .await
+        .map_err(internal)?
+        .map_err(internal)?;
+
+        Ok(Json(ListResponse {
+            profile,
+            path: resolved_path,
+            entries,
+        }))
+    }
+
+    #[tool(
+        description = "Upload a single local file to the FTP server. \
+            Parent directories are created if missing. \
+            Set before_changes=true to upload the last-committed (git HEAD) \
+            version instead of the current working-tree content."
+    )]
+    async fn ftp_upload_file(
+        &self,
+        Parameters(args): Parameters<UploadFileArgs>,
+    ) -> Result<Json<UploadResponse>, ErrorData> {
+        let cfg = Config::load().map_err(internal)?;
+        let p = cfg
+            .profile(&args.profile)
+            .ok_or_else(|| invalid(format!("no profile '{}'", args.profile)))?
+            .clone();
+        let UploadFileArgs {
+            profile,
+            local_path,
+            remote_path,
+            before_changes,
+        } = args;
+        let pname = profile.clone();
+        let remote_root = p.remote_root.trim_end_matches('/').to_string();
+        let full_remote = if remote_root.is_empty() {
+            remote_path.clone()
+        } else {
+            format!("{remote_root}/{}", remote_path.trim_start_matches('/'))
+        };
+        let local_for_blocking = local_path.clone();
+        let remote_for_blocking = full_remote.clone();
+        let bytes = tokio::task::spawn_blocking(move || -> anyhow::Result<u64> {
+            let content = if before_changes {
+                let local = std::path::Path::new(&local_for_blocking);
+                let parent = local.parent().unwrap_or(std::path::Path::new("."));
+                let root_out = std::process::Command::new("git")
+                    .args(["rev-parse", "--show-toplevel"])
+                    .current_dir(parent)
+                    .output()
+                    .map_err(|e| anyhow::anyhow!("git rev-parse: {e}"))?;
+                if !root_out.status.success() {
+                    return Err(anyhow::anyhow!(
+                        "not a git repo: {}",
+                        String::from_utf8_lossy(&root_out.stderr).trim()
+                    ));
+                }
+                let git_root = std::path::PathBuf::from(
+                    String::from_utf8_lossy(&root_out.stdout).trim(),
+                );
+                let abs = local
+                    .canonicalize()
+                    .map_err(|e| anyhow::anyhow!("canonicalize {local_for_blocking}: {e}"))?;
+                let rel = abs.strip_prefix(&git_root).map_err(|_| {
+                    anyhow::anyhow!(
+                        "file not under git root {}",
+                        git_root.display()
+                    )
+                })?;
+                let rel_str = rel.to_string_lossy();
+                let show_out = std::process::Command::new("git")
+                    .args(["show", &format!("HEAD:{rel_str}")])
+                    .current_dir(&git_root)
+                    .output()
+                    .map_err(|e| anyhow::anyhow!("git show: {e}"))?;
+                if !show_out.status.success() {
+                    return Err(anyhow::anyhow!(
+                        "git show HEAD:{rel_str} failed: {}",
+                        String::from_utf8_lossy(&show_out.stderr).trim()
+                    ));
+                }
+                show_out.stdout
+            } else {
+                std::fs::read(&local_for_blocking)
+                    .map_err(|e| anyhow::anyhow!("read {local_for_blocking}: {e}"))?
+            };
+            let mut c = crate::ftp::FtpClient::connect(&pname, &p)?;
+            let written = c.put_bytes(&remote_for_blocking, &content)?;
+            c.quit();
+            Ok(written)
+        })
+        .await
+        .map_err(internal)?
+        .map_err(internal)?;
+
+        Ok(Json(UploadResponse {
+            profile,
+            local_path,
+            remote_path: full_remote,
+            bytes,
+        }))
+    }
+
+    #[tool(
+        description = "Recursively deploy a local directory to the FTP \
+            server. Respects .gitignore and per-profile ignore patterns. \
+            Set dry_run=true to preview the file list without uploading."
+    )]
+    async fn ftp_deploy(
+        &self,
+        Parameters(DeployArgs { profile, dry_run }): Parameters<DeployArgs>,
+    ) -> Result<Json<deploy::DeployPlan>, ErrorData> {
+        let cfg = Config::load().map_err(internal)?;
+        let p = cfg
+            .profile(&profile)
+            .ok_or_else(|| invalid(format!("no profile '{profile}'")))?
+            .clone();
+        let pname = profile.clone();
+        let plan = tokio::task::spawn_blocking(move || deploy::deploy(&pname, &p, dry_run))
+            .await
+            .map_err(internal)?
+            .map_err(internal)?;
+        Ok(Json(plan))
+    }
+
+    #[tool(
+        description = "Upload only the files changed by the given commits. \
+            Each commit SHA is resolved via `git diff-tree` against its \
+            parent. Files deleted in those commits are skipped. Set \
+            dry_run=true to preview."
+    )]
+    async fn ftp_deploy_commits(
+        &self,
+        Parameters(args): Parameters<DeployCommitsArgs>,
+    ) -> Result<Json<deploy::DeployPlan>, ErrorData> {
+        let cfg = Config::load().map_err(internal)?;
+        let p = cfg
+            .profile(&args.profile)
+            .ok_or_else(|| invalid(format!("no profile '{}'", args.profile)))?
+            .clone();
+        let DeployCommitsArgs {
+            profile,
+            commits,
+            dry_run,
+        } = args;
+        let result = tokio::task::spawn_blocking(move || {
+            deploy::deploy_commits(&profile, &p, &commits, dry_run)
+        })
+        .await
+        .map_err(internal)?;
+
+        match result {
+            Ok(plan) => Ok(Json(plan)),
+            Err(deploy::DeployCommitsError::InvalidArgs(m)) => Err(invalid(m)),
+            Err(deploy::DeployCommitsError::Other(e)) => Err(internal(e)),
+        }
+    }
+
+    #[tool(
+        description = "Delete a single file from the FTP server. \
+            The profile's remote_root is prepended to remote_path, \
+            matching the behavior of ftp_deploy."
+    )]
+    async fn ftp_delete_file(
+        &self,
+        Parameters(args): Parameters<DeleteFileArgs>,
+    ) -> Result<Json<DeleteResponse>, ErrorData> {
+        let cfg = Config::load().map_err(internal)?;
+        let p = cfg
+            .profile(&args.profile)
+            .ok_or_else(|| invalid(format!("no profile '{}'", args.profile)))?
+            .clone();
+        let DeleteFileArgs {
+            profile,
+            remote_path,
+        } = args;
+        let pname = profile.clone();
+        let remote_root = p.remote_root.trim_end_matches('/').to_string();
+        let full_path = if remote_root.is_empty() {
+            remote_path.clone()
+        } else {
+            format!("{remote_root}/{}", remote_path.trim_start_matches('/'))
+        };
+        let full_path_blocking = full_path.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let mut c = crate::ftp::FtpClient::connect(&pname, &p)?;
+            c.delete(&full_path_blocking)?;
+            c.quit();
+            Ok(())
+        })
+        .await
+        .map_err(internal)?
+        .map_err(internal)?;
+
+        Ok(Json(DeleteResponse {
+            profile,
+            remote_path: full_path,
+        }))
+    }
+}
+
+#[tool_handler]
+impl ServerHandler for FtpServer {}
+
+// ─── Error helpers ───────────────────────────────────────────────────────────
+
+fn internal<E: std::fmt::Display>(e: E) -> ErrorData {
+    ErrorData::internal_error(e.to_string(), None)
+}
+
+fn invalid(msg: impl Into<String>) -> ErrorData {
+    ErrorData::invalid_params(msg.into(), None)
+}
