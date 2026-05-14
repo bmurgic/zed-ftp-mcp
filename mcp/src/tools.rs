@@ -49,6 +49,28 @@ pub struct UploadFileArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct DownloadFileArgs {
+    pub profile: String,
+    /// Remote path of the file to download (remote_root prepended automatically).
+    pub remote_path: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct MkdirArgs {
+    pub profile: String,
+    /// Remote path of the directory to create (remote_root prepended automatically).
+    pub remote_path: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DeleteDirArgs {
+    pub profile: String,
+    /// Remote path of the directory to delete (remote_root prepended automatically).
+    /// The directory must be empty.
+    pub remote_path: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct DeleteFileArgs {
     pub profile: String,
     /// Server-absolute path of the file to delete (remote_root is prepended automatically).
@@ -83,6 +105,8 @@ pub struct ProfileSummary {
     pub user: String,
     pub remote_root: String,
     pub local_root: String,
+    pub tls: bool,
+    pub accept_invalid_certs: bool,
     pub password_stored: bool,
 }
 
@@ -115,6 +139,22 @@ pub struct UploadResponse {
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
+pub struct DownloadResponse {
+    pub profile: String,
+    pub remote_path: String,
+    /// File contents as a UTF-8 string. Binary files are base64-encoded.
+    pub content: String,
+    pub encoding: String,
+    pub bytes: usize,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct MkdirResponse {
+    pub profile: String,
+    pub remote_path: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
 pub struct DeleteResponse {
     pub profile: String,
     pub remote_path: String,
@@ -142,6 +182,8 @@ impl FtpServer {
                 user: p.user.clone(),
                 remote_root: p.remote_root.clone(),
                 local_root: p.local_root.clone(),
+                tls: p.tls,
+                accept_invalid_certs: p.accept_invalid_certs,
                 password_stored: crate::config::has_password(name).unwrap_or(false),
             })
             .collect();
@@ -369,6 +411,118 @@ impl FtpServer {
     }
 
     #[tool(
+        description = "Download a file from the FTP server and return its contents. \
+            UTF-8 text is returned as-is; binary files are base64-encoded. \
+            remote_root is prepended automatically."
+    )]
+    async fn ftp_download_file(
+        &self,
+        Parameters(args): Parameters<DownloadFileArgs>,
+    ) -> Result<Json<DownloadResponse>, ErrorData> {
+        let cfg = Config::load().map_err(internal)?;
+        let p = cfg
+            .profile(&args.profile)
+            .ok_or_else(|| invalid(format!("no profile '{}'", args.profile)))?
+            .clone();
+        let DownloadFileArgs { profile, remote_path } = args;
+        let pname = profile.clone();
+        let remote_root = p.remote_root.trim_end_matches('/').to_string();
+        let full_path = if remote_root.is_empty() {
+            remote_path.clone()
+        } else {
+            format!("{remote_root}/{}", remote_path.trim_start_matches('/'))
+        };
+        let full_path_blocking = full_path.clone();
+        let raw = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
+            let mut c = crate::ftp::FtpClient::connect(&pname, &p)?;
+            let bytes = c.get_bytes(&full_path_blocking)?;
+            c.quit();
+            Ok(bytes)
+        })
+        .await
+        .map_err(internal)?
+        .map_err(internal)?;
+
+        let bytes = raw.len();
+        let (content, encoding) = match std::str::from_utf8(&raw) {
+            Ok(s) => (s.to_string(), "utf-8".to_string()),
+            Err(_) => (use_base64(&raw), "base64".to_string()),
+        };
+        Ok(Json(DownloadResponse { profile, remote_path: full_path, content, encoding, bytes }))
+    }
+
+    #[tool(
+        description = "Create a directory (and any missing parents) on the FTP server. \
+            remote_root is prepended automatically."
+    )]
+    async fn ftp_mkdir(
+        &self,
+        Parameters(args): Parameters<MkdirArgs>,
+    ) -> Result<Json<MkdirResponse>, ErrorData> {
+        let cfg = Config::load().map_err(internal)?;
+        let p = cfg
+            .profile(&args.profile)
+            .ok_or_else(|| invalid(format!("no profile '{}'", args.profile)))?
+            .clone();
+        let MkdirArgs { profile, remote_path } = args;
+        let pname = profile.clone();
+        let remote_root = p.remote_root.trim_end_matches('/').to_string();
+        let full_path = if remote_root.is_empty() {
+            remote_path.clone()
+        } else {
+            format!("{remote_root}/{}", remote_path.trim_start_matches('/'))
+        };
+        let full_path_blocking = full_path.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let mut c = crate::ftp::FtpClient::connect(&pname, &p)?;
+            c.mkdir_p(&full_path_blocking)?;
+            c.quit();
+            Ok(())
+        })
+        .await
+        .map_err(internal)?
+        .map_err(internal)?;
+
+        Ok(Json(MkdirResponse { profile, remote_path: full_path }))
+    }
+
+    #[tool(
+        description = "Delete a directory from the FTP server. \
+            The directory must be empty. \
+            remote_root is prepended automatically."
+    )]
+    async fn ftp_delete_dir(
+        &self,
+        Parameters(args): Parameters<DeleteDirArgs>,
+    ) -> Result<Json<DeleteResponse>, ErrorData> {
+        let cfg = Config::load().map_err(internal)?;
+        let p = cfg
+            .profile(&args.profile)
+            .ok_or_else(|| invalid(format!("no profile '{}'", args.profile)))?
+            .clone();
+        let DeleteDirArgs { profile, remote_path } = args;
+        let pname = profile.clone();
+        let remote_root = p.remote_root.trim_end_matches('/').to_string();
+        let full_path = if remote_root.is_empty() {
+            remote_path.clone()
+        } else {
+            format!("{remote_root}/{}", remote_path.trim_start_matches('/'))
+        };
+        let full_path_blocking = full_path.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let mut c = crate::ftp::FtpClient::connect(&pname, &p)?;
+            c.rmdir(&full_path_blocking)?;
+            c.quit();
+            Ok(())
+        })
+        .await
+        .map_err(internal)?
+        .map_err(internal)?;
+
+        Ok(Json(DeleteResponse { profile, remote_path: full_path }))
+    }
+
+    #[tool(
         description = "Delete a single file from the FTP server. \
             The profile's remote_root is prepended to remote_path, \
             matching the behavior of ftp_deploy."
@@ -422,4 +576,20 @@ fn internal<E: std::fmt::Display>(e: E) -> ErrorData {
 
 fn invalid(msg: impl Into<String>) -> ErrorData {
     ErrorData::invalid_params(msg.into(), None)
+}
+
+fn use_base64(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as usize;
+        let b1 = if chunk.len() > 1 { chunk[1] as usize } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as usize } else { 0 };
+        let _ = write!(out, "{}", TABLE[b0 >> 2] as char);
+        let _ = write!(out, "{}", TABLE[((b0 & 3) << 4) | (b1 >> 4)] as char);
+        let _ = write!(out, "{}", if chunk.len() > 1 { TABLE[((b1 & 0xf) << 2) | (b2 >> 6)] as char } else { '=' });
+        let _ = write!(out, "{}", if chunk.len() > 2 { TABLE[b2 & 0x3f] as char } else { '=' });
+    }
+    out
 }

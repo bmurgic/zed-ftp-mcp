@@ -32,6 +32,13 @@ pub struct Profile {
     pub local_root: String,
     #[serde(default = "default_passive")]
     pub passive: bool,
+    /// Use explicit FTPS (STARTTLS). Requires the server to support AUTH TLS.
+    #[serde(default)]
+    pub tls: bool,
+    /// Skip TLS certificate verification. Only use for self-signed certs on
+    /// trusted private servers.
+    #[serde(default)]
+    pub accept_invalid_certs: bool,
     /// Glob patterns to skip during deploy. `.gitignore` is always honored.
     #[serde(default)]
     pub ignore: Vec<String>,

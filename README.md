@@ -92,11 +92,14 @@ Or just call the tools directly without the agent doing any reasoning:
 | --- | --- |
 | `ftp_list_profiles` | Enumerate profiles + show which have a stored password |
 | `ftp_test` | Connect, log in, return PWD, disconnect |
-| `ftp_list` | List a remote directory (path is relative to `remote_root`) |
+| `ftp_list` | List a remote directory (relative to `remote_root`) |
+| `ftp_download_file` | Download a remote file; returns UTF-8 text or base64 for binary |
 | `ftp_upload_file` | Upload one local file; `before_changes=true` uploads the last-committed (git HEAD) version instead of the working tree |
 | `ftp_deploy` | Recursive upload of the full local project, gitignore-aware, optional `dry_run` |
 | `ftp_deploy_commits` | Upload only the files changed by specific commit SHAs, optional `dry_run` |
-| `ftp_delete_file` | Delete a single remote file (`remote_root` prepended automatically) |
+| `ftp_mkdir` | Create a directory and any missing parents |
+| `ftp_delete_file` | Delete a single remote file |
+| `ftp_delete_dir` | Delete an empty remote directory |
 
 ## Limitations / scope
 
