@@ -8,6 +8,7 @@
 mod config;
 mod deploy;
 mod ftp;
+mod schema;
 mod tools;
 
 use anyhow::{Context, Result};

@@ -101,6 +101,7 @@ pub struct DeployCommitsArgs {
 pub struct ProfileSummary {
     pub name: String,
     pub host: String,
+    #[schemars(transform = crate::schema::remove_unsigned_integer_format)]
     pub port: u16,
     pub user: String,
     pub remote_root: String,
@@ -135,6 +136,7 @@ pub struct UploadResponse {
     pub profile: String,
     pub local_path: String,
     pub remote_path: String,
+    #[schemars(transform = crate::schema::remove_unsigned_integer_format)]
     pub bytes: u64,
 }
 
@@ -145,6 +147,7 @@ pub struct DownloadResponse {
     /// File contents as a UTF-8 string. Binary files are base64-encoded.
     pub content: String,
     pub encoding: String,
+    #[schemars(transform = crate::schema::remove_unsigned_integer_format)]
     pub bytes: usize,
 }
 

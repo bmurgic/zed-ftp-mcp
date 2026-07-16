@@ -26,8 +26,11 @@ pub struct DeployPlan {
     pub local_root: String,
     pub remote_root: String,
     pub dry_run: bool,
+    #[schemars(transform = crate::schema::remove_unsigned_integer_format)]
     pub files_uploaded: usize,
+    #[schemars(transform = crate::schema::remove_unsigned_integer_format)]
     pub bytes_uploaded: u64,
+    #[schemars(transform = crate::schema::remove_unsigned_integer_format)]
     pub directories_created: usize,
     pub skipped: Vec<String>,
     pub uploaded: Vec<UploadedFile>,
@@ -37,6 +40,7 @@ pub struct DeployPlan {
 pub struct UploadedFile {
     pub local: String,
     pub remote: String,
+    #[schemars(transform = crate::schema::remove_unsigned_integer_format)]
     pub bytes: u64,
 }
 
