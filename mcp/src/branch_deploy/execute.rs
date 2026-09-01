@@ -70,6 +70,7 @@ pub fn execute_deploy<R: BranchRemote, B: BlobSource>(
             remote_path: upload.remote_path.clone(),
             object_id: upload.object_id.clone(),
             bytes: upload.bytes,
+            remote_bytes_read: None,
             upload_status: UploadStatus::Planned,
             verification_status: if verify {
                 VerificationStatus::Planned
@@ -137,16 +138,18 @@ pub fn execute_deploy<R: BranchRemote, B: BlobSource>(
         }
 
         match remote.compare_remote_bytes(&upload.remote_path, &bytes) {
-            Ok(comparison) if comparison.matches => {
-                result.verification_status = VerificationStatus::Verified;
-            }
-            Ok(_) => {
-                result.verification_status = VerificationStatus::Mismatch;
-                failures.push(FailureRecord {
-                    stage: "verification".to_string(),
-                    git_path: Some(upload.git_path.clone()),
-                    error: "remote bytes do not match the committed blob".to_string(),
-                });
+            Ok(comparison) => {
+                result.remote_bytes_read = Some(comparison.bytes_read);
+                if comparison.matches {
+                    result.verification_status = VerificationStatus::Verified;
+                } else {
+                    result.verification_status = VerificationStatus::Mismatch;
+                    failures.push(FailureRecord {
+                        stage: "verification".to_string(),
+                        git_path: Some(upload.git_path.clone()),
+                        error: "remote bytes do not match the committed blob".to_string(),
+                    });
+                }
             }
             Err(error) => {
                 result.verification_status = VerificationStatus::Failed;

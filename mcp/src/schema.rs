@@ -145,6 +145,12 @@ mod tests {
                 None,
             );
         }
+
+        assert_optional_integer_schema(
+            &manifest_schema,
+            "/$defs/UploadResult/properties/remote_bytes_read",
+            "/$defs/UploadResult/required",
+        );
     }
 
     fn schema<T: JsonSchema>() -> Value {
@@ -184,5 +190,27 @@ mod tests {
         if let Some(maximum) = maximum {
             assert_eq!(property.get("maximum"), Some(&json!(maximum)));
         }
+    }
+
+    fn assert_optional_integer_schema(schema: &Value, pointer: &str, required_pointer: &str) {
+        let property = schema
+            .pointer(pointer)
+            .unwrap_or_else(|| panic!("missing schema property at {pointer}"));
+        let types = property
+            .get("type")
+            .and_then(Value::as_array)
+            .expect("optional integer should permit integer and null");
+
+        assert!(types.contains(&json!("integer")));
+        assert!(types.contains(&json!("null")));
+        assert_eq!(property.get("minimum"), Some(&json!(0)));
+        assert_eq!(property.get("format"), None);
+        assert!(
+            !schema
+                .pointer(required_pointer)
+                .and_then(Value::as_array)
+                .is_some_and(|required| required.contains(&json!("remote_bytes_read"))),
+            "remote byte count should remain optional"
+        );
     }
 }

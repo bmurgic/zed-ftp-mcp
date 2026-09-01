@@ -107,6 +107,9 @@ pub struct UploadResult {
     pub object_id: String,
     #[schemars(transform = crate::schema::remove_unsigned_integer_format)]
     pub bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = crate::schema::remove_unsigned_integer_format)]
+    pub remote_bytes_read: Option<u64>,
     pub upload_status: UploadStatus,
     pub verification_status: VerificationStatus,
 }
@@ -235,6 +238,7 @@ pub fn dry_run_manifest(plan: BranchDeployPlan, verify: bool) -> BranchDeployMan
             remote_path: upload.remote_path,
             object_id: upload.object_id,
             bytes: upload.bytes,
+            remote_bytes_read: None,
             upload_status: UploadStatus::Planned,
             verification_status: if verify {
                 VerificationStatus::Planned
@@ -281,6 +285,7 @@ fn connection_failure_manifest(
             remote_path: upload.remote_path.clone(),
             object_id: upload.object_id.clone(),
             bytes: upload.bytes,
+            remote_bytes_read: None,
             upload_status: UploadStatus::NotAttempted,
             verification_status: if verify {
                 VerificationStatus::NotAttempted

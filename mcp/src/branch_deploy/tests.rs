@@ -28,6 +28,7 @@ struct TestRemote {
     calls: Vec<RemoteCall>,
     failures: std::collections::BTreeMap<usize, RemoteFailure>,
     mismatches: std::collections::BTreeSet<String>,
+    comparison_bytes_read: std::collections::BTreeMap<String, u64>,
 }
 
 impl TestRemote {
@@ -62,11 +63,16 @@ impl BranchRemote for TestRemote {
         expected: &[u8],
     ) -> Result<RemoteComparison, RemoteFailure> {
         let matches = !self.mismatches.contains(path);
+        let bytes_read = self
+            .comparison_bytes_read
+            .get(path)
+            .copied()
+            .unwrap_or(expected.len() as u64);
         self.record(
             RemoteCall::Compare(path.to_string(), expected.to_vec()),
             RemoteComparison {
                 matches,
-                bytes_read: expected.len() as u64,
+                bytes_read,
             },
         )
     }
@@ -331,6 +337,80 @@ fn executor_verification_mismatch_drains_and_fails_manifest() {
     );
     assert_eq!(manifest.failures[0].stage, "verification");
     assert_eq!(manifest.counts.verified, 1);
+}
+
+#[test]
+fn executor_records_measured_remote_bytes_for_verified_and_mismatched_uploads() {
+    let mut remote = TestRemote {
+        comparison_bytes_read: std::collections::BTreeMap::from([
+            ("/remote/a.bin".to_string(), 11),
+            ("/remote/nested/b.bin".to_string(), 13),
+        ]),
+        mismatches: std::collections::BTreeSet::from(["/remote/a.bin".to_string()]),
+        ..TestRemote::default()
+    };
+    let mut blobs = executor_blobs();
+
+    let manifest = execute_deploy(executor_plan(), true, &mut blobs, &mut remote);
+    let serialized = serde_json::to_value(manifest).expect("manifest should serialize");
+
+    assert_eq!(
+        serialized.pointer("/uploads/0/remote_bytes_read"),
+        Some(&json!(11))
+    );
+    assert_eq!(
+        serialized.pointer("/uploads/1/remote_bytes_read"),
+        Some(&json!(13))
+    );
+}
+
+#[test]
+fn executor_omits_remote_bytes_without_a_completed_comparison() {
+    let mut remote = TestRemote::default();
+    let mut blobs = executor_blobs();
+    let verification_disabled = execute_deploy(executor_plan(), false, &mut blobs, &mut remote);
+    let planned = dry_run_manifest(executor_plan(), true);
+
+    let mut failed_comparison_remote = TestRemote {
+        failures: std::collections::BTreeMap::from([(4, RemoteFailure::operation("RETR refused"))]),
+        ..TestRemote::default()
+    };
+    let mut failed_comparison_blobs = executor_blobs();
+    let comparison_failed = execute_deploy(
+        executor_plan(),
+        true,
+        &mut failed_comparison_blobs,
+        &mut failed_comparison_remote,
+    );
+    let mut not_attempted_remote = TestRemote {
+        failures: std::collections::BTreeMap::from([(
+            2,
+            RemoteFailure::connection_lost("MKD connection lost"),
+        )]),
+        ..TestRemote::default()
+    };
+    let mut not_attempted_blobs = executor_blobs();
+    let not_attempted = execute_deploy(
+        executor_plan(),
+        true,
+        &mut not_attempted_blobs,
+        &mut not_attempted_remote,
+    );
+
+    for (manifest, upload_index) in [
+        (verification_disabled, 0),
+        (planned, 0),
+        (comparison_failed, 0),
+        (not_attempted, 1),
+    ] {
+        let serialized = serde_json::to_value(manifest).expect("manifest should serialize");
+        assert!(
+            serialized
+                .pointer(&format!("/uploads/{upload_index}/remote_bytes_read"))
+                .is_none(),
+            "remote byte count should be absent before comparison completes"
+        );
+    }
 }
 
 #[test]

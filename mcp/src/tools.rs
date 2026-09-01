@@ -705,7 +705,9 @@ fn use_base64(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{branch_deploy_error, branch_deploy_manifest_output, DeployBranchArgs};
-    use crate::branch_deploy::{dry_run_manifest, BranchDeployError, BranchDeployPlan};
+    use crate::branch_deploy::{
+        dry_run_manifest, BranchDeployError, BranchDeployPlan, PlannedUpload,
+    };
     use rmcp::model::ErrorCode;
 
     #[test]
@@ -735,5 +737,42 @@ mod tests {
         let response = branch_deploy_manifest_output(manifest);
 
         assert!(!response.0.success);
+    }
+
+    #[test]
+    fn deploy_branch_contract_mcp_omits_unmeasured_remote_bytes() {
+        let mut plan = BranchDeployPlan::empty("staging", "/repo");
+        plan.uploads.push(PlannedUpload {
+            git_path: "app.bin".to_string(),
+            remote_path: "/remote/app.bin".to_string(),
+            object_id: "object".to_string(),
+            bytes: 4,
+        });
+        let manifest = dry_run_manifest(plan, true);
+        let response = branch_deploy_manifest_output(manifest);
+        let value = serde_json::to_value(response.0).expect("MCP manifest should serialize");
+
+        assert!(value.pointer("/uploads/0/remote_bytes_read").is_none());
+    }
+
+    #[test]
+    fn deploy_branch_contract_mcp_serializes_measured_remote_bytes() {
+        let mut plan = BranchDeployPlan::empty("staging", "/repo");
+        plan.uploads.push(PlannedUpload {
+            git_path: "app.bin".to_string(),
+            remote_path: "/remote/app.bin".to_string(),
+            object_id: "object".to_string(),
+            bytes: 4,
+        });
+        let mut manifest = dry_run_manifest(plan, true);
+        manifest.uploads[0].remote_bytes_read = Some(11);
+
+        let value = serde_json::to_value(branch_deploy_manifest_output(manifest).0)
+            .expect("MCP manifest should serialize");
+
+        assert_eq!(
+            value.pointer("/uploads/0/remote_bytes_read"),
+            Some(&serde_json::json!(11))
+        );
     }
 }
