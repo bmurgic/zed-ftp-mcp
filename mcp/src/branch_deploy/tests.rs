@@ -1,7 +1,9 @@
 use super::git::null_device_for_platform;
+use super::git::BatchBlobReader;
 use super::{
-    deploy_branch, deploy_branch_with_handoff, dry_run_manifest, map_remote_path, plan_branch,
-    BranchDeployError, BranchDeployPlan, DeletedPathStatus, DeployBranchRequest, UploadStatus,
+    deploy_branch, deploy_branch_with_handoff, dry_run_manifest, execute_deploy, map_remote_path,
+    plan_branch, BlobSource, BranchDeployError, BranchDeployPlan, BranchRemote, DeletedPathStatus,
+    DeployBranchRequest, PlannedUpload, RemoteComparison, RemoteFailure, UploadStatus,
     VerificationStatus,
 };
 use crate::config::Profile;
@@ -10,6 +12,307 @@ use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
 use tempfile::TempDir;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RemoteCall {
+    Binary,
+    Mkdir(String),
+    Upload(String, Vec<u8>),
+    Compare(String, Vec<u8>),
+    #[allow(dead_code)]
+    Delete(String),
+}
+
+#[derive(Default)]
+struct TestRemote {
+    calls: Vec<RemoteCall>,
+    failures: std::collections::BTreeMap<usize, RemoteFailure>,
+    mismatches: std::collections::BTreeSet<String>,
+}
+
+impl TestRemote {
+    fn record<T>(&mut self, call: RemoteCall, success: T) -> Result<T, RemoteFailure> {
+        self.calls.push(call);
+        self.failures
+            .get(&self.calls.len())
+            .cloned()
+            .map_or(Ok(success), Err)
+    }
+}
+
+impl BranchRemote for TestRemote {
+    fn set_binary_mode(&mut self) -> Result<(), RemoteFailure> {
+        self.record(RemoteCall::Binary, ())
+    }
+
+    fn mkdir_p(&mut self, path: &str) -> Result<(), RemoteFailure> {
+        self.record(RemoteCall::Mkdir(path.to_string()), ())
+    }
+
+    fn upload_bytes(&mut self, path: &str, bytes: &[u8]) -> Result<u64, RemoteFailure> {
+        self.record(
+            RemoteCall::Upload(path.to_string(), bytes.to_vec()),
+            bytes.len() as u64,
+        )
+    }
+
+    fn compare_remote_bytes(
+        &mut self,
+        path: &str,
+        expected: &[u8],
+    ) -> Result<RemoteComparison, RemoteFailure> {
+        let matches = !self.mismatches.contains(path);
+        self.record(
+            RemoteCall::Compare(path.to_string(), expected.to_vec()),
+            RemoteComparison {
+                matches,
+                bytes_read: expected.len() as u64,
+            },
+        )
+    }
+
+    fn delete_file(&mut self, path: &str) -> Result<(), RemoteFailure> {
+        self.record(RemoteCall::Delete(path.to_string()), ())
+    }
+}
+
+#[derive(Default)]
+struct TestBlobs {
+    blobs: std::collections::BTreeMap<String, Vec<u8>>,
+    reads: Vec<String>,
+}
+
+impl BlobSource for TestBlobs {
+    fn read_blob(&mut self, object_id: &str) -> Result<Vec<u8>, BranchDeployError> {
+        self.reads.push(object_id.to_string());
+        self.blobs.get(object_id).cloned().ok_or_else(|| {
+            BranchDeployError::Other(anyhow::anyhow!("missing test blob {object_id}"))
+        })
+    }
+}
+
+fn executor_plan() -> BranchDeployPlan {
+    let mut plan = BranchDeployPlan::empty("staging", "/repo");
+    plan.uploads = vec![
+        PlannedUpload {
+            git_path: "a.bin".to_string(),
+            remote_path: "/remote/a.bin".to_string(),
+            object_id: "a".to_string(),
+            bytes: 4,
+        },
+        PlannedUpload {
+            git_path: "nested/b.bin".to_string(),
+            remote_path: "/remote/nested/b.bin".to_string(),
+            object_id: "b".to_string(),
+            bytes: 3,
+        },
+    ];
+    plan.touched_paths = plan.uploads.len();
+    plan
+}
+
+fn executor_blobs() -> TestBlobs {
+    TestBlobs {
+        blobs: std::collections::BTreeMap::from([
+            ("a".to_string(), vec![0, b'\r', b'\n', 0xff]),
+            ("b".to_string(), vec![0x80, 1, 2]),
+        ]),
+        ..TestBlobs::default()
+    }
+}
+
+#[test]
+fn executor_uploads_binary_bytes_in_git_path_order_and_verifies_immediately() {
+    let mut remote = TestRemote::default();
+    let mut blobs = executor_blobs();
+
+    let manifest = execute_deploy(executor_plan(), true, &mut blobs, &mut remote);
+
+    assert!(manifest.success);
+    assert_eq!(blobs.reads, vec!["a", "b"]);
+    assert_eq!(
+        remote.calls,
+        vec![
+            RemoteCall::Binary,
+            RemoteCall::Mkdir("/remote".to_string()),
+            RemoteCall::Upload("/remote/a.bin".to_string(), vec![0, b'\r', b'\n', 0xff]),
+            RemoteCall::Compare("/remote/a.bin".to_string(), vec![0, b'\r', b'\n', 0xff]),
+            RemoteCall::Mkdir("/remote/nested".to_string()),
+            RemoteCall::Upload("/remote/nested/b.bin".to_string(), vec![0x80, 1, 2]),
+            RemoteCall::Compare("/remote/nested/b.bin".to_string(), vec![0x80, 1, 2]),
+        ]
+    );
+    assert_eq!(manifest.counts.uploaded, 2);
+    assert_eq!(manifest.counts.verified, 2);
+    assert!(manifest
+        .uploads
+        .iter()
+        .all(|upload| upload.verification_status == VerificationStatus::Verified));
+}
+
+#[test]
+fn executor_skips_comparison_only_when_disabled() {
+    let mut remote = TestRemote::default();
+    let mut blobs = executor_blobs();
+
+    let manifest = execute_deploy(executor_plan(), false, &mut blobs, &mut remote);
+
+    assert!(manifest.success);
+    assert!(remote
+        .calls
+        .iter()
+        .all(|call| !matches!(call, RemoteCall::Compare(_, _))));
+    assert!(manifest
+        .uploads
+        .iter()
+        .all(|upload| upload.verification_status == VerificationStatus::NotRequested));
+}
+
+#[test]
+fn executor_batch_blob_reader_returns_exact_committed_bytes() {
+    let repository = TestRepo::new();
+    let expected = [0, b'\r', b'\n', 0xff, 0x80];
+    repository.write("binary.bin", &expected);
+    repository.commit("binary fixture");
+    let object_id = repository.rev_parse("HEAD:binary.bin");
+    let mut blobs = BatchBlobReader::new(repository.path()).expect("batch reader should start");
+
+    let actual = blobs
+        .read_blob(&object_id)
+        .expect("batch reader should return the committed blob");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn executor_operation_upload_failure_continues() {
+    let mut remote = TestRemote {
+        failures: std::collections::BTreeMap::from([(
+            3,
+            RemoteFailure::operation("upload refused"),
+        )]),
+        ..TestRemote::default()
+    };
+    let mut blobs = executor_blobs();
+
+    let manifest = execute_deploy(executor_plan(), true, &mut blobs, &mut remote);
+
+    assert!(!manifest.success);
+    assert_eq!(manifest.uploads[0].upload_status, UploadStatus::Failed);
+    assert_eq!(
+        manifest.uploads[0].verification_status,
+        VerificationStatus::NotAttempted
+    );
+    assert_eq!(manifest.uploads[1].upload_status, UploadStatus::Uploaded);
+    assert_eq!(
+        manifest.uploads[1].verification_status,
+        VerificationStatus::Verified
+    );
+    assert_eq!(manifest.failures[0].stage, "upload");
+    assert_eq!(manifest.failures[0].git_path.as_deref(), Some("a.bin"));
+    assert_eq!(manifest.counts.uploaded, 1);
+    assert_eq!(manifest.counts.verified, 1);
+}
+
+#[test]
+fn executor_operation_compare_failure_continues() {
+    let mut remote = TestRemote {
+        failures: std::collections::BTreeMap::from([(4, RemoteFailure::operation("RETR refused"))]),
+        ..TestRemote::default()
+    };
+    let mut blobs = executor_blobs();
+
+    let manifest = execute_deploy(executor_plan(), true, &mut blobs, &mut remote);
+
+    assert!(!manifest.success);
+    assert_eq!(manifest.uploads[0].upload_status, UploadStatus::Uploaded);
+    assert_eq!(
+        manifest.uploads[0].verification_status,
+        VerificationStatus::Failed
+    );
+    assert_eq!(
+        manifest.uploads[1].verification_status,
+        VerificationStatus::Verified
+    );
+    assert_eq!(manifest.failures[0].stage, "verification");
+    assert_eq!(manifest.counts.uploaded, 2);
+    assert_eq!(manifest.counts.verified, 1);
+}
+
+#[test]
+fn executor_verification_mismatch_drains_and_fails_manifest() {
+    let mut remote = TestRemote {
+        mismatches: std::collections::BTreeSet::from(["/remote/a.bin".to_string()]),
+        ..TestRemote::default()
+    };
+    let mut blobs = executor_blobs();
+
+    let manifest = execute_deploy(executor_plan(), true, &mut blobs, &mut remote);
+
+    assert!(!manifest.success);
+    assert_eq!(
+        manifest.uploads[0].verification_status,
+        VerificationStatus::Mismatch
+    );
+    assert_eq!(
+        manifest.uploads[1].verification_status,
+        VerificationStatus::Verified
+    );
+    assert_eq!(manifest.failures[0].stage, "verification");
+    assert_eq!(manifest.counts.verified, 1);
+}
+
+#[test]
+fn executor_connection_loss_marks_remaining_not_attempted() {
+    let mut remote = TestRemote {
+        failures: std::collections::BTreeMap::from([(
+            3,
+            RemoteFailure::connection_lost("FTP connection lost"),
+        )]),
+        ..TestRemote::default()
+    };
+    let mut blobs = executor_blobs();
+
+    let manifest = execute_deploy(executor_plan(), true, &mut blobs, &mut remote);
+
+    assert!(!manifest.success);
+    assert_eq!(manifest.uploads[0].upload_status, UploadStatus::Failed);
+    assert_eq!(
+        manifest.uploads[1].upload_status,
+        UploadStatus::NotAttempted
+    );
+    assert_eq!(
+        manifest.uploads[1].verification_status,
+        VerificationStatus::NotAttempted
+    );
+    assert_eq!(manifest.failures[0].stage, "upload");
+    assert_eq!(manifest.counts.uploaded, 0);
+    assert_eq!(manifest.counts.verified, 0);
+}
+
+#[test]
+fn executor_never_reconnects_after_connection_loss() {
+    let mut remote = TestRemote {
+        failures: std::collections::BTreeMap::from([(
+            4,
+            RemoteFailure::connection_lost("RETR connection lost"),
+        )]),
+        ..TestRemote::default()
+    };
+    let mut blobs = executor_blobs();
+
+    let _manifest = execute_deploy(executor_plan(), true, &mut blobs, &mut remote);
+
+    assert_eq!(
+        remote.calls,
+        vec![
+            RemoteCall::Binary,
+            RemoteCall::Mkdir("/remote".to_string()),
+            RemoteCall::Upload("/remote/a.bin".to_string(), vec![0, b'\r', b'\n', 0xff]),
+            RemoteCall::Compare("/remote/a.bin".to_string(), vec![0, b'\r', b'\n', 0xff]),
+        ]
+    );
+}
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -450,9 +753,14 @@ fn dry_run_reads_metadata_only() {
     assert_eq!(effects.remote_factory_calls(), 1);
     assert_eq!(effects.remote_method_calls(), 1);
 
-    let public_error = deploy_branch(&actual_request, &profile)
-        .expect_err("public execution should remain unavailable until Slice 2");
-    assert!(public_error.to_string().contains("not available"));
+    let public_manifest = deploy_branch(&actual_request, &profile)
+        .expect("connection failures should return an unsuccessful execution manifest");
+    assert!(!public_manifest.success);
+    assert_eq!(public_manifest.failures[0].stage, "connect");
+    assert_eq!(
+        public_manifest.uploads[0].upload_status,
+        UploadStatus::NotAttempted
+    );
 }
 
 #[cfg(unix)]

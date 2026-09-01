@@ -155,15 +155,30 @@ fn deploy_branch_command(request: branch_deploy::DeployBranchRequest) -> Result<
     let manifest = branch_deploy::deploy_branch(&request, profile)?;
     let stdout = std::io::stdout();
     let mut output = stdout.lock();
-    serde_json::to_writer_pretty(&mut output, &manifest)?;
-    use std::io::Write;
+    write_branch_manifest(&mut output, &manifest)?;
+    branch_execution_exit(manifest.success)
+}
+
+fn write_branch_manifest(
+    output: &mut impl std::io::Write,
+    manifest: &branch_deploy::BranchDeployManifest,
+) -> Result<()> {
+    serde_json::to_writer_pretty(&mut *output, manifest)?;
     writeln!(output)?;
     Ok(())
 }
 
+fn branch_execution_exit(success: bool) -> Result<()> {
+    if success {
+        Ok(())
+    } else {
+        anyhow::bail!("branch deployment completed unsuccessfully")
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Cmd};
+    use super::{branch_execution_exit, Cli, Cmd};
     use clap::Parser;
 
     #[test]
@@ -197,5 +212,11 @@ mod tests {
         assert_eq!(head_ref, "HEAD");
         assert!(verify);
         assert!(dry_run);
+    }
+
+    #[test]
+    fn deploy_branch_execution_contract_cli_exits_nonzero_for_unsuccessful_manifest() {
+        assert!(branch_execution_exit(true).is_ok());
+        assert!(branch_execution_exit(false).is_err());
     }
 }

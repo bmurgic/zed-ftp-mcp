@@ -2,7 +2,13 @@ use crate::config::Profile;
 use schemars::JsonSchema;
 use serde::Serialize;
 
+mod execute;
 mod git;
+
+pub use execute::{
+    execute_deploy, BlobSource, BranchRemote, RemoteComparison, RemoteFailure, RemoteFailureKind,
+};
+use git::BatchBlobReader;
 
 #[derive(Debug, Clone)]
 pub struct DeployBranchRequest {
@@ -188,9 +194,22 @@ pub fn deploy_branch(
     request: &DeployBranchRequest,
     profile: &Profile,
 ) -> Result<BranchDeployManifest, BranchDeployError> {
-    deploy_branch_with_handoff(request, profile, unavailable_branch_execution)
+    let plan = plan_branch(request, profile)?;
+    if request.dry_run {
+        return Ok(dry_run_manifest(plan, request.verify));
+    }
+
+    let mut blobs = BatchBlobReader::new(std::path::Path::new(&plan.repository.root))?;
+    let mut remote = match crate::ftp::FtpClient::connect(&request.profile, profile) {
+        Ok(remote) => remote,
+        Err(error) => return Ok(connection_failure_manifest(plan, request.verify, error)),
+    };
+    let manifest = execute_deploy(plan, request.verify, &mut blobs, &mut remote);
+    remote.quit();
+    Ok(manifest)
 }
 
+#[cfg(test)]
 pub(crate) fn deploy_branch_with_handoff<F>(
     request: &DeployBranchRequest,
     profile: &Profile,
@@ -205,15 +224,6 @@ where
     }
 
     execution_handoff(plan, request.verify)
-}
-
-fn unavailable_branch_execution(
-    _plan: BranchDeployPlan,
-    _verify: bool,
-) -> Result<BranchDeployManifest, BranchDeployError> {
-    Err(BranchDeployError::Other(anyhow::anyhow!(
-        "branch deployment execution is not available until upload verification is configured"
-    )))
 }
 
 pub fn dry_run_manifest(plan: BranchDeployPlan, verify: bool) -> BranchDeployManifest {
@@ -255,6 +265,56 @@ pub fn dry_run_manifest(plan: BranchDeployPlan, verify: bool) -> BranchDeployMan
         uploads,
         deleted: plan.deleted,
         failures: plan.failures,
+    }
+}
+
+fn connection_failure_manifest(
+    plan: BranchDeployPlan,
+    verify: bool,
+    error: anyhow::Error,
+) -> BranchDeployManifest {
+    let uploads = plan
+        .uploads
+        .iter()
+        .map(|upload| UploadResult {
+            git_path: upload.git_path.clone(),
+            remote_path: upload.remote_path.clone(),
+            object_id: upload.object_id.clone(),
+            bytes: upload.bytes,
+            upload_status: UploadStatus::NotAttempted,
+            verification_status: if verify {
+                VerificationStatus::NotAttempted
+            } else {
+                VerificationStatus::NotRequested
+            },
+        })
+        .collect::<Vec<_>>();
+    let mut failures = plan.failures;
+    failures.push(FailureRecord {
+        stage: "connect".to_string(),
+        git_path: None,
+        error: error.to_string(),
+    });
+    BranchDeployManifest {
+        success: false,
+        profile: plan.profile,
+        repository: plan.repository,
+        refs: plan.refs,
+        merge_rule: "first_parent".to_string(),
+        dry_run: false,
+        verify,
+        counts: ManifestCounts {
+            commits: plan.commits.len(),
+            touched_paths: plan.touched_paths,
+            planned_uploads: uploads.len(),
+            uploaded: 0,
+            verified: 0,
+            deleted_reported: plan.deleted.len(),
+            failures: failures.len(),
+        },
+        uploads,
+        deleted: plan.deleted,
+        failures,
     }
 }
 

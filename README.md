@@ -88,9 +88,10 @@ Or just call the tools directly without the agent doing any reasoning:
 
 ### Plan a Git worktree range
 
-Use `deploy-branch` to preview the committed files from a selected Git
+Use `deploy-branch` to deploy the committed files from a selected Git
 worktree. The command requires the absolute path to the exact worktree root
-and a base ref. The head ref defaults to `HEAD`.
+and a base ref. The head ref defaults to `HEAD`. Pass `--dry-run` to preview
+the manifest without accessing saved credentials, Git blob contents, or FTP.
 
 ```sh
 zed-ftp-mcp deploy-branch staging \
@@ -107,6 +108,18 @@ range. Each surviving path uses the blob from the resolved head commit, even
 when the worktree is dirty or the profile's `local_root` and ignore rules point
 somewhere else. The manifest records the dirty state and reports removed Git
 paths. A reported removal never deletes a remote file.
+
+Without `--dry-run`, zed-ftp opens one FTP session, selects binary transfer
+mode, uploads each committed blob in Git-path order, and verifies every upload
+by downloading and comparing its complete byte stream in that same session.
+Verification is on by default. Pass `--no-verify` only when you intentionally
+want to skip the download comparison.
+
+An execution manifest records each upload and verification status. A mismatch
+or per-file FTP failure leaves the other planned paths eligible to run, while a
+lost connection marks the remaining paths as not attempted. The CLI always
+prints this complete manifest and exits nonzero when any upload or verification
+does not succeed. The MCP tool returns the same unsuccessful manifest as data.
 
 ### Available tools
 

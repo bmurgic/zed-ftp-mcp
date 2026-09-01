@@ -193,11 +193,9 @@ pub struct DeleteResponse {
 
 #[tool_router]
 impl FtpServer {
-    #[tool(
-        description = "List FTP connection profiles configured in \
+    #[tool(description = "List FTP connection profiles configured in \
             ~/.config/zed-ftp/connections.toml, including whether each \
-            profile has a password stored in the OS keychain."
-    )]
+            profile has a password stored in the OS keychain.")]
     async fn ftp_list_profiles(&self) -> Result<Json<ProfilesResponse>, ErrorData> {
         let cfg = Config::load().map_err(internal)?;
         let cfg_path = crate::config::path_hint();
@@ -222,10 +220,8 @@ impl FtpServer {
         }))
     }
 
-    #[tool(
-        description = "Test an FTP connection profile by connecting, \
-            authenticating, and reporting the server's working directory."
-    )]
+    #[tool(description = "Test an FTP connection profile by connecting, \
+            authenticating, and reporting the server's working directory.")]
     async fn ftp_test(
         &self,
         Parameters(ProfileArg { profile }): Parameters<ProfileArg>,
@@ -247,7 +243,10 @@ impl FtpServer {
         .map_err(internal)?;
 
         Ok(Json(TestResponse {
-            host: cfg.profile(&profile).map(|p| p.host.clone()).unwrap_or_default(),
+            host: cfg
+                .profile(&profile)
+                .map(|p| p.host.clone())
+                .unwrap_or_default(),
             profile,
             pwd,
         }))
@@ -273,7 +272,13 @@ impl FtpServer {
             } else {
                 format!("{remote_root}/{}", sub.trim_start_matches('/'))
             }),
-            None => if remote_root.is_empty() { None } else { Some(remote_root) },
+            None => {
+                if remote_root.is_empty() {
+                    None
+                } else {
+                    Some(remote_root)
+                }
+            }
         };
         let path_for_blocking = resolved_path.clone();
         let entries = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<String>> {
@@ -293,12 +298,10 @@ impl FtpServer {
         }))
     }
 
-    #[tool(
-        description = "Upload a single local file to the FTP server. \
+    #[tool(description = "Upload a single local file to the FTP server. \
             Parent directories are created if missing. \
             Set before_changes=true to upload the last-committed (git HEAD) \
-            version instead of the current working-tree content."
-    )]
+            version instead of the current working-tree content.")]
     async fn ftp_upload_file(
         &self,
         Parameters(args): Parameters<UploadFileArgs>,
@@ -338,17 +341,13 @@ impl FtpServer {
                         String::from_utf8_lossy(&root_out.stderr).trim()
                     ));
                 }
-                let git_root = std::path::PathBuf::from(
-                    String::from_utf8_lossy(&root_out.stdout).trim(),
-                );
+                let git_root =
+                    std::path::PathBuf::from(String::from_utf8_lossy(&root_out.stdout).trim());
                 let abs = local
                     .canonicalize()
                     .map_err(|e| anyhow::anyhow!("canonicalize {local_for_blocking}: {e}"))?;
                 let rel = abs.strip_prefix(&git_root).map_err(|_| {
-                    anyhow::anyhow!(
-                        "file not under git root {}",
-                        git_root.display()
-                    )
+                    anyhow::anyhow!("file not under git root {}", git_root.display())
                 })?;
                 let rel_str = rel.to_string_lossy();
                 let show_out = std::process::Command::new("git")
@@ -384,11 +383,9 @@ impl FtpServer {
         }))
     }
 
-    #[tool(
-        description = "Recursively deploy a local directory to the FTP \
+    #[tool(description = "Recursively deploy a local directory to the FTP \
             server. Respects .gitignore and per-profile ignore patterns. \
-            Set dry_run=true to preview the file list without uploading."
-    )]
+            Set dry_run=true to preview the file list without uploading.")]
     async fn ftp_deploy(
         &self,
         Parameters(DeployArgs { profile, dry_run }): Parameters<DeployArgs>,
@@ -406,12 +403,10 @@ impl FtpServer {
         Ok(Json(plan))
     }
 
-    #[tool(
-        description = "Upload only the files changed by the given commits. \
+    #[tool(description = "Upload only the files changed by the given commits. \
             Each commit SHA is resolved via `git diff-tree` against its \
             parent. Files deleted in those commits are skipped. Set \
-            dry_run=true to preview."
-    )]
+            dry_run=true to preview.")]
     async fn ftp_deploy_commits(
         &self,
         Parameters(args): Parameters<DeployCommitsArgs>,
@@ -464,7 +459,9 @@ impl FtpServer {
                 .await
                 .map_err(internal)?;
 
-        result.map(Json).map_err(branch_deploy_error)
+        result
+            .map(branch_deploy_manifest_output)
+            .map_err(branch_deploy_error)
     }
 
     #[tool(
@@ -481,7 +478,10 @@ impl FtpServer {
             .profile(&args.profile)
             .ok_or_else(|| invalid(format!("no profile '{}'", args.profile)))?
             .clone();
-        let DownloadFileArgs { profile, remote_path } = args;
+        let DownloadFileArgs {
+            profile,
+            remote_path,
+        } = args;
         let pname = profile.clone();
         let remote_root = p.remote_root.trim_end_matches('/').to_string();
         let full_path = if remote_root.is_empty() {
@@ -505,7 +505,13 @@ impl FtpServer {
             Ok(s) => (s.to_string(), "utf-8".to_string()),
             Err(_) => (use_base64(&raw), "base64".to_string()),
         };
-        Ok(Json(DownloadResponse { profile, remote_path: full_path, content, encoding, bytes }))
+        Ok(Json(DownloadResponse {
+            profile,
+            remote_path: full_path,
+            content,
+            encoding,
+            bytes,
+        }))
     }
 
     #[tool(
@@ -521,7 +527,10 @@ impl FtpServer {
             .profile(&args.profile)
             .ok_or_else(|| invalid(format!("no profile '{}'", args.profile)))?
             .clone();
-        let MkdirArgs { profile, remote_path } = args;
+        let MkdirArgs {
+            profile,
+            remote_path,
+        } = args;
         let pname = profile.clone();
         let remote_root = p.remote_root.trim_end_matches('/').to_string();
         let full_path = if remote_root.is_empty() {
@@ -540,14 +549,15 @@ impl FtpServer {
         .map_err(internal)?
         .map_err(internal)?;
 
-        Ok(Json(MkdirResponse { profile, remote_path: full_path }))
+        Ok(Json(MkdirResponse {
+            profile,
+            remote_path: full_path,
+        }))
     }
 
-    #[tool(
-        description = "Delete a directory from the FTP server. \
+    #[tool(description = "Delete a directory from the FTP server. \
             The directory must be empty. \
-            remote_root is prepended automatically."
-    )]
+            remote_root is prepended automatically.")]
     async fn ftp_delete_dir(
         &self,
         Parameters(args): Parameters<DeleteDirArgs>,
@@ -557,7 +567,10 @@ impl FtpServer {
             .profile(&args.profile)
             .ok_or_else(|| invalid(format!("no profile '{}'", args.profile)))?
             .clone();
-        let DeleteDirArgs { profile, remote_path } = args;
+        let DeleteDirArgs {
+            profile,
+            remote_path,
+        } = args;
         let pname = profile.clone();
         let remote_root = p.remote_root.trim_end_matches('/').to_string();
         let full_path = if remote_root.is_empty() {
@@ -576,14 +589,15 @@ impl FtpServer {
         .map_err(internal)?
         .map_err(internal)?;
 
-        Ok(Json(DeleteResponse { profile, remote_path: full_path }))
+        Ok(Json(DeleteResponse {
+            profile,
+            remote_path: full_path,
+        }))
     }
 
-    #[tool(
-        description = "Delete a single file from the FTP server. \
+    #[tool(description = "Delete a single file from the FTP server. \
             The profile's remote_root is prepended to remote_path, \
-            matching the behavior of ftp_deploy."
-    )]
+            matching the behavior of ftp_deploy.")]
     async fn ftp_delete_file(
         &self,
         Parameters(args): Parameters<DeleteFileArgs>,
@@ -642,26 +656,56 @@ fn branch_deploy_error(error: branch_deploy::BranchDeployError) -> ErrorData {
     }
 }
 
+fn branch_deploy_manifest_output(
+    manifest: branch_deploy::BranchDeployManifest,
+) -> Json<branch_deploy::BranchDeployManifest> {
+    Json(manifest)
+}
+
 fn use_base64(bytes: &[u8]) -> String {
     use std::fmt::Write;
     const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let b0 = chunk[0] as usize;
-        let b1 = if chunk.len() > 1 { chunk[1] as usize } else { 0 };
-        let b2 = if chunk.len() > 2 { chunk[2] as usize } else { 0 };
+        let b1 = if chunk.len() > 1 {
+            chunk[1] as usize
+        } else {
+            0
+        };
+        let b2 = if chunk.len() > 2 {
+            chunk[2] as usize
+        } else {
+            0
+        };
         let _ = write!(out, "{}", TABLE[b0 >> 2] as char);
         let _ = write!(out, "{}", TABLE[((b0 & 3) << 4) | (b1 >> 4)] as char);
-        let _ = write!(out, "{}", if chunk.len() > 1 { TABLE[((b1 & 0xf) << 2) | (b2 >> 6)] as char } else { '=' });
-        let _ = write!(out, "{}", if chunk.len() > 2 { TABLE[b2 & 0x3f] as char } else { '=' });
+        let _ = write!(
+            out,
+            "{}",
+            if chunk.len() > 1 {
+                TABLE[((b1 & 0xf) << 2) | (b2 >> 6)] as char
+            } else {
+                '='
+            }
+        );
+        let _ = write!(
+            out,
+            "{}",
+            if chunk.len() > 2 {
+                TABLE[b2 & 0x3f] as char
+            } else {
+                '='
+            }
+        );
     }
     out
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{branch_deploy_error, DeployBranchArgs};
-    use crate::branch_deploy::BranchDeployError;
+    use super::{branch_deploy_error, branch_deploy_manifest_output, DeployBranchArgs};
+    use crate::branch_deploy::{dry_run_manifest, BranchDeployError, BranchDeployPlan};
     use rmcp::model::ErrorCode;
 
     #[test]
@@ -681,5 +725,15 @@ mod tests {
             branch_deploy_error(BranchDeployError::InvalidArgs("bad repository".to_string())).code,
             ErrorCode::INVALID_PARAMS
         );
+    }
+
+    #[test]
+    fn deploy_branch_execution_contract_mcp_returns_unsuccessful_manifest_as_data() {
+        let mut manifest = dry_run_manifest(BranchDeployPlan::empty("staging", "/repo"), true);
+        manifest.success = false;
+
+        let response = branch_deploy_manifest_output(manifest);
+
+        assert!(!response.0.success);
     }
 }

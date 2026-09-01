@@ -1,13 +1,14 @@
 use super::{
-    map_remote_path, BranchDeployError, BranchDeployPlan, DeletedPathResult, DeletedPathStatus,
-    DeployBranchRequest, FailureRecord, PlannedUpload, RepositorySummary, RequestedAndResolvedRef,
-    ResolvedRefs,
+    map_remote_path, BlobSource, BranchDeployError, BranchDeployPlan, DeletedPathResult,
+    DeletedPathStatus, DeployBranchRequest, FailureRecord, PlannedUpload, RepositorySummary,
+    RequestedAndResolvedRef, ResolvedRefs,
 };
 use crate::config::Profile;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Output, Stdio};
 
 const GIT_OPTIONAL_LOCKS_DISABLED: &str = "0";
 const GIT_SAFE_PAGER: &str = "cat";
@@ -25,6 +26,109 @@ struct TreeEntry {
     object_type: String,
     object_id: String,
     bytes: u64,
+}
+
+pub(crate) struct BatchBlobReader {
+    _child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+}
+
+impl BatchBlobReader {
+    pub(crate) fn new(repository_root: &Path) -> Result<Self, BranchDeployError> {
+        let mut command = Command::new("git");
+        configure_git_command(&mut command, repository_root);
+        let mut child = command
+            .args(["cat-file", "--batch"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    BranchDeployError::InvalidArgs("`git` was not found on PATH".to_string())
+                } else {
+                    BranchDeployError::Other(
+                        anyhow::Error::from(error).context("spawning git cat-file"),
+                    )
+                }
+            })?;
+        let stdin = child.stdin.take().ok_or_else(|| {
+            BranchDeployError::Other(anyhow::anyhow!("git cat-file did not provide stdin"))
+        })?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            BranchDeployError::Other(anyhow::anyhow!("git cat-file did not provide stdout"))
+        })?;
+        Ok(Self {
+            _child: child,
+            stdin,
+            stdout: BufReader::new(stdout),
+        })
+    }
+}
+
+impl BlobSource for BatchBlobReader {
+    fn read_blob(&mut self, object_id: &str) -> Result<Vec<u8>, BranchDeployError> {
+        writeln!(self.stdin, "{object_id}")
+            .and_then(|_| self.stdin.flush())
+            .map_err(|error| {
+                BranchDeployError::Other(
+                    anyhow::Error::from(error).context("writing git cat-file request"),
+                )
+            })?;
+
+        let mut header = Vec::new();
+        self.stdout
+            .read_until(b'\n', &mut header)
+            .map_err(|error| {
+                BranchDeployError::Other(
+                    anyhow::Error::from(error).context("reading git cat-file header"),
+                )
+            })?;
+        let header = std::str::from_utf8(header.strip_suffix(b"\n").ok_or_else(|| {
+            BranchDeployError::Other(anyhow::anyhow!(
+                "git cat-file returned an unterminated header"
+            ))
+        })?)
+        .map_err(|_| {
+            BranchDeployError::Other(anyhow::anyhow!("git cat-file returned a non-UTF-8 header"))
+        })?;
+        let mut fields = header.split_whitespace();
+        let returned_id = fields.next();
+        let object_type = fields.next();
+        let size = fields.next();
+        if returned_id != Some(object_id) || object_type != Some("blob") || fields.next().is_some()
+        {
+            return Err(BranchDeployError::Other(anyhow::anyhow!(
+                "git cat-file returned an unexpected object header '{header}'"
+            )));
+        }
+        let size = size
+            .ok_or_else(|| {
+                BranchDeployError::Other(anyhow::anyhow!(
+                    "git cat-file returned a missing object size"
+                ))
+            })?
+            .parse::<usize>()
+            .map_err(|_| {
+                BranchDeployError::Other(anyhow::anyhow!(
+                    "git cat-file returned an invalid object size"
+                ))
+            })?;
+        let mut bytes = vec![0; size];
+        self.stdout.read_exact(&mut bytes).map_err(|error| {
+            BranchDeployError::Other(anyhow::Error::from(error).context("reading git blob bytes"))
+        })?;
+        let mut trailer = [0; 1];
+        self.stdout.read_exact(&mut trailer).map_err(|error| {
+            BranchDeployError::Other(anyhow::Error::from(error).context("reading git blob trailer"))
+        })?;
+        if trailer != *b"\n" {
+            return Err(BranchDeployError::Other(anyhow::anyhow!(
+                "git cat-file returned an unexpected blob trailer"
+            )));
+        }
+        Ok(bytes)
+    }
 }
 
 pub(super) fn plan_branch(
@@ -384,6 +488,28 @@ where
     S: AsRef<std::ffi::OsStr>,
 {
     let mut command = Command::new("git");
+    configure_git_command(&mut command, repository_root);
+    let output = command.args(arguments).output().map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            BranchDeployError::InvalidArgs("`git` was not found on PATH".to_string())
+        } else {
+            BranchDeployError::Other(anyhow::Error::from(error).context("spawning git"))
+        }
+    })?;
+    if output.status.success() {
+        return Ok(output);
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let detail = if stderr.is_empty() {
+        format!("git command failed with exit {}", output.status)
+    } else {
+        stderr
+    };
+    Err(BranchDeployError::InvalidArgs(detail))
+}
+
+fn configure_git_command(command: &mut Command, repository_root: &Path) {
     let null_device = null_device_for_platform(cfg!(windows));
     let hooks_path = format!("core.hooksPath={null_device}");
     // Planning must not inherit Git variables that can select another repository or inject config.
@@ -416,26 +542,7 @@ where
             "submodule.recurse=false",
         ])
         .arg("-C")
-        .arg(repository_root)
-        .args(arguments);
-    let output = command.output().map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            BranchDeployError::InvalidArgs("`git` was not found on PATH".to_string())
-        } else {
-            BranchDeployError::Other(anyhow::Error::from(error).context("spawning git"))
-        }
-    })?;
-    if output.status.success() {
-        return Ok(output);
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let detail = if stderr.is_empty() {
-        format!("git command failed with exit {}", output.status)
-    } else {
-        stderr
-    };
-    Err(BranchDeployError::InvalidArgs(detail))
+        .arg(repository_root);
 }
 
 fn output_text(output: &Output, command: &str) -> Result<String, BranchDeployError> {

@@ -330,7 +330,7 @@ pub fn execute_deploy<R: BranchRemote, B: BlobSource>(
 ) -> BranchDeployManifest;
 ```
 
-- [ ] **2.1 Add the in-memory remote, blob source, and failing success-path tests.**
+- [x] **2.1 Add the in-memory remote, blob source, and failing success-path tests.**
 
   Implement test fakes that record an enum call log:
 
@@ -346,7 +346,7 @@ pub fn execute_deploy<R: BranchRemote, B: BlobSource>(
 
   Add tests prefixed `executor_` for binary mode first, deterministic upload order, one blob read at a time, parent directory creation, exact uploaded bytes, immediate comparison, matching byte counts, and verification disabled with no `Compare` call.
 
-- [ ] **2.2 Run the executor tests and capture the expected red state.**
+- [x] **2.2 Run the executor tests and capture the expected red state.**
 
   Run:
 
@@ -356,13 +356,13 @@ pub fn execute_deploy<R: BranchRemote, B: BlobSource>(
 
   Expected result: compilation fails because `execute.rs`, `BranchRemote`, and `BlobSource` do not exist.
 
-- [ ] **2.3 Add the batch blob reader and minimal successful executor.**
+- [x] **2.3 Add the batch blob reader and minimal successful executor.**
 
   `BatchBlobReader` starts one `git -C <root> cat-file --batch` child with piped stdin and stdout. For each requested object ID, write one line, parse `<oid> blob <size>`, read exactly `size` bytes plus the terminating newline, and return the bytes. Reject a missing object, non-blob type, malformed header, short read, or unexpected trailer as `BranchDeployError::Other`.
 
   In `execute_deploy`, call `set_binary_mode` once. For each upload, read one blob, create its parent, upload it, compare it immediately when verification is enabled, update that entry, and drop the byte vector before moving to the next upload.
 
-- [ ] **2.4 Run the successful executor tests until they pass.**
+- [x] **2.4 Run the successful executor tests until they pass.**
 
   Run:
 
@@ -372,7 +372,7 @@ pub fn execute_deploy<R: BranchRemote, B: BlobSource>(
 
   Expected result: success-path call order and manifest counts pass.
 
-- [ ] **2.5 Add failing failure-state tests.**
+- [x] **2.5 Add failing failure-state tests.**
 
   Let each fake operation inject either failure kind at one call index. Add exact tests:
 
@@ -386,11 +386,11 @@ pub fn execute_deploy<R: BranchRemote, B: BlobSource>(
 
   Assert the full ordered `uploads`, `failures`, and `counts`, not only `success`.
 
-- [ ] **2.6 Implement deterministic failure transitions.**
+- [x] **2.6 Implement deterministic failure transitions.**
 
   Map an `Operation` failure to the current entry and continue. Map `ConnectionLost` to the current entry, mark every later upload and verification `not_attempted`, and stop without constructing another remote. Treat mismatch as a verification failure after `compare_remote_bytes` returns its complete byte count. Compute `success` only after all statuses settle.
 
-- [ ] **2.7 Add failing typed FTP adapter tests.**
+- [x] **2.7 Add failing typed FTP adapter tests.**
 
   In `ftp.rs`, add tests prefixed `branch_adapter_` for:
 
@@ -405,7 +405,7 @@ pub fn execute_deploy<R: BranchRemote, B: BlobSource>(
 
   Add a reader test where the first byte mismatches but later reads increment a shared counter. Assert comparison returns `matches=false` and the counter equals the full remote length.
 
-- [ ] **2.8 Implement typed branch operations on `FtpClient`.**
+- [x] **2.8 Implement typed branch operations on `FtpClient`.**
 
   Preserve every existing method. Add branch-specific internal helpers that return `FtpError` before mapping to `RemoteFailure`. Implement binary selection with `transfer_type(FileType::Binary)`. Implement comparison with `retr` and a fixed buffer:
 
@@ -428,7 +428,7 @@ pub fn execute_deploy<R: BranchRemote, B: BlobSource>(
 
   The closure must return normally after EOF so `suppaftp` finalizes RETR. Implement `BranchRemote for FtpClient` with the approved five methods.
 
-- [ ] **2.9 Add the opt-in pinned disposable FTP test.**
+- [x] **2.9 Add the opt-in pinned disposable FTP test.**
 
   Add an ignored test named `disposable_branch_round_trip`. Guard it with `ZED_FTP_RUN_FTP_INTEGRATION=1`. Launch the pinned image:
 
@@ -438,7 +438,7 @@ pub fn execute_deploy<R: BranchRemote, B: BlobSource>(
 
   Use one dynamically mapped control port and one host-selected passive port mapped to the same container port. Set `USERS=test|test|/home/test`, `ADDRESS=127.0.0.1`, and the same `MIN_PORT` and `MAX_PORT`. Put a small TCP control proxy between the client and container. Record client commands and assert `TYPE I` occurs before `STOR` and `RETR`. Upload bytes containing NUL, CRLF, `0xff`, and `0x80`, then compare them through the adapter. A Drop guard must run `docker rm -f <test-container-id>` for the container created by that test.
 
-- [ ] **2.10 Complete actual CLI and MCP orchestration.**
+- [x] **2.10 Complete actual CLI and MCP orchestration.**
 
   For `dry_run=false`, plan first, then create one `BatchBlobReader` and one `FtpClient`. Credential access stays inside `FtpClient::connect`. Run `execute_deploy`, call best-effort `quit`, and return the manifest. MCP returns the manifest even when `success=false`. CLI always prints it and returns a nonzero process exit when `success=false`.
 
@@ -448,11 +448,11 @@ pub fn execute_deploy<R: BranchRemote, B: BlobSource>(
 
   Run every command under `qa.md#slice-2-qa-binary-upload-and-verification`, including the ignored disposable FTP test. Save a non-empty report with `Status: PASS` only after every command exits zero.
 
-- [ ] **2.12 Update the README for actual deployment and verification.**
+- [x] **2.12 Update the README for actual deployment and verification.**
 
   Document default verification, `--no-verify`, binary transfer, one-session behavior, mismatch and failure manifest semantics, and nonzero CLI exit. Do not instruct an agent to download files manually.
 
-- [ ] **2.13 Commit the Slice 2 implementation.**
+- [x] **2.13 Commit the Slice 2 implementation.**
 
   Run `git diff --check`, stage only Slice 2 files and its checked `plan.md` micro-steps, then commit:
 
