@@ -9,7 +9,7 @@ use crate::config::{self, Profile};
 use anyhow::{Context, Result};
 use std::io::{Cursor, Read};
 use suppaftp::types::FileType;
-use suppaftp::{FtpError, FtpStream, Mode, NativeTlsConnector, NativeTlsFtpStream};
+use suppaftp::{FtpError, FtpStream, Mode, NativeTlsConnector, NativeTlsFtpStream, Status};
 
 enum AnyFtpStream {
     Plain(FtpStream),
@@ -172,6 +172,10 @@ impl FtpClient {
         stream!(self, |s| s.transfer_type(FileType::Binary))
     }
 
+    fn branch_mkdir_p(&mut self, path: &str) -> Result<(), FtpError> {
+        branch_mkdir_path(path, |directory| stream!(self, |s| s.mkdir(directory)))
+    }
+
     fn branch_upload_bytes(&mut self, remote_path: &str, bytes: &[u8]) -> Result<u64, FtpError> {
         let mut cursor = Cursor::new(bytes);
         stream!(self, |s| s.put_file(remote_path, &mut cursor))
@@ -199,7 +203,7 @@ impl BranchRemote for FtpClient {
     }
 
     fn mkdir_p(&mut self, path: &str) -> Result<(), RemoteFailure> {
-        FtpClient::mkdir_p(self, path).map_err(|error| RemoteFailure::operation(error.to_string()))
+        self.branch_mkdir_p(path).map_err(map_branch_ftp_error)
     }
 
     fn upload_bytes(&mut self, path: &str, bytes: &[u8]) -> Result<u64, RemoteFailure> {
@@ -222,19 +226,55 @@ impl BranchRemote for FtpClient {
 }
 
 fn map_branch_ftp_error(error: FtpError) -> RemoteFailure {
-    let kind = match &error {
+    match &error {
         FtpError::ConnectionError(_)
         | FtpError::SecureError(_)
         | FtpError::BadResponse
-        | FtpError::DataConnectionAlreadyOpen => RemoteFailureKind::ConnectionLost,
+        | FtpError::DataConnectionAlreadyOpen => RemoteFailure {
+            kind: RemoteFailureKind::ConnectionLost,
+            error: error.to_string(),
+        },
         FtpError::UnexpectedResponse(_) | FtpError::InvalidAddress(_) => {
-            RemoteFailureKind::Operation
+            RemoteFailure::operation(error.to_string())
         }
-    };
-    RemoteFailure {
-        kind,
-        error: error.to_string(),
     }
+}
+
+fn branch_mkdir_path(
+    path: &str,
+    mut mkdir: impl FnMut(&str) -> Result<(), FtpError>,
+) -> Result<(), FtpError> {
+    if path.is_empty() || path == "/" {
+        return Ok(());
+    }
+    let mut directory = if path.starts_with('/') {
+        String::from("/")
+    } else {
+        String::new()
+    };
+    for segment in path
+        .trim_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+    {
+        if !directory.is_empty() && !directory.ends_with('/') {
+            directory.push('/');
+        }
+        directory.push_str(segment);
+        if let Err(error) = mkdir(&directory) {
+            if !is_directory_already_exists(&error) {
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_directory_already_exists(error: &FtpError) -> bool {
+    matches!(
+        error,
+        FtpError::UnexpectedResponse(response) if response.status == Status::FileUnavailable
+    )
 }
 
 fn compare_reader_bytes(
@@ -316,6 +356,49 @@ mod tests {
     }
 
     #[test]
+    fn branch_adapter_mkdir_reports_operation_failure() {
+        let (mut client, server) =
+            branch_client_for_mkd_response(Some(b"553 invalid directory\r\n"));
+
+        let failure = BranchRemote::mkdir_p(&mut client, "/remote")
+            .expect_err("branch mkdir should report an operation failure");
+
+        assert_eq!(failure.kind, RemoteFailureKind::Operation);
+        assert_eq!(
+            server.join().expect("MKD server should complete"),
+            b"MKD /remote\r\n"
+        );
+    }
+
+    #[test]
+    fn branch_adapter_mkdir_reports_connection_loss() {
+        let (mut client, server) = branch_client_for_mkd_response(None);
+
+        let failure = BranchRemote::mkdir_p(&mut client, "/remote")
+            .expect_err("branch mkdir should report a lost connection");
+
+        assert_eq!(failure.kind, RemoteFailureKind::ConnectionLost);
+        assert_eq!(
+            server.join().expect("MKD server should complete"),
+            b"MKD /remote\r\n"
+        );
+    }
+
+    #[test]
+    fn branch_adapter_mkdir_ignores_directory_already_exists() {
+        let (mut client, server) =
+            branch_client_for_mkd_response(Some(b"550 directory already exists\r\n"));
+
+        BranchRemote::mkdir_p(&mut client, "/remote")
+            .expect("branch mkdir should ignore an existing directory");
+
+        assert_eq!(
+            server.join().expect("MKD server should complete"),
+            b"MKD /remote\r\n"
+        );
+    }
+
+    #[test]
     fn branch_adapter_comparison_drains_after_first_mismatch() {
         let mut reader = CountingReader {
             bytes: vec![b'x', b'b', b'c', b'd', b'e'],
@@ -350,6 +433,44 @@ mod tests {
             self.offset += 1;
             Ok(1)
         }
+    }
+
+    fn branch_client_for_mkd_response(
+        response: Option<&'static [u8]>,
+    ) -> (FtpClient, thread::JoinHandle<Vec<u8>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("MKD server should bind");
+        let address = listener
+            .local_addr()
+            .expect("MKD server address should resolve");
+        let server = thread::spawn(move || {
+            let (mut connection, _) = listener.accept().expect("MKD server should accept");
+            connection
+                .write_all(b"220 ready\r\n")
+                .expect("MKD server should send greeting");
+            let mut command = Vec::new();
+            BufReader::new(
+                connection
+                    .try_clone()
+                    .expect("MKD server connection should clone"),
+            )
+            .read_until(b'\n', &mut command)
+            .expect("MKD server should receive command");
+            if let Some(response) = response {
+                connection
+                    .write_all(response)
+                    .expect("MKD server should send response");
+            }
+            command
+        });
+        let stream =
+            FtpStream::connect(address.to_string()).expect("client should connect to MKD server");
+
+        (
+            FtpClient {
+                stream: AnyFtpStream::Plain(stream),
+            },
+            server,
+        )
     }
 
     #[test]

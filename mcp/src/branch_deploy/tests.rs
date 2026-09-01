@@ -215,6 +215,77 @@ fn executor_operation_upload_failure_continues() {
 }
 
 #[test]
+fn executor_operation_mkdir_failure_skips_item_and_continues() {
+    let mut remote = TestRemote {
+        failures: std::collections::BTreeMap::from([(2, RemoteFailure::operation("MKD refused"))]),
+        ..TestRemote::default()
+    };
+    let mut blobs = executor_blobs();
+
+    let manifest = execute_deploy(executor_plan(), true, &mut blobs, &mut remote);
+
+    assert!(!manifest.success);
+    assert_eq!(manifest.uploads[0].upload_status, UploadStatus::Failed);
+    assert_eq!(
+        manifest.uploads[0].verification_status,
+        VerificationStatus::NotAttempted
+    );
+    assert_eq!(manifest.uploads[1].upload_status, UploadStatus::Uploaded);
+    assert_eq!(
+        manifest.uploads[1].verification_status,
+        VerificationStatus::Verified
+    );
+    assert_eq!(manifest.failures[0].stage, "mkdir");
+    assert_eq!(manifest.failures[0].git_path.as_deref(), Some("a.bin"));
+    assert_eq!(
+        remote.calls,
+        vec![
+            RemoteCall::Binary,
+            RemoteCall::Mkdir("/remote".to_string()),
+            RemoteCall::Mkdir("/remote/nested".to_string()),
+            RemoteCall::Upload("/remote/nested/b.bin".to_string(), vec![0x80, 1, 2]),
+            RemoteCall::Compare("/remote/nested/b.bin".to_string(), vec![0x80, 1, 2]),
+        ]
+    );
+}
+
+#[test]
+fn executor_connection_loss_during_mkdir_stops_without_uploading_or_reconnecting() {
+    let mut remote = TestRemote {
+        failures: std::collections::BTreeMap::from([(
+            2,
+            RemoteFailure::connection_lost("MKD connection lost"),
+        )]),
+        ..TestRemote::default()
+    };
+    let mut blobs = executor_blobs();
+
+    let manifest = execute_deploy(executor_plan(), true, &mut blobs, &mut remote);
+
+    assert!(!manifest.success);
+    assert_eq!(manifest.uploads[0].upload_status, UploadStatus::Failed);
+    assert_eq!(
+        manifest.uploads[0].verification_status,
+        VerificationStatus::NotAttempted
+    );
+    assert_eq!(
+        manifest.uploads[1].upload_status,
+        UploadStatus::NotAttempted
+    );
+    assert_eq!(
+        manifest.uploads[1].verification_status,
+        VerificationStatus::NotAttempted
+    );
+    assert_eq!(manifest.failures[0].stage, "mkdir");
+    assert_eq!(manifest.failures[0].git_path.as_deref(), Some("a.bin"));
+    assert_eq!(blobs.reads, vec!["a"]);
+    assert_eq!(
+        remote.calls,
+        vec![RemoteCall::Binary, RemoteCall::Mkdir("/remote".to_string()),]
+    );
+}
+
+#[test]
 fn executor_operation_compare_failure_continues() {
     let mut remote = TestRemote {
         failures: std::collections::BTreeMap::from([(4, RemoteFailure::operation("RETR refused"))]),
