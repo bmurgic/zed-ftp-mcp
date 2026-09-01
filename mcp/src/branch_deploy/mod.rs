@@ -280,16 +280,27 @@ pub fn deploy_branch(
     request: &DeployBranchRequest,
     profile: &Profile,
 ) -> Result<BranchDeployManifest, BranchDeployError> {
+    deploy_branch_with_connector(request, profile, crate::ftp::FtpClient::connect)
+}
+
+fn deploy_branch_with_connector<F>(
+    request: &DeployBranchRequest,
+    profile: &Profile,
+    connect: F,
+) -> Result<BranchDeployManifest, BranchDeployError>
+where
+    F: FnOnce(&str, &Profile) -> anyhow::Result<crate::ftp::FtpClient>,
+{
     let plan = plan_branch(request, profile)?;
     if request.dry_run {
         return Ok(dry_run_manifest(plan, request.verify));
     }
 
-    let mut blobs = BatchBlobReader::new(std::path::Path::new(&plan.repository.root))?;
-    let mut remote = match crate::ftp::FtpClient::connect(&request.profile, profile) {
+    let mut remote = match connect(&request.profile, profile) {
         Ok(remote) => remote,
         Err(error) => return Ok(connection_failure_manifest(plan, request.verify, error)),
     };
+    let mut blobs = BatchBlobReader::new(std::path::Path::new(&plan.repository.root))?;
     let manifest = execute_deploy(plan, request.verify, &mut blobs, &mut remote);
     remote.quit();
     Ok(manifest)
@@ -327,23 +338,6 @@ where
         return Ok(deletion_dry_run_manifest(plan));
     }
     execution_handoff(plan)
-}
-
-#[cfg(test)]
-pub(crate) fn deploy_branch_with_handoff<F>(
-    request: &DeployBranchRequest,
-    profile: &Profile,
-    execution_handoff: F,
-) -> Result<BranchDeployManifest, BranchDeployError>
-where
-    F: FnOnce(BranchDeployPlan, bool) -> Result<BranchDeployManifest, BranchDeployError>,
-{
-    let plan = plan_branch(request, profile)?;
-    if request.dry_run {
-        return Ok(dry_run_manifest(plan, request.verify));
-    }
-
-    execution_handoff(plan, request.verify)
 }
 
 pub fn dry_run_manifest(plan: BranchDeployPlan, verify: bool) -> BranchDeployManifest {

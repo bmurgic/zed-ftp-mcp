@@ -1,12 +1,12 @@
 use super::git::null_device_for_platform;
 use super::git::BatchBlobReader;
 use super::{
-    connection_failure_manifest, delete_branch_files_with_handoff, deploy_branch,
-    deploy_branch_with_handoff, dry_run_manifest, execute_deletion, execute_deploy,
-    map_remote_path, plan_branch, plan_deletion, BlobSource, BranchDeletePlan, BranchDeployError,
-    BranchDeployPlan, BranchRemote, DeleteBranchFilesRequest, DeletePathResult, DeletePathStatus,
-    DeletedPathStatus, DeployBranchRequest, PlannedUpload, RemoteComparison, RemoteFailure,
-    RepositorySummary, UploadStatus, VerificationStatus,
+    delete_branch_files_with_handoff, deploy_branch, deploy_branch_with_connector,
+    dry_run_manifest, execute_deletion, execute_deploy, map_remote_path, plan_branch,
+    plan_deletion, BlobSource, BranchDeletePlan, BranchDeployError, BranchDeployPlan, BranchRemote,
+    DeleteBranchFilesRequest, DeletePathResult, DeletePathStatus, DeletedPathStatus,
+    DeployBranchRequest, PlannedUpload, RemoteComparison, RemoteFailure, RepositorySummary,
+    UploadStatus, VerificationStatus,
 };
 use crate::config::Profile;
 use serde_json::json;
@@ -1217,17 +1217,14 @@ fn dry_run_reads_metadata_only() {
         "HEAD",
     );
     let profile = test_profile("/remote/root");
-    let mut effects = DryRunEffects::default();
-    let manifest = deploy_branch_with_handoff(&request, &profile, |_, _| {
-        effects.record_execution_handoff();
-        Err(branch_execution_unavailable())
+    let mut connector_calls = 0;
+    let manifest = deploy_branch_with_connector(&request, &profile, |_, _| {
+        connector_calls += 1;
+        Err(anyhow::anyhow!("dry run must not connect"))
     })
     .expect("dry run should succeed");
 
-    assert_eq!(effects.blob_reads(), 0);
-    assert_eq!(effects.credential_reads(), 0);
-    assert_eq!(effects.remote_factory_calls(), 0);
-    assert_eq!(effects.remote_method_calls(), 0);
+    assert_eq!(connector_calls, 0);
     assert_eq!(
         manifest
             .uploads
@@ -1236,33 +1233,58 @@ fn dry_run_reads_metadata_only() {
             .collect::<Vec<_>>(),
         vec![UploadStatus::Planned; manifest.uploads.len()]
     );
+}
 
-    let mut actual_request = request;
-    actual_request.dry_run = false;
-    let error = deploy_branch_with_handoff(&actual_request, &profile, |_, _| {
-        effects.record_execution_handoff();
-        Err(branch_execution_unavailable())
-    })
-    .expect_err("execution should remain unavailable until Slice 2");
-    assert!(error.to_string().contains("not available"));
-    assert_eq!(effects.blob_reads(), 1);
-    assert_eq!(effects.credential_reads(), 1);
-    assert_eq!(effects.remote_factory_calls(), 1);
-    assert_eq!(effects.remote_method_calls(), 1);
+#[test]
+fn connection_failure_returns_not_attempted_manifest() {
+    let repository = TestRepo::new();
+    repository.write("tracked.txt", b"base");
+    repository.commit("base");
+    let base = repository.rev_parse("HEAD");
+    repository.write("added.txt", b"added");
+    repository.write("tracked.txt", b"head");
+    repository.commit("head");
 
-    let connection_failure_plan = plan_branch(&actual_request, &profile)
-        .expect("connection failure fixture should plan without external handoff");
-    let public_manifest = connection_failure_manifest(
-        connection_failure_plan,
-        actual_request.verify,
-        anyhow::anyhow!("test connection failure"),
+    let mut request = request(
+        repository.path().to_str().expect("utf-8 path"),
+        &base,
+        "HEAD",
     );
+    request.dry_run = false;
+    let profile = test_profile("/remote/root");
+
+    let mut connector_calls = 0;
+    let public_manifest =
+        deploy_branch_with_connector(&request, &profile, |profile_name, connected_profile| {
+            connector_calls += 1;
+            assert_eq!(profile_name, "staging");
+            assert_eq!(connected_profile.host, "example.test");
+            Err(anyhow::anyhow!("test connection failure"))
+        })
+        .expect("connection failures should return a complete deployment manifest");
+
+    assert_eq!(connector_calls, 1);
     assert!(!public_manifest.success);
+    assert!(public_manifest.verify);
+    assert_eq!(public_manifest.profile, "staging");
+    assert_eq!(public_manifest.refs.base.commit, base);
+    assert_eq!(
+        public_manifest.refs.head.commit,
+        repository.rev_parse("HEAD")
+    );
     assert_eq!(public_manifest.failures[0].stage, "connect");
     assert_eq!(
-        public_manifest.uploads[0].upload_status,
-        UploadStatus::NotAttempted
+        public_manifest
+            .uploads
+            .iter()
+            .map(|upload| upload.git_path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["added.txt", "tracked.txt"]
     );
+    assert!(public_manifest.uploads.iter().all(|upload| {
+        upload.upload_status == UploadStatus::NotAttempted
+            && upload.verification_status == VerificationStatus::NotAttempted
+    }));
 }
 
 #[cfg(unix)]
@@ -1632,45 +1654,6 @@ fn assert_missing_blob(repository_root: &Path, object_id: &str) {
 
 struct TestRepo {
     directory: TempDir,
-}
-
-#[derive(Default)]
-struct DryRunEffects {
-    blob_reads: usize,
-    credential_reads: usize,
-    remote_factory_calls: usize,
-    remote_method_calls: usize,
-}
-
-impl DryRunEffects {
-    fn blob_reads(&self) -> usize {
-        self.blob_reads
-    }
-
-    fn credential_reads(&self) -> usize {
-        self.credential_reads
-    }
-
-    fn remote_factory_calls(&self) -> usize {
-        self.remote_factory_calls
-    }
-
-    fn remote_method_calls(&self) -> usize {
-        self.remote_method_calls
-    }
-
-    fn record_execution_handoff(&mut self) {
-        self.blob_reads += 1;
-        self.credential_reads += 1;
-        self.remote_factory_calls += 1;
-        self.remote_method_calls += 1;
-    }
-}
-
-fn branch_execution_unavailable() -> BranchDeployError {
-    BranchDeployError::Other(anyhow::anyhow!(
-        "branch deployment execution is not available until upload verification is configured"
-    ))
 }
 
 impl TestRepo {
