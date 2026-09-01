@@ -2,17 +2,19 @@ use super::git::null_device_for_platform;
 use super::git::BatchBlobReader;
 use super::{
     delete_branch_files_with_connector, deploy_branch, deploy_branch_with_connector,
-    dry_run_manifest, execute_deletion, execute_deploy, map_remote_path, plan_branch,
-    plan_deletion, BlobSource, BranchDeletePlan, BranchDeployError, BranchDeployPlan, BranchRemote,
-    DeleteBranchFilesRequest, DeletePathResult, DeletePathStatus, DeletedPathStatus,
-    DeployBranchRequest, PlannedUpload, RemoteComparison, RemoteFailure, RepositorySummary,
-    UploadStatus, VerificationStatus,
+    deploy_branch_with_dependencies, dry_run_manifest, execute_deletion, execute_deploy,
+    map_remote_path, plan_branch, plan_deletion, BlobSource, BranchDeletePlan, BranchDeployError,
+    BranchDeployPlan, BranchRemote, DeleteBranchFilesRequest, DeletePathResult, DeletePathStatus,
+    DeletedPathStatus, DeployBranchRequest, PlannedUpload, RemoteComparison, RemoteFailure,
+    RepositorySummary, UploadStatus, VerificationStatus,
 };
 use crate::config::Profile;
 use serde_json::json;
+use std::cell::Cell;
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
+use std::rc::Rc;
 use tempfile::TempDir;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,6 +98,19 @@ impl BlobSource for TestBlobs {
         self.blobs.get(object_id).cloned().ok_or_else(|| {
             BranchDeployError::Other(anyhow::anyhow!("missing test blob {object_id}"))
         })
+    }
+}
+
+struct CountingBlobSource {
+    reads: Rc<Cell<usize>>,
+}
+
+impl BlobSource for CountingBlobSource {
+    fn read_blob(&mut self, _object_id: &str) -> Result<Vec<u8>, BranchDeployError> {
+        self.reads.set(self.reads.get() + 1);
+        Err(BranchDeployError::Other(anyhow::anyhow!(
+            "dry run must not read blobs"
+        )))
     }
 }
 
@@ -1200,6 +1215,73 @@ fn planner_reports_deleted_recreated_submodule_and_unsafe_entries() {
 }
 
 #[test]
+fn planner_reports_deleted_paths_without_upload_work() {
+    let repository = TestRepo::new();
+    repository.write("deleted.txt", b"deleted");
+    repository.commit("base");
+    let base = repository.rev_parse("HEAD");
+    fs::remove_file(repository.path().join("deleted.txt")).expect("delete fixture path");
+    repository.commit("delete");
+
+    let plan = plan_for(&repository, &base);
+
+    assert_eq!(plan.deleted.len(), 1);
+    assert_eq!(plan.deleted[0].git_path, "deleted.txt");
+    assert_eq!(
+        plan.deleted[0].status,
+        DeletedPathStatus::RequiresExplicitCall
+    );
+    assert!(plan.uploads.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn planner_rejects_symlink_blob_entries() {
+    let repository = TestRepo::new();
+    repository.write("target.txt", b"target");
+    repository.commit("base");
+    let base = repository.rev_parse("HEAD");
+    std::os::unix::fs::symlink("target.txt", repository.path().join("linked.txt"))
+        .expect("symlink fixture should exist");
+    repository.commit("add symlink");
+
+    let plan = plan_for(&repository, &base);
+
+    assert!(plan
+        .uploads
+        .iter()
+        .all(|upload| upload.git_path != "linked.txt"));
+    assert!(plan.failures.iter().any(|failure| {
+        failure.git_path.as_deref() == Some("linked.txt")
+            && failure.error == "head entry is not a deployable regular blob: 120000 blob"
+    }));
+}
+
+#[cfg(unix)]
+#[test]
+fn planner_accepts_executable_regular_blob_entries() {
+    let repository = TestRepo::new();
+    repository.write("base.txt", b"base");
+    repository.commit("base");
+    let base = repository.rev_parse("HEAD");
+    repository.write("script.sh", b"#!/bin/sh\nprintf executable\n");
+    let mut permissions = fs::metadata(repository.path().join("script.sh"))
+        .expect("fixture metadata should be readable")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(repository.path().join("script.sh"), permissions)
+        .expect("fixture should be executable");
+    repository.commit("add executable script");
+
+    let plan = plan_for(&repository, &base);
+
+    assert_eq!(
+        upload(&plan, "script.sh").object_id,
+        repository.rev_parse("HEAD:script.sh")
+    );
+}
+
+#[test]
 fn planner_orders_exact_git_paths_deterministically() {
     let repository = TestRepo::new();
     repository.write("base.txt", b"base");
@@ -1241,14 +1323,29 @@ fn dry_run_reads_metadata_only() {
         "HEAD",
     );
     let profile = test_profile("/remote/root");
-    let mut connector_calls = 0;
-    let manifest = deploy_branch_with_connector(&request, &profile, |_, _| {
-        connector_calls += 1;
-        Err(anyhow::anyhow!("dry run must not connect"))
-    })
+    let blob_source_factory_calls = Cell::new(0);
+    let blob_reads = Rc::new(Cell::new(0));
+    let connector_calls = Cell::new(0);
+    let source_reads = Rc::clone(&blob_reads);
+    let manifest = deploy_branch_with_dependencies(
+        &request,
+        &profile,
+        |_| {
+            blob_source_factory_calls.set(blob_source_factory_calls.get() + 1);
+            Ok(CountingBlobSource {
+                reads: Rc::clone(&source_reads),
+            })
+        },
+        |_, _| {
+            connector_calls.set(connector_calls.get() + 1);
+            Err(anyhow::anyhow!("dry run must not connect"))
+        },
+    )
     .expect("dry run should succeed");
 
-    assert_eq!(connector_calls, 0);
+    assert_eq!(blob_source_factory_calls.get(), 0);
+    assert_eq!(blob_reads.get(), 0);
+    assert_eq!(connector_calls.get(), 0);
     assert_eq!(
         manifest
             .uploads

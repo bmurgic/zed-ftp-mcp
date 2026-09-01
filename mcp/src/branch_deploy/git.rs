@@ -24,6 +24,7 @@ pub(super) fn null_device_for_platform(is_windows: bool) -> &'static str {
 
 #[derive(Debug)]
 struct TreeEntry {
+    mode: String,
     object_type: String,
     object_id: String,
     bytes: u64,
@@ -152,7 +153,7 @@ pub(super) fn plan_branch(
 
     let surviving_blobs: BTreeSet<Vec<u8>> = head_tree
         .iter()
-        .filter_map(|(path, entry)| (entry.object_type == "blob").then_some(path.clone()))
+        .filter_map(|(path, entry)| is_regular_blob(entry).then_some(path.clone()))
         .collect();
     let mut uploads = Vec::new();
     let mut deleted = Vec::new();
@@ -160,7 +161,7 @@ pub(super) fn plan_branch(
 
     for path in &touched_paths {
         match head_tree.get(path) {
-            Some(entry) if entry.object_type == "blob" => {
+            Some(entry) if is_regular_blob(entry) => {
                 match map_remote_path(&profile.remote_root, path) {
                     Ok((git_path, remote_path)) => uploads.push(PlannedUpload {
                         git_path,
@@ -173,7 +174,10 @@ pub(super) fn plan_branch(
             }
             Some(entry) => failures.push(planning_failure(
                 path,
-                format!("head entry is not a deployable blob: {}", entry.object_type),
+                format!(
+                    "head entry is not a deployable regular blob: {} {}",
+                    entry.mode, entry.object_type
+                ),
             )),
             None => match map_remote_path(&profile.remote_root, path) {
                 Ok((git_path, _)) => {
@@ -549,6 +553,13 @@ fn head_tree(
         tree.insert(
             path.to_vec(),
             TreeEntry {
+                mode: std::str::from_utf8(fields[0])
+                    .map_err(|_| {
+                        BranchDeployError::Other(anyhow::anyhow!(
+                            "git ls-tree returned a non-UTF-8 mode"
+                        ))
+                    })?
+                    .to_string(),
                 object_type: object_type.to_string(),
                 object_id: object_id.to_string(),
                 bytes,
@@ -556,6 +567,10 @@ fn head_tree(
         );
     }
     Ok(tree)
+}
+
+fn is_regular_blob(entry: &TreeEntry) -> bool {
+    entry.object_type == "blob" && matches!(entry.mode.as_str(), "100644" | "100755")
 }
 
 fn parse_name_status(output: &[u8]) -> Result<Vec<Vec<u8>>, BranchDeployError> {

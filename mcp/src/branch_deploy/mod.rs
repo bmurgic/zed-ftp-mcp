@@ -291,12 +291,26 @@ fn deploy_branch_with_connector<F>(
 where
     F: FnOnce(&str, &Profile) -> anyhow::Result<crate::ftp::FtpClient>,
 {
+    deploy_branch_with_dependencies(request, profile, BatchBlobReader::new, connect)
+}
+
+fn deploy_branch_with_dependencies<B, S, F>(
+    request: &DeployBranchRequest,
+    profile: &Profile,
+    create_blob_source: B,
+    connect: F,
+) -> Result<BranchDeployManifest, BranchDeployError>
+where
+    B: FnOnce(&std::path::Path) -> Result<S, BranchDeployError>,
+    S: BlobSource,
+    F: FnOnce(&str, &Profile) -> anyhow::Result<crate::ftp::FtpClient>,
+{
     let plan = plan_branch(request, profile)?;
     if request.dry_run {
         return Ok(dry_run_manifest(plan, request.verify));
     }
 
-    let mut blobs = BatchBlobReader::new(std::path::Path::new(&plan.repository.root))?;
+    let mut blobs = create_blob_source(std::path::Path::new(&plan.repository.root))?;
     let mut remote = match connect(&request.profile, profile) {
         Ok(remote) => remote,
         Err(error) => return Ok(connection_failure_manifest(plan, request.verify, error)),
