@@ -444,7 +444,7 @@ pub fn execute_deploy<R: BranchRemote, B: BlobSource>(
 
   Prefix interface tests with `deploy_branch_execution_contract`. Inject fakes below the public wrapper so tests do not read the OS keychain or contact a network.
 
-- [ ] **2.11 Run the Slice 2 QA commands.**
+- [x] **2.11 Run the Slice 2 QA commands.**
 
   Run every command under `qa.md#slice-2-qa-binary-upload-and-verification`, including the ignored disposable FTP test. Save a non-empty report with `Status: PASS` only after every command exits zero.
 
