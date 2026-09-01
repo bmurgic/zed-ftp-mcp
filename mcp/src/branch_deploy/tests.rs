@@ -483,6 +483,195 @@ fn dry_run_does_not_run_repository_fsmonitor() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn dry_run_rejects_applicable_top_level_clean_filter_before_execution() {
+    let repository = TestRepo::new();
+    repository.write(".gitattributes", b"tracked.txt filter=hostile\n");
+    repository.write("tracked.txt", b"base");
+    repository.commit("base");
+    let base = repository.rev_parse("HEAD");
+    repository.write("tracked.txt", b"head");
+    repository.commit("head");
+    repository.write("tracked.txt", b"work");
+    let sentinel = repository.enable_clean_filter_sentinel("hostile");
+
+    let error = deploy_branch(
+        &request(
+            repository.path().to_str().expect("utf-8 path"),
+            &base,
+            "HEAD",
+        ),
+        &test_profile("/remote/root"),
+    )
+    .expect_err("dry-run planning must fail closed before clean filters can execute");
+
+    assert!(error.to_string().contains("clean/process filter"));
+    assert!(
+        !sentinel.exists(),
+        "dry-run planning must not execute the top-level clean filter"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn dry_run_rejects_applicable_initialized_submodule_clean_filter_before_execution() {
+    let submodule_source = TestRepo::new();
+    submodule_source.write(".gitattributes", b"tracked.txt filter=hostile\n");
+    submodule_source.write("tracked.txt", b"base");
+    submodule_source.commit("submodule base");
+
+    let repository = TestRepo::new();
+    repository.write("top-level.txt", b"base");
+    repository.commit("base");
+    repository.git_success(&[
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        submodule_source.path().to_str().expect("utf-8 path"),
+        "submodule",
+    ]);
+    repository.commit("add submodule");
+    let base = repository.rev_parse("HEAD");
+    repository.write("top-level.txt", b"head");
+    repository.commit("head");
+
+    let submodule = ExistingTestRepo::open(repository.path().join("submodule"));
+    submodule.write("tracked.txt", b"work");
+    let sentinel = submodule.enable_clean_filter_sentinel("hostile");
+
+    let error = deploy_branch(
+        &request(
+            repository.path().to_str().expect("utf-8 path"),
+            &base,
+            "HEAD",
+        ),
+        &test_profile("/remote/root"),
+    )
+    .expect_err("dry-run planning must fail closed before submodule filters can execute");
+
+    assert!(error.to_string().contains("clean/process filter"));
+    assert!(
+        !sentinel.exists(),
+        "dry-run planning must not execute initialized-submodule clean filters"
+    );
+}
+
+#[test]
+fn planner_keeps_raw_head_tree_when_a_replacement_ref_exists() {
+    let repository = TestRepo::new();
+    repository.write("base.txt", b"base");
+    repository.commit("base");
+    let base = repository.rev_parse("HEAD");
+    repository.write("legitimate.txt", b"legitimate");
+    repository.commit("legitimate head");
+    let head = repository.rev_parse("HEAD");
+    let legitimate_blob = repository.rev_parse("HEAD:legitimate.txt");
+
+    repository.git_success(&["checkout", "-b", "replacement", &base]);
+    repository.write("replacement.txt", b"replacement");
+    repository.commit("replacement head");
+    let replacement = repository.rev_parse("HEAD");
+    repository.git_success(&["replace", &head, &replacement]);
+
+    let plan = plan_branch(
+        &request(
+            repository.path().to_str().expect("utf-8 path"),
+            &base,
+            &head,
+        ),
+        &test_profile("/remote/root"),
+    )
+    .expect("planner must use raw commit identities");
+
+    assert_eq!(plan.refs.head.commit, head);
+    assert_eq!(upload(&plan, "legitimate.txt").object_id, legitimate_blob);
+    assert!(plan
+        .uploads
+        .iter()
+        .all(|planned_upload| planned_upload.git_path != "replacement.txt"));
+}
+
+#[cfg(unix)]
+#[test]
+fn dry_run_rejects_blobless_partial_clone_without_remote_contact() {
+    let source = TestRepo::new();
+    source.write("tracked.txt", b"base");
+    source.commit("base");
+    let base = source.rev_parse("HEAD");
+    source.write("tracked.txt", b"head");
+    source.commit("head");
+    let head_blob = source.rev_parse("HEAD:tracked.txt");
+    source.git_success(&["config", "uploadpack.allowFilter", "true"]);
+
+    let clone_parent = TempDir::new().expect("partial-clone parent should exist");
+    let clone_root = clone_parent.path().join("partial-clone");
+    git_success_at(
+        clone_parent.path(),
+        &[
+            "clone",
+            "--filter=blob:none",
+            "--no-checkout",
+            &format!("file://{}", source.path().display()),
+            clone_root.to_str().expect("utf-8 path"),
+        ],
+    );
+    let remote_contact_log = clone_parent.path().join("remote-contact.log");
+    let upload_pack = clone_parent.path().join("upload-pack-sentinel.sh");
+    fs::write(
+        &upload_pack,
+        format!(
+            "#!/bin/sh\nprintf remote-contact >> '{}'\nexec git-upload-pack \"$@\"\n",
+            remote_contact_log.display()
+        ),
+    )
+    .expect("upload-pack sentinel should be written");
+    let mut permissions = fs::metadata(&upload_pack)
+        .expect("upload-pack sentinel metadata should be readable")
+        .permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&upload_pack, permissions)
+        .expect("upload-pack sentinel should be executable");
+    git_success_at(
+        &clone_root,
+        &[
+            "config",
+            "remote.origin.uploadpack",
+            upload_pack.to_str().expect("utf-8 path"),
+        ],
+    );
+
+    assert_missing_blob(&clone_root, &head_blob);
+    let error = deploy_branch(
+        &request(clone_root.to_str().expect("utf-8 path"), &base, "HEAD"),
+        &test_profile("/remote/root"),
+    )
+    .expect_err("dry-run planning must reject blobless partial clones before object inspection");
+
+    assert!(error.to_string().contains("partial/promisor"));
+    assert_missing_blob(&clone_root, &head_blob);
+    assert!(
+        !remote_contact_log.exists(),
+        "dry-run planning must not contact a promisor remote"
+    );
+}
+
+#[test]
+fn planner_reports_same_length_tracked_worktree_change_as_dirty() {
+    let repository = TestRepo::new();
+    repository.write("tracked.txt", b"base");
+    repository.commit("base");
+    let base = repository.rev_parse("HEAD");
+    repository.write("tracked.txt", b"head");
+    repository.commit("head");
+    repository.write("tracked.txt", b"work");
+
+    let plan = plan_for(&repository, &base);
+
+    assert!(plan.repository.dirty);
+}
+
 fn test_profile(remote_root: &str) -> Profile {
     Profile {
         host: "example.test".to_string(),
@@ -534,8 +723,46 @@ fn upload<'a>(plan: &'a BranchDeployPlan, git_path: &str) -> &'a super::PlannedU
         .unwrap_or_else(|| panic!("missing planned upload for {git_path}"))
 }
 
+fn git_success_at(repository_root: &Path, arguments: &[&str]) {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repository_root)
+        .args(arguments)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .expect("git should run");
+    assert!(
+        output.status.success(),
+        "git command failed: {arguments:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn assert_missing_blob(repository_root: &Path, object_id: &str) {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repository_root)
+        .args(["rev-list", "--objects", "--missing=print", "HEAD"])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .expect("git should inspect missing objects");
+    assert!(
+        output.status.success(),
+        "git should inspect missing objects: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains(&format!("?{object_id}")),
+        "blob {object_id} must remain absent locally"
+    );
+}
+
 struct TestRepo {
     directory: TempDir,
+}
+
+struct ExistingTestRepo {
+    path: std::path::PathBuf,
 }
 
 #[derive(Default)]
@@ -649,6 +876,26 @@ impl TestRepo {
         sentinel
     }
 
+    #[cfg(unix)]
+    fn enable_clean_filter_sentinel(&self, filter_name: &str) -> std::path::PathBuf {
+        let sentinel = self.path().join("clean-filter-was-invoked");
+        let command = self.path().join("clean-filter-sentinel.sh");
+        let script = format!("#!/bin/sh\n: > '{}'\ncat\n", sentinel.display());
+        fs::write(&command, script).expect("clean-filter sentinel should be written");
+        let mut permissions = fs::metadata(&command)
+            .expect("clean-filter sentinel metadata should be readable")
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&command, permissions)
+            .expect("clean-filter sentinel should be executable");
+        self.git_success(&[
+            "config",
+            &format!("filter.{filter_name}.clean"),
+            command.to_str().expect("utf-8 path"),
+        ]);
+        sentinel
+    }
+
     fn git_text(&self, arguments: &[&str]) -> String {
         let output = self.git(arguments);
         assert!(output.status.success(), "git command failed: {arguments:?}");
@@ -682,5 +929,41 @@ impl TestRepo {
             .env("GIT_COMMITTER_EMAIL", "branch-deploy@example.test")
             .output()
             .expect("git should run")
+    }
+}
+
+impl ExistingTestRepo {
+    fn open(path: std::path::PathBuf) -> Self {
+        Self { path }
+    }
+
+    fn write(&self, relative_path: &str, bytes: &[u8]) {
+        let path = self.path.join(relative_path);
+        let parent = path.parent().expect("fixture file should have a parent");
+        fs::create_dir_all(parent).expect("fixture directory should exist");
+        fs::write(path, bytes).expect("fixture file should be written");
+    }
+
+    #[cfg(unix)]
+    fn enable_clean_filter_sentinel(&self, filter_name: &str) -> std::path::PathBuf {
+        let sentinel = self.path.join("clean-filter-was-invoked");
+        let command = self.path.join("clean-filter-sentinel.sh");
+        let script = format!("#!/bin/sh\n: > '{}'\ncat\n", sentinel.display());
+        fs::write(&command, script).expect("clean-filter sentinel should be written");
+        let mut permissions = fs::metadata(&command)
+            .expect("clean-filter sentinel metadata should be readable")
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&command, permissions)
+            .expect("clean-filter sentinel should be executable");
+        git_success_at(
+            &self.path,
+            &[
+                "config",
+                &format!("filter.{filter_name}.clean"),
+                command.to_str().expect("utf-8 path"),
+            ],
+        );
+        sentinel
     }
 }

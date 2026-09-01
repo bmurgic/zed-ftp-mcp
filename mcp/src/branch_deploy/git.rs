@@ -32,11 +32,13 @@ pub(super) fn plan_branch(
     profile: &Profile,
 ) -> Result<BranchDeployPlan, BranchDeployError> {
     let repository_root = validate_repository_root(&request.repo_root)?;
+    reject_partial_or_promisor_repository(&repository_root)?;
     let base_commit = resolve_commit(&repository_root, &request.base_ref)?;
     let head_commit = resolve_commit(&repository_root, &request.head_ref)?;
     let commits = range_commits(&repository_root, &base_commit, &head_commit)?;
     let touched_paths = touched_paths(&repository_root, &commits)?;
     let head_tree = head_tree(&repository_root, &head_commit)?;
+    preflight_dirty_state_filters(&repository_root)?;
     let dirty = !run_git(
         &repository_root,
         ["status", "--porcelain=v1", "-z", "--untracked-files=normal"],
@@ -310,6 +312,128 @@ fn ascii_fold(path: &[u8]) -> Vec<u8> {
     path.iter().map(u8::to_ascii_lowercase).collect()
 }
 
+fn reject_partial_or_promisor_repository(repository_root: &Path) -> Result<(), BranchDeployError> {
+    let output = run_git(repository_root, ["config", "--null", "--list"])?;
+    for (key, value) in parse_repository_git_config(&output.stdout)? {
+        let key = key.to_ascii_lowercase();
+        if key == "extensions.partialclone"
+            || key.starts_with("remote.")
+                && key.ends_with(".promisor")
+                && value.eq_ignore_ascii_case("true")
+        {
+            return Err(BranchDeployError::InvalidArgs(
+                "partial/promisor repositories are not supported for branch deployment planning"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn preflight_dirty_state_filters(repository_root: &Path) -> Result<(), BranchDeployError> {
+    preflight_repository_dirty_state_filters(repository_root)?;
+    for submodule_root in initialized_submodule_roots(repository_root)? {
+        preflight_dirty_state_filters(&submodule_root)?;
+    }
+    Ok(())
+}
+
+fn preflight_repository_dirty_state_filters(
+    repository_root: &Path,
+) -> Result<(), BranchDeployError> {
+    for filter_name in executable_filter_names(repository_root)? {
+        let attribute_pathspec = format!(":(attr:filter={filter_name})");
+        let output = run_git(
+            repository_root,
+            ["ls-files", "-z", "--", attribute_pathspec.as_str()],
+        )?;
+        if !output.stdout.is_empty() {
+            return Err(BranchDeployError::InvalidArgs(format!(
+                "repository has an applicable executable clean/process filter '{filter_name}'; refusing to inspect dirty state"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn executable_filter_names(repository_root: &Path) -> Result<BTreeSet<String>, BranchDeployError> {
+    let output = run_git(repository_root, ["config", "--null", "--list"])?;
+    let mut filter_names = BTreeSet::new();
+    for (key, value) in parse_repository_git_config(&output.stdout)? {
+        let key = key.to_ascii_lowercase();
+        let Some(filter_key) = key.strip_prefix("filter.") else {
+            continue;
+        };
+        let Some((filter_name, setting)) = filter_key.rsplit_once('.') else {
+            continue;
+        };
+        if !filter_name.is_empty()
+            && (setting == "clean" || setting == "process")
+            && !value.is_empty()
+        {
+            filter_names.insert(filter_name.to_string());
+        }
+    }
+    Ok(filter_names)
+}
+
+fn initialized_submodule_roots(repository_root: &Path) -> Result<Vec<PathBuf>, BranchDeployError> {
+    let output = run_git(repository_root, ["ls-files", "-s", "-z"])?;
+    let mut submodule_roots = Vec::new();
+    for record in output
+        .stdout
+        .split(|byte| *byte == b'\0')
+        .filter(|record| !record.is_empty())
+    {
+        let Some(tab_index) = record.iter().position(|byte| *byte == b'\t') else {
+            continue;
+        };
+        let (mode_and_object, path_with_separator) = record.split_at(tab_index);
+        let Some(mode) = mode_and_object
+            .split(|byte| byte.is_ascii_whitespace())
+            .next()
+        else {
+            continue;
+        };
+        if mode != b"160000" {
+            continue;
+        }
+        let submodule_path = std::str::from_utf8(&path_with_separator[1..]).map_err(|_| {
+            BranchDeployError::InvalidArgs(
+                "initialized submodule path is not valid UTF-8; refusing to inspect dirty state"
+                    .to_string(),
+            )
+        })?;
+        let submodule_root = repository_root.join(submodule_path);
+        if submodule_root.is_dir() && submodule_root.join(".git").exists() {
+            submodule_roots.push(submodule_root);
+        }
+    }
+    Ok(submodule_roots)
+}
+
+fn parse_repository_git_config(config: &[u8]) -> Result<Vec<(String, String)>, BranchDeployError> {
+    let mut entries = Vec::new();
+    for record in config
+        .split(|byte| *byte == b'\0')
+        .filter(|record| !record.is_empty())
+    {
+        let Some(separator) = record.iter().position(|byte| *byte == b'\n') else {
+            return Err(BranchDeployError::Other(anyhow::anyhow!(
+                "git config returned malformed NUL-delimited output"
+            )));
+        };
+        let key = std::str::from_utf8(&record[..separator]).map_err(|_| {
+            BranchDeployError::Other(anyhow::anyhow!("git config returned a non-UTF-8 key"))
+        })?;
+        let value = std::str::from_utf8(&record[separator + 1..]).map_err(|_| {
+            BranchDeployError::Other(anyhow::anyhow!("git config returned a non-UTF-8 value"))
+        })?;
+        entries.push((key.to_string(), value.to_string()));
+    }
+    Ok(entries)
+}
+
 fn run_git<I, S>(repository_root: &Path, arguments: I) -> Result<Output, BranchDeployError>
 where
     I: IntoIterator<Item = S>,
@@ -327,6 +451,10 @@ where
     command
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", null_device)
+        // Replacement refs can make recorded commit IDs disagree with planned trees and blobs.
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        // This is defense in depth only; partial and promisor repositories are rejected before object inspection.
+        .env("GIT_NO_LAZY_FETCH", "1")
         // `git status` must not refresh the index or create an optional lock while inspecting dirty state.
         .env("GIT_OPTIONAL_LOCKS", GIT_OPTIONAL_LOCKS_DISABLED)
         .env("GIT_PAGER", GIT_SAFE_PAGER)
