@@ -1,4 +1,4 @@
-use super::git::null_device_for_platform;
+use super::git::{null_device_for_platform, parse_filter_attribute_values};
 use super::{
     deploy_branch, deploy_branch_with_handoff, dry_run_manifest, map_remote_path, plan_branch,
     BranchDeployError, BranchDeployPlan, DeletedPathStatus, DeployBranchRequest, UploadStatus,
@@ -558,6 +558,295 @@ fn dry_run_rejects_applicable_initialized_submodule_clean_filter_before_executio
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn dry_run_rejects_top_level_mixed_case_clean_filter_before_execution() {
+    assert_top_level_filter_rejected_before_execution("MixedCase", "FiLtEr", "ClEaN");
+}
+
+#[cfg(unix)]
+#[test]
+fn dry_run_rejects_top_level_mixed_case_process_filter_before_execution() {
+    assert_top_level_filter_rejected_before_execution("MixedCase", "FiLtEr", "PrOcEsS");
+}
+
+#[cfg(unix)]
+#[test]
+fn dry_run_rejects_initialized_submodule_mixed_case_clean_filter_before_execution() {
+    assert_initialized_submodule_filter_rejected_before_execution("MixedCase", "FiLtEr", "ClEaN");
+}
+
+#[cfg(unix)]
+#[test]
+fn dry_run_rejects_initialized_submodule_mixed_case_process_filter_before_execution() {
+    assert_initialized_submodule_filter_rejected_before_execution("MixedCase", "FiLtEr", "PrOcEsS");
+}
+
+#[cfg(unix)]
+#[test]
+fn dry_run_rejects_nested_initialized_submodule_filter_before_execution() {
+    let nested_source = TestRepo::new();
+    nested_source.write(".gitattributes", b"tracked.txt filter=MixedCase\n");
+    nested_source.write("tracked.txt", b"base");
+    nested_source.commit("nested base");
+
+    let middle_source = TestRepo::new();
+    middle_source.write("middle.txt", b"base");
+    middle_source.commit("middle base");
+    middle_source.git_success(&[
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        nested_source.path().to_str().expect("utf-8 path"),
+        "nested",
+    ]);
+    middle_source.commit("add nested submodule");
+
+    let repository = TestRepo::new();
+    repository.write("top-level.txt", b"base");
+    repository.commit("base");
+    repository.git_success(&[
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        middle_source.path().to_str().expect("utf-8 path"),
+        "middle",
+    ]);
+    repository.commit("add middle submodule");
+    repository.git_success(&[
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "update",
+        "--init",
+        "--recursive",
+    ]);
+    let base = repository.rev_parse("HEAD");
+    repository.write("top-level.txt", b"head");
+    repository.commit("head");
+
+    let nested = ExistingTestRepo::open(repository.path().join("middle/nested"));
+    nested.write("tracked.txt", b"work");
+    let sentinel = nested.enable_filter_sentinel("MixedCase", "FiLtEr", "ClEaN", "nested");
+
+    let error = deploy_branch(
+        &request(
+            repository.path().to_str().expect("utf-8 path"),
+            &base,
+            "HEAD",
+        ),
+        &test_profile("/remote/root"),
+    )
+    .expect_err("dry-run planning must fail closed before nested-submodule filters can execute");
+
+    assert!(error.to_string().contains("clean/process filter"));
+    assert!(
+        !sentinel.exists(),
+        "dry-run planning must not execute nested initialized-submodule filters"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn dry_run_accepts_configured_inapplicable_mixed_case_filter() {
+    assert_inapplicable_filter_allows_dirty_repository(
+        "MixedCase",
+        "FiLtEr",
+        "ClEaN",
+        "mixed-case-inapplicable",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn dry_run_rejects_applicable_dotted_filter_driver_before_execution() {
+    assert_top_level_filter_rejected_before_execution("My.Driver", "FiLtEr", "ClEaN");
+}
+
+#[cfg(unix)]
+#[test]
+fn dry_run_accepts_inapplicable_dotted_filter_driver() {
+    assert_inapplicable_filter_allows_dirty_repository(
+        "My.Driver",
+        "FiLtEr",
+        "PrOcEsS",
+        "dotted-inapplicable",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn dry_run_rejects_filter_on_non_utf8_tracked_path_before_execution() {
+    let repository = TestRepo::new();
+    repository.write(".gitattributes", b"* filter=MixedCase\n");
+    repository.write("tracked.txt", b"base");
+    repository.commit("base");
+    let base = repository.rev_parse("HEAD");
+    let blob = repository.rev_parse("HEAD:tracked.txt");
+    repository.add_non_utf8_blob(&blob, b"invalid-\xff");
+    repository.git_success(&["commit", "-m", "add non-utf8 path"]);
+    let sentinel = enable_filter_sentinel_at(
+        repository.path(),
+        "MixedCase",
+        "FiLtEr",
+        "ClEaN",
+        "non-utf8",
+    );
+
+    let error = deploy_branch(
+        &request(
+            repository.path().to_str().expect("utf-8 path"),
+            &base,
+            "HEAD",
+        ),
+        &test_profile("/remote/root"),
+    )
+    .expect_err("dry-run planning must reject the executable filter before status");
+
+    assert!(error.to_string().contains("clean/process filter"));
+    assert!(!sentinel.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn dry_run_parses_adversarial_filter_attribute_paths_as_nul_records() {
+    let repository = TestRepo::new();
+    repository.write(".gitattributes", b"* filter=MixedCase\n");
+    repository.write("ordinary.txt", b"base");
+    repository.commit("base");
+    let base = repository.rev_parse("HEAD");
+    repository.write("line\nfilter: process: set.txt", b"head");
+    repository.write("triple:filter:MixedCase.txt", b"head");
+    repository.commit("add adversarial paths");
+    let sentinel = enable_filter_sentinel_at(
+        repository.path(),
+        "MixedCase",
+        "FiLtEr",
+        "ClEaN",
+        "adversarial-paths",
+    );
+
+    let error = deploy_branch(
+        &request(
+            repository.path().to_str().expect("utf-8 path"),
+            &base,
+            "HEAD",
+        ),
+        &test_profile("/remote/root"),
+    )
+    .expect_err("NUL-delimited attribute records must preserve adversarial path bytes");
+
+    assert!(error.to_string().contains("clean/process filter"));
+    assert!(!sentinel.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn dry_run_rejects_bare_filter_attribute_fail_closed() {
+    let (repository, base) = dirty_repository_with_attributes(b"tracked.txt filter\n");
+
+    let error = deploy_branch(
+        &request(
+            repository.path().to_str().expect("utf-8 path"),
+            &base,
+            "HEAD",
+        ),
+        &test_profile("/remote/root"),
+    )
+    .expect_err("a bare filter attribute must fail closed");
+
+    assert!(error.to_string().contains("bare filter attribute"));
+}
+
+#[cfg(unix)]
+#[test]
+fn dry_run_accepts_unset_and_unspecified_filter_attributes() {
+    for (label, attributes) in [
+        ("unset", b"tracked.txt -filter\n".as_slice()),
+        ("unspecified", b"tracked.txt !filter\n".as_slice()),
+    ] {
+        let (repository, base) = dirty_repository_with_attributes(attributes);
+        let sentinel =
+            enable_filter_sentinel_at(repository.path(), "MixedCase", "FiLtEr", "ClEaN", label);
+
+        let manifest = deploy_branch(
+            &request(
+                repository.path().to_str().expect("utf-8 path"),
+                &base,
+                "HEAD",
+            ),
+            &test_profile("/remote/root"),
+        )
+        .expect("unset and unspecified filter attributes must not be rejected");
+
+        assert!(manifest.repository.dirty);
+        assert!(!sentinel.exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn dry_run_rejects_macro_expanded_filter_attribute_before_execution() {
+    let (repository, base) = dirty_repository_with_attributes(
+        b"[attr]usesFilter filter=MixedCase\ntracked.txt usesFilter\n",
+    );
+    let sentinel =
+        enable_filter_sentinel_at(repository.path(), "MixedCase", "FiLtEr", "ClEaN", "macro");
+
+    let error = deploy_branch(
+        &request(
+            repository.path().to_str().expect("utf-8 path"),
+            &base,
+            "HEAD",
+        ),
+        &test_profile("/remote/root"),
+    )
+    .expect_err("macro-expanded executable filters must fail closed before status");
+
+    assert!(error.to_string().contains("clean/process filter"));
+    assert!(!sentinel.exists());
+}
+
+#[test]
+fn filter_attribute_parser_preserves_exact_nul_delimited_values() {
+    let output = b"line\nfilter: process\0filter\0MixedCase\0colon:path\0filter\0My.Driver\0unset\0filter\0unset\0unspecified\0filter\0unspecified\0";
+
+    let (values, has_bare_filter) =
+        parse_filter_attribute_values(output).expect("valid NUL triples should parse");
+
+    assert_eq!(
+        values.into_iter().collect::<Vec<_>>(),
+        vec![b"MixedCase".to_vec(), b"My.Driver".to_vec()]
+    );
+    assert!(!has_bare_filter);
+}
+
+#[test]
+fn filter_attribute_parser_reports_bare_filter_set() {
+    let (values, has_bare_filter) = parse_filter_attribute_values(b"tracked.txt\0filter\0set\0")
+        .expect("bare filter output should be recognized");
+
+    assert!(values.is_empty());
+    assert!(has_bare_filter);
+}
+
+#[test]
+fn filter_attribute_parser_rejects_malformed_nul_triples() {
+    for output in [
+        b"tracked.txt\0filter\0MixedCase".as_slice(),
+        b"tracked.txt\0filter\0".as_slice(),
+        b"tracked.txt\0diff\0MixedCase\0".as_slice(),
+        b"\0filter\0MixedCase\0".as_slice(),
+    ] {
+        assert!(
+            parse_filter_attribute_values(output).is_err(),
+            "malformed record must fail closed: {output:?}"
+        );
+    }
+}
+
 #[test]
 fn planner_keeps_raw_head_tree_when_a_replacement_ref_exists() {
     let repository = TestRepo::new();
@@ -1086,4 +1375,170 @@ impl ExistingTestRepo {
         );
         sentinel
     }
+
+    #[cfg(unix)]
+    fn enable_filter_sentinel(
+        &self,
+        filter_name: &str,
+        section: &str,
+        setting: &str,
+        label: &str,
+    ) -> std::path::PathBuf {
+        enable_filter_sentinel_at(&self.path, filter_name, section, setting, label)
+    }
+}
+
+#[cfg(unix)]
+fn assert_top_level_filter_rejected_before_execution(
+    filter_name: &str,
+    section: &str,
+    setting: &str,
+) {
+    let attributes = format!("tracked.txt filter={filter_name}\n");
+    let (repository, base) = dirty_repository_with_attributes(attributes.as_bytes());
+    let sentinel = enable_filter_sentinel_at(
+        repository.path(),
+        filter_name,
+        section,
+        setting,
+        "top-level",
+    );
+
+    let error = deploy_branch(
+        &request(
+            repository.path().to_str().expect("utf-8 path"),
+            &base,
+            "HEAD",
+        ),
+        &test_profile("/remote/root"),
+    )
+    .expect_err("dry-run planning must fail closed before filters can execute");
+
+    assert!(error.to_string().contains("clean/process filter"));
+    assert!(
+        !sentinel.exists(),
+        "dry-run planning must not execute the top-level {setting} filter"
+    );
+}
+
+#[cfg(unix)]
+fn assert_initialized_submodule_filter_rejected_before_execution(
+    filter_name: &str,
+    section: &str,
+    setting: &str,
+) {
+    let submodule_source = TestRepo::new();
+    submodule_source.write(
+        ".gitattributes",
+        format!("tracked.txt filter={filter_name}\n").as_bytes(),
+    );
+    submodule_source.write("tracked.txt", b"base");
+    submodule_source.commit("submodule base");
+
+    let repository = TestRepo::new();
+    repository.write("top-level.txt", b"base");
+    repository.commit("base");
+    repository.git_success(&[
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        submodule_source.path().to_str().expect("utf-8 path"),
+        "submodule",
+    ]);
+    repository.commit("add submodule");
+    let base = repository.rev_parse("HEAD");
+    repository.write("top-level.txt", b"head");
+    repository.commit("head");
+
+    let submodule = ExistingTestRepo::open(repository.path().join("submodule"));
+    submodule.write("tracked.txt", b"work");
+    let sentinel = submodule.enable_filter_sentinel(filter_name, section, setting, "submodule");
+
+    let error = deploy_branch(
+        &request(
+            repository.path().to_str().expect("utf-8 path"),
+            &base,
+            "HEAD",
+        ),
+        &test_profile("/remote/root"),
+    )
+    .expect_err("dry-run planning must fail closed before submodule filters can execute");
+
+    assert!(error.to_string().contains("clean/process filter"));
+    assert!(
+        !sentinel.exists(),
+        "dry-run planning must not execute initialized-submodule {setting} filters"
+    );
+}
+
+#[cfg(unix)]
+fn assert_inapplicable_filter_allows_dirty_repository(
+    filter_name: &str,
+    section: &str,
+    setting: &str,
+    label: &str,
+) {
+    let (repository, base) = dirty_repository_with_attributes(b"");
+    let sentinel =
+        enable_filter_sentinel_at(repository.path(), filter_name, section, setting, label);
+
+    let manifest = deploy_branch(
+        &request(
+            repository.path().to_str().expect("utf-8 path"),
+            &base,
+            "HEAD",
+        ),
+        &test_profile("/remote/root"),
+    )
+    .expect("configured filters that apply to no tracked path must not be rejected");
+
+    assert!(manifest.repository.dirty);
+    assert!(
+        !sentinel.exists(),
+        "dry-run planning must not execute an inapplicable {setting} filter"
+    );
+}
+
+#[cfg(unix)]
+fn dirty_repository_with_attributes(attributes: &[u8]) -> (TestRepo, String) {
+    let repository = TestRepo::new();
+    if !attributes.is_empty() {
+        repository.write(".gitattributes", attributes);
+    }
+    repository.write("tracked.txt", b"base");
+    repository.commit("base");
+    let base = repository.rev_parse("HEAD");
+    repository.write("tracked.txt", b"head");
+    repository.commit("head");
+    repository.write("tracked.txt", b"work");
+    (repository, base)
+}
+
+#[cfg(unix)]
+fn enable_filter_sentinel_at(
+    repository_root: &Path,
+    filter_name: &str,
+    section: &str,
+    setting: &str,
+    label: &str,
+) -> std::path::PathBuf {
+    let sentinel = repository_root.join(format!("{label}-filter-was-invoked"));
+    let command = repository_root.join(format!("{label}-filter-sentinel.sh"));
+    let script = format!("#!/bin/sh\n: > '{}'\ncat\n", sentinel.display());
+    fs::write(&command, script).expect("filter sentinel should be written");
+    let mut permissions = fs::metadata(&command)
+        .expect("filter sentinel metadata should be readable")
+        .permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&command, permissions).expect("filter sentinel should be executable");
+    git_success_at(
+        repository_root,
+        &[
+            "config",
+            &format!("{section}.{filter_name}.{setting}"),
+            command.to_str().expect("utf-8 path"),
+        ],
+    );
+    sentinel
 }

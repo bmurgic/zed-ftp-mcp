@@ -6,8 +6,9 @@ use super::{
 use crate::config::Profile;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 const GIT_OPTIONAL_LOCKS_DISABLED: &str = "0";
 const GIT_SAFE_PAGER: &str = "cat";
@@ -368,13 +369,22 @@ fn preflight_dirty_state_filters(repository_root: &Path) -> Result<(), BranchDep
 fn preflight_repository_dirty_state_filters(
     repository_root: &Path,
 ) -> Result<(), BranchDeployError> {
+    let tracked_paths = run_git(repository_root, ["ls-files", "-z"])?;
+    let attributes = run_git_with_input(
+        repository_root,
+        ["check-attr", "--cached", "-z", "--stdin", "filter"],
+        &tracked_paths.stdout,
+    )?;
+    let (applied_filter_names, has_bare_filter) =
+        parse_filter_attribute_values(&attributes.stdout)?;
+    if has_bare_filter {
+        return Err(BranchDeployError::InvalidArgs(
+            "repository has a bare filter attribute; refusing to inspect dirty state".to_string(),
+        ));
+    }
+
     for filter_name in executable_filter_names(repository_root)? {
-        let attribute_pathspec = format!(":(attr:filter={filter_name})");
-        let output = run_git(
-            repository_root,
-            ["ls-files", "-z", "--", attribute_pathspec.as_str()],
-        )?;
-        if !output.stdout.is_empty() {
+        if applied_filter_names.contains(filter_name.as_bytes()) {
             return Err(BranchDeployError::InvalidArgs(format!(
                 "repository has an applicable executable clean/process filter '{filter_name}'; refusing to inspect dirty state"
             )));
@@ -387,21 +397,66 @@ fn executable_filter_names(repository_root: &Path) -> Result<BTreeSet<String>, B
     let output = run_git(repository_root, ["config", "--null", "--list"])?;
     let mut filter_names = BTreeSet::new();
     for (key, value) in parse_repository_git_config(&output.stdout)? {
-        let key = key.to_ascii_lowercase();
-        let Some(filter_key) = key.strip_prefix("filter.") else {
+        let Some((section, filter_key)) = key.split_once('.') else {
             continue;
         };
+        if !section.eq_ignore_ascii_case("filter") {
+            continue;
+        }
         let Some((filter_name, setting)) = filter_key.rsplit_once('.') else {
             continue;
         };
         if !filter_name.is_empty()
-            && (setting == "clean" || setting == "process")
+            && (setting.eq_ignore_ascii_case("clean") || setting.eq_ignore_ascii_case("process"))
             && !value.is_empty()
         {
             filter_names.insert(filter_name.to_string());
         }
     }
     Ok(filter_names)
+}
+
+pub(super) fn parse_filter_attribute_values(
+    output: &[u8],
+) -> Result<(BTreeSet<Vec<u8>>, bool), BranchDeployError> {
+    if output.is_empty() {
+        return Ok((BTreeSet::new(), false));
+    }
+    if output.last() != Some(&b'\0') {
+        return Err(BranchDeployError::Other(anyhow::anyhow!(
+            "git check-attr returned output without a trailing NUL"
+        )));
+    }
+
+    let fields = output[..output.len() - 1]
+        .split(|byte| *byte == b'\0')
+        .collect::<Vec<_>>();
+    if fields.len() % 3 != 0 {
+        return Err(BranchDeployError::Other(anyhow::anyhow!(
+            "git check-attr returned incomplete NUL-delimited triples"
+        )));
+    }
+
+    let mut filter_names = BTreeSet::new();
+    let mut has_bare_filter = false;
+    for record in fields.chunks_exact(3) {
+        let [path, attribute, value] = record else {
+            unreachable!("chunks_exact(3) always yields triples")
+        };
+        if path.is_empty() || *attribute != b"filter" || value.is_empty() {
+            return Err(BranchDeployError::Other(anyhow::anyhow!(
+                "git check-attr returned a malformed filter record"
+            )));
+        }
+        match *value {
+            b"set" => has_bare_filter = true,
+            b"unset" | b"unspecified" => {}
+            filter_name => {
+                filter_names.insert(filter_name.to_vec());
+            }
+        }
+    }
+    Ok((filter_names, has_bare_filter))
 }
 
 fn initialized_submodule_roots(repository_root: &Path) -> Result<Vec<PathBuf>, BranchDeployError> {
@@ -507,6 +562,79 @@ where
         } else {
             BranchDeployError::Other(anyhow::Error::from(error).context("spawning git"))
         }
+    })?;
+    if output.status.success() {
+        return Ok(output);
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let detail = if stderr.is_empty() {
+        format!("git command failed with exit {}", output.status)
+    } else {
+        stderr
+    };
+    Err(BranchDeployError::InvalidArgs(detail))
+}
+
+fn run_git_with_input<I, S>(
+    repository_root: &Path,
+    arguments: I,
+    input: &[u8],
+) -> Result<Output, BranchDeployError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    let mut command = Command::new("git");
+    let null_device = null_device_for_platform(cfg!(windows));
+    let hooks_path = format!("core.hooksPath={null_device}");
+    command.env_clear();
+    if let Some(path) = env::var_os("PATH") {
+        command.env("PATH", path);
+    }
+    command
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", null_device)
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_OPTIONAL_LOCKS", GIT_OPTIONAL_LOCKS_DISABLED)
+        .env("GIT_PAGER", GIT_SAFE_PAGER)
+        .args([
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            hooks_path.as_str(),
+            "-c",
+            "core.pager=cat",
+            "-c",
+            "diff.external=",
+            "-c",
+            "submodule.recurse=false",
+        ])
+        .arg("-C")
+        .arg(repository_root)
+        .args(arguments)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = command.spawn().map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            BranchDeployError::InvalidArgs("`git` was not found on PATH".to_string())
+        } else {
+            BranchDeployError::Other(anyhow::Error::from(error).context("spawning git"))
+        }
+    })?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| BranchDeployError::Other(anyhow::anyhow!("opening git stdin")))?
+        .write_all(input)
+        .map_err(|error| {
+            BranchDeployError::Other(anyhow::Error::from(error).context("writing git stdin"))
+        })?;
+    let output = child.wait_with_output().map_err(|error| {
+        BranchDeployError::Other(anyhow::Error::from(error).context("waiting for git"))
     })?;
     if output.status.success() {
         return Ok(output);
