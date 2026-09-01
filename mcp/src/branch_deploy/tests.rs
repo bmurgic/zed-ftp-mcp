@@ -323,6 +323,41 @@ fn deletion_preflight_preserves_requested_dry_run_without_execution() {
 }
 
 #[test]
+fn deletion_preflight_dry_run_returns_planned_paths_without_execution() {
+    let repository = TestRepo::new();
+    repository.write("gone.txt", b"before");
+    repository.commit("base");
+    let base = repository.rev_parse("HEAD");
+    fs::remove_file(repository.path().join("gone.txt")).expect("fixture file should delete");
+    repository.commit("delete");
+    let head = repository.rev_parse("HEAD");
+
+    let mut request = deletion_request(
+        repository.path(),
+        &base,
+        &head,
+        vec!["gone.txt"],
+        "approved removal",
+    );
+    request.dry_run = true;
+    let mut execution_calls = 0;
+
+    let manifest =
+        delete_branch_files_with_handoff(&request, &test_profile("/remote/root"), |_| {
+            execution_calls += 1;
+            panic!("successful dry run must not reach credential or FTP execution")
+        })
+        .expect("dry run should return its authorized plan");
+
+    assert!(manifest.success);
+    assert!(manifest.dry_run);
+    assert_eq!(execution_calls, 0);
+    assert_eq!(manifest.counts.planned, 1);
+    assert_eq!(manifest.paths[0].git_path, "gone.txt");
+    assert_eq!(manifest.paths[0].status, DeletePathStatus::Planned);
+}
+
+#[test]
 fn deletion_executor_dry_run_returns_planned_paths_without_remote_calls() {
     let mut remote = TestRemote::default();
     let mut plan = deletion_executor_plan();
