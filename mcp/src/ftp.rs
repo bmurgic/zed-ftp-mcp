@@ -283,10 +283,10 @@ fn is_directory_already_exists(error: &FtpError) -> bool {
     if response.status != Status::FileUnavailable {
         return false;
     }
-    std::str::from_utf8(&response.body).is_ok_and(|body| {
-        body.trim_end()
-            .eq_ignore_ascii_case("550 directory already exists")
-    })
+    // Servers word this differently ("550 Directory already exists",
+    // "550 File or directory already exists"), so match the phrase, not the line.
+    std::str::from_utf8(&response.body)
+        .is_ok_and(|body| body.to_ascii_lowercase().contains("already exists"))
 }
 
 fn compare_reader_bytes(
@@ -470,6 +470,20 @@ mod tests {
     fn branch_adapter_mkdir_ignores_directory_already_exists() {
         let (mut client, server) =
             branch_client_for_mkd_response(Some(b"550 Directory Already Exists\r\n"));
+
+        BranchRemote::mkdir_p(&mut client, "/remote")
+            .expect("branch mkdir should ignore an existing directory");
+
+        assert_eq!(
+            server.join().expect("MKD server should complete"),
+            b"MKD /remote\r\n"
+        );
+    }
+
+    #[test]
+    fn branch_adapter_mkdir_ignores_file_or_directory_already_exists() {
+        let (mut client, server) =
+            branch_client_for_mkd_response(Some(b"550 File or directory already exists\r\n"));
 
         BranchRemote::mkdir_p(&mut client, "/remote")
             .expect("branch mkdir should ignore an existing directory");
