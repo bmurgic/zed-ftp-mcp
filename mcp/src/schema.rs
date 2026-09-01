@@ -13,6 +13,7 @@ pub(crate) fn remove_unsigned_integer_format(schema: &mut schemars::Schema) {
 
 #[cfg(test)]
 mod tests {
+    use crate::branch_deploy::BranchDeployManifest;
     use crate::deploy::DeployPlan;
     use crate::tools::{DownloadResponse, ProfilesResponse, UploadResponse};
     use schemars::{schema_for, JsonSchema};
@@ -122,6 +123,28 @@ mod tests {
         super::remove_unsigned_integer_format(&mut schema);
 
         assert_eq!(schema, original);
+    }
+
+    #[test]
+    fn deploy_branch_contract_manifest_counts_have_compatible_integer_schemas() {
+        let manifest_schema: Value = schema::<BranchDeployManifest>();
+
+        assert_no_unsupported_formats(&manifest_schema);
+        for count in [
+            "commits",
+            "touched_paths",
+            "planned_uploads",
+            "uploaded",
+            "verified",
+            "deleted_reported",
+            "failures",
+        ] {
+            assert_integer_schema(
+                &manifest_schema,
+                &format!("/$defs/ManifestCounts/properties/{count}"),
+                None,
+            );
+        }
     }
 
     fn schema<T: JsonSchema>() -> Value {

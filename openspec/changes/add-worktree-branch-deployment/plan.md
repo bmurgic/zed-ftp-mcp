@@ -103,7 +103,7 @@ pub fn plan_branch(
 pub fn dry_run_manifest(plan: BranchDeployPlan, verify: bool) -> BranchDeployManifest;
 ```
 
-- [ ] **1.1 Add the failing contract and path tests.**
+- [x] **1.1 Add the failing contract and path tests.**
 
   Add `#[cfg(test)] mod tests;` to `branch_deploy/mod.rs`. In `tests.rs`, add tests with these exact names:
 
@@ -116,7 +116,7 @@ pub fn dry_run_manifest(plan: BranchDeployPlan, verify: bool) -> BranchDeployMan
 
   Assert the complete JSON keys from the approved manifest, snake-case enum values, exact `/remote/root/path` mapping, and one failure for each unsafe input. Do not use snapshot files.
 
-- [ ] **1.2 Run the focused tests and capture the expected red state.**
+- [x] **1.2 Run the focused tests and capture the expected red state.**
 
   Run:
 
@@ -126,7 +126,7 @@ pub fn dry_run_manifest(plan: BranchDeployPlan, verify: bool) -> BranchDeployMan
 
   Expected result: compilation fails because `branch_deploy` and its contract types do not exist.
 
-- [ ] **1.3 Add the shared contracts and lexical mapper.**
+- [x] **1.3 Add the shared contracts and lexical mapper.**
 
   Define these serialized statuses in `mod.rs`:
 
@@ -154,7 +154,7 @@ pub fn dry_run_manifest(plan: BranchDeployPlan, verify: bool) -> BranchDeployMan
 
   Require valid UTF-8, a non-empty relative path, non-empty components, no `.` or `..`, no backslash or control character, and a mapped target strictly below the normalized remote root. Return both the Git path and remote path as owned strings.
 
-- [ ] **1.4 Run the contract and path tests until they pass.**
+- [x] **1.4 Run the contract and path tests until they pass.**
 
   Run:
 
@@ -164,7 +164,7 @@ pub fn dry_run_manifest(plan: BranchDeployPlan, verify: bool) -> BranchDeployMan
 
   Expected result: all new tests pass and existing schema tests remain green.
 
-- [ ] **1.5 Add the temporary Git fixture and failing planner tests.**
+- [x] **1.5 Add the temporary Git fixture and failing planner tests.**
 
   Add `tempfile = "3"` under `[dev-dependencies]`. Implement `TestRepo` with `tempfile::TempDir` and a `git(&[&str]) -> Output` helper that sets repository-local `user.name` and `user.email`.
 
@@ -182,7 +182,7 @@ pub fn dry_run_manifest(plan: BranchDeployPlan, verify: bool) -> BranchDeployMan
 
   Create real commits for every case. Use `git hash-object` and `git cat-file -s` as independent expected values. For the dirty case, overwrite the working-tree file after committing and assert the planned object ID and size still match `HEAD:path`.
 
-- [ ] **1.6 Run the planner tests and capture the expected red state.**
+- [x] **1.6 Run the planner tests and capture the expected red state.**
 
   Run:
 
@@ -192,7 +192,7 @@ pub fn dry_run_manifest(plan: BranchDeployPlan, verify: bool) -> BranchDeployMan
 
   Expected result: tests fail because Git planning functions do not exist.
 
-- [ ] **1.7 Implement the Git planner with NUL-delimited plumbing.**
+- [x] **1.7 Implement the Git planner with NUL-delimited plumbing.**
 
   Add a command helper that always invokes `git -C <repo_root>` without a shell. Map `ErrorKind::NotFound` to `InvalidArgs("`git` was not found on PATH")`. Include stderr in other invalid Git-command messages.
 
@@ -214,7 +214,7 @@ pub fn dry_run_manifest(plan: BranchDeployPlan, verify: bool) -> BranchDeployMan
 
   Mark a deleted entry `blocked_case_collision` when its ASCII-folded path matches a surviving head blob. Otherwise mark it `requires_explicit_call`. Do not call any delete method.
 
-- [ ] **1.8 Run all planner tests until they pass.**
+- [x] **1.8 Run all planner tests until they pass.**
 
   Run:
 
@@ -224,7 +224,7 @@ pub fn dry_run_manifest(plan: BranchDeployPlan, verify: bool) -> BranchDeployMan
 
   Expected result: every Git fixture passes twice in the same process without order drift.
 
-- [ ] **1.9 Add the failing dry-run side-effect test.**
+- [x] **1.9 Add the failing dry-run side-effect test.**
 
   Add counters at orchestration seams under test. The test must assert this exact result after `dry_run_manifest`:
 
@@ -238,13 +238,13 @@ pub fn dry_run_manifest(plan: BranchDeployPlan, verify: bool) -> BranchDeployMan
 
   Name the test `dry_run_reads_metadata_only` so the QA command can select it exactly.
 
-- [ ] **1.10 Add dry-run CLI, MCP, and schema contract tests.**
+- [x] **1.10 Add dry-run CLI, MCP, and schema contract tests.**
 
   In `main.rs`, test clap parsing for `deploy-branch staging --repo-root /repo --base origin/dev --dry-run`. Assert `head_ref == "HEAD"` and `verify == true`. In `tools.rs`, test `DeployBranchArgs` deserialization with the same defaults and invalid-parameter mapping. In `schema.rs`, assert that all manifest counts are integer schemas with no unsupported unsigned format.
 
   Prefix these test names with `deploy_branch_contract` so the Slice 1 QA command selects all of them.
 
-- [ ] **1.11 Implement the shared dry-run CLI and MCP path.**
+- [x] **1.11 Implement the shared dry-run CLI and MCP path.**
 
   Add the CLI arguments:
 
@@ -261,15 +261,15 @@ pub fn dry_run_manifest(plan: BranchDeployPlan, verify: bool) -> BranchDeployMan
 
   Add MCP `DeployBranchArgs` with serde default functions for `HEAD` and `true`. Both wrappers load the profile, build one `DeployBranchRequest`, call `plan_branch`, and return `dry_run_manifest` when `dry_run` is true. Keep the actual-execution branch private to the orchestration function that Task 2 completes. Invalid roots and refs map to MCP invalid parameters. CLI serializes the manifest with `serde_json::to_writer_pretty`.
 
-- [ ] **1.12 Run the Slice 1 QA commands.**
+- [x] **1.12 Run the Slice 1 QA commands.**
 
   Run every command under `qa.md#slice-1-qa-deterministic-plan-and-dry-run`. Save a non-empty report with `Status: PASS` only after every command exits zero.
 
-- [ ] **1.13 Update the README for the verified dry-run behavior.**
+- [x] **1.13 Update the README for the verified dry-run behavior.**
 
   Document the command and MCP inputs, exact committed-blob planning, dirty-state reporting, full-range union, and deleted-path reporting. State that reported deletions do not remove remote files.
 
-- [ ] **1.14 Commit the Slice 1 implementation.**
+- [x] **1.14 Commit the Slice 1 implementation.**
 
   Run `git diff --check`, stage only Slice 1 files and its checked `plan.md` micro-steps, then commit:
 

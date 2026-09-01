@@ -5,6 +5,7 @@
 //!   - `set-password`       store a profile's FTP password in the OS keychain
 //!   - `list-profiles`      print profiles loaded from the config file
 
+mod branch_deploy;
 mod config;
 mod deploy;
 mod ftp;
@@ -34,6 +35,30 @@ enum Cmd {
     },
     /// List configured connection profiles.
     ListProfiles,
+    /// Plan a committed Git range from an explicit worktree.
+    DeployBranch {
+        /// Profile name as defined in connections.toml.
+        profile: String,
+        /// Absolute path to the exact Git worktree root.
+        #[arg(long)]
+        repo_root: String,
+        /// Base Git ref for the commit range.
+        #[arg(long = "base")]
+        base_ref: String,
+        /// Head Git ref for the commit range.
+        #[arg(long = "head", default_value = "HEAD")]
+        head_ref: String,
+        /// Disable post-upload byte verification.
+        #[arg(
+            long = "no-verify",
+            action = clap::ArgAction::SetFalse,
+            default_value_t = true
+        )]
+        verify: bool,
+        /// Return the deployment plan without accessing FTP or credentials.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[tokio::main]
@@ -51,6 +76,21 @@ async fn main() -> Result<()> {
         Cmd::Serve => serve().await,
         Cmd::SetPassword { profile } => set_password(&profile),
         Cmd::ListProfiles => list_profiles(),
+        Cmd::DeployBranch {
+            profile,
+            repo_root,
+            base_ref,
+            head_ref,
+            verify,
+            dry_run,
+        } => deploy_branch_command(branch_deploy::DeployBranchRequest {
+            profile,
+            repo_root,
+            base_ref,
+            head_ref,
+            verify,
+            dry_run,
+        }),
     }
 }
 
@@ -101,4 +141,61 @@ fn list_profiles() -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn deploy_branch_command(request: branch_deploy::DeployBranchRequest) -> Result<()> {
+    let config = config::Config::load()?;
+    let profile = config.profile(&request.profile).with_context(|| {
+        format!(
+            "no profile named '{}' in {}",
+            request.profile,
+            config::path_hint()
+        )
+    })?;
+    let manifest = branch_deploy::deploy_branch(&request, profile)?;
+    let stdout = std::io::stdout();
+    let mut output = stdout.lock();
+    serde_json::to_writer_pretty(&mut output, &manifest)?;
+    use std::io::Write;
+    writeln!(output)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Cmd};
+    use clap::Parser;
+
+    #[test]
+    fn deploy_branch_contract_cli_defaults() {
+        let cli = Cli::try_parse_from([
+            "zed-ftp-mcp",
+            "deploy-branch",
+            "staging",
+            "--repo-root",
+            "/repo",
+            "--base",
+            "origin/dev",
+            "--dry-run",
+        ])
+        .expect("CLI arguments should parse");
+
+        let Some(Cmd::DeployBranch {
+            profile,
+            repo_root,
+            base_ref,
+            head_ref,
+            verify,
+            dry_run,
+        }) = cli.command
+        else {
+            panic!("expected deploy-branch command");
+        };
+        assert_eq!(profile, "staging");
+        assert_eq!(repo_root, "/repo");
+        assert_eq!(base_ref, "origin/dev");
+        assert_eq!(head_ref, "HEAD");
+        assert!(verify);
+        assert!(dry_run);
+    }
 }

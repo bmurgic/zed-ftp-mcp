@@ -86,6 +86,28 @@ Or just call the tools directly without the agent doing any reasoning:
 
 > Run the `ftp_deploy` tool with profile=staging.
 
+### Plan a Git worktree range
+
+Use `deploy-branch` to preview the committed files from a selected Git
+worktree. The command requires the absolute path to the exact worktree root
+and a base ref. The head ref defaults to `HEAD`.
+
+```sh
+zed-ftp-mcp deploy-branch staging \
+	--repo-root /absolute/path/to/repository \
+	--base origin/main \
+	--dry-run
+```
+
+The MCP equivalent is `ftp_deploy_branch`. It accepts `profile`, `repo_root`,
+and `base_ref`, plus optional `head_ref`, `verify`, and `dry_run` fields.
+
+The dry-run manifest lists the union of paths touched by every commit in the
+range. Each surviving path uses the blob from the resolved head commit, even
+when the worktree is dirty or the profile's `local_root` and ignore rules point
+somewhere else. The manifest records the dirty state and reports removed Git
+paths. A reported removal never deletes a remote file.
+
 ### Available tools
 
 | Tool | Purpose |
@@ -97,6 +119,7 @@ Or just call the tools directly without the agent doing any reasoning:
 | `ftp_upload_file` | Upload one local file; `before_changes=true` uploads the last-committed (git HEAD) version instead of the working tree |
 | `ftp_deploy` | Recursive upload of the full local project, gitignore-aware, optional `dry_run` |
 | `ftp_deploy_commits` | Upload only the files changed by specific commit SHAs, optional `dry_run` |
+| `ftp_deploy_branch` | Plan a committed range from an explicit Git worktree, optional `dry_run` |
 | `ftp_mkdir` | Create a directory and any missing parents |
 | `ftp_delete_file` | Delete a single remote file |
 | `ftp_delete_dir` | Delete an empty remote directory |

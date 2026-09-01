@@ -46,3 +46,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Used for password prompts on `set-password`
 rpassword = "7"
+
+[dev-dependencies]
+tempfile = "3"

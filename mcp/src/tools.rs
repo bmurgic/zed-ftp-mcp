@@ -3,7 +3,7 @@
 //! Each tool is a thin async wrapper that loads config, then runs blocking
 //! FTP work on a tokio blocking thread (suppaftp is sync).
 
-use crate::{config::Config, deploy};
+use crate::{branch_deploy, config::Config, deploy};
 use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::{tool, tool_handler, tool_router, ErrorData, ServerHandler};
 use schemars::JsonSchema;
@@ -93,6 +93,32 @@ pub struct DeployCommitsArgs {
     /// If true, list what *would* be uploaded without sending anything.
     #[serde(default)]
     pub dry_run: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DeployBranchArgs {
+    pub profile: String,
+    /// Absolute path to the exact Git worktree root.
+    pub repo_root: String,
+    /// Base Git ref for the commit range.
+    pub base_ref: String,
+    /// Head Git ref for the commit range. Defaults to HEAD.
+    #[serde(default = "default_head_ref")]
+    pub head_ref: String,
+    /// Verify each uploaded file by default.
+    #[serde(default = "default_verify")]
+    pub verify: bool,
+    /// Return the plan without reading credentials or accessing FTP.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+fn default_head_ref() -> String {
+    "HEAD".to_string()
+}
+
+fn default_verify() -> bool {
+    true
 }
 
 // ─── Tool output types ───────────────────────────────────────────────────────
@@ -413,6 +439,34 @@ impl FtpServer {
         }
     }
 
+    #[tool(description = "Plan a committed Git range from an explicit worktree. \
+            The plan uses exact head-commit blobs and reports removed Git paths. \
+            Set dry_run=true to avoid credential and FTP access.")]
+    async fn ftp_deploy_branch(
+        &self,
+        Parameters(args): Parameters<DeployBranchArgs>,
+    ) -> Result<Json<branch_deploy::BranchDeployManifest>, ErrorData> {
+        let config = Config::load().map_err(internal)?;
+        let profile = config
+            .profile(&args.profile)
+            .ok_or_else(|| invalid(format!("no profile '{}'", args.profile)))?
+            .clone();
+        let request = branch_deploy::DeployBranchRequest {
+            profile: args.profile,
+            repo_root: args.repo_root,
+            base_ref: args.base_ref,
+            head_ref: args.head_ref,
+            verify: args.verify,
+            dry_run: args.dry_run,
+        };
+        let result =
+            tokio::task::spawn_blocking(move || branch_deploy::deploy_branch(&request, &profile))
+                .await
+                .map_err(internal)?;
+
+        result.map(Json).map_err(branch_deploy_error)
+    }
+
     #[tool(
         description = "Download a file from the FTP server and return its contents. \
             UTF-8 text is returned as-is; binary files are base64-encoded. \
@@ -581,6 +635,13 @@ fn invalid(msg: impl Into<String>) -> ErrorData {
     ErrorData::invalid_params(msg.into(), None)
 }
 
+fn branch_deploy_error(error: branch_deploy::BranchDeployError) -> ErrorData {
+    match error {
+        branch_deploy::BranchDeployError::InvalidArgs(message) => invalid(message),
+        branch_deploy::BranchDeployError::Other(error) => internal(error),
+    }
+}
+
 fn use_base64(bytes: &[u8]) -> String {
     use std::fmt::Write;
     const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -595,4 +656,30 @@ fn use_base64(bytes: &[u8]) -> String {
         let _ = write!(out, "{}", if chunk.len() > 2 { TABLE[b2 & 0x3f] as char } else { '=' });
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{branch_deploy_error, DeployBranchArgs};
+    use crate::branch_deploy::BranchDeployError;
+    use rmcp::model::ErrorCode;
+
+    #[test]
+    fn deploy_branch_contract_mcp_defaults_and_invalid_params() {
+        let args: DeployBranchArgs = serde_json::from_value(serde_json::json!({
+            "profile": "staging",
+            "repo_root": "/repo",
+            "base_ref": "origin/dev",
+            "dry_run": true
+        }))
+        .expect("MCP arguments should deserialize");
+
+        assert_eq!(args.head_ref, "HEAD");
+        assert!(args.verify);
+        assert!(args.dry_run);
+        assert_eq!(
+            branch_deploy_error(BranchDeployError::InvalidArgs("bad repository".to_string())).code,
+            ErrorCode::INVALID_PARAMS
+        );
+    }
 }
