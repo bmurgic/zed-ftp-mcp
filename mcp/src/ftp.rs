@@ -271,10 +271,16 @@ fn branch_mkdir_path(
 }
 
 fn is_directory_already_exists(error: &FtpError) -> bool {
-    matches!(
-        error,
-        FtpError::UnexpectedResponse(response) if response.status == Status::FileUnavailable
-    )
+    let FtpError::UnexpectedResponse(response) = error else {
+        return false;
+    };
+    if response.status != Status::FileUnavailable {
+        return false;
+    }
+    std::str::from_utf8(&response.body).is_ok_and(|body| {
+        body.trim_end()
+            .eq_ignore_ascii_case("550 directory already exists")
+    })
 }
 
 fn compare_reader_bytes(
@@ -371,6 +377,21 @@ mod tests {
     }
 
     #[test]
+    fn branch_adapter_mkdir_reports_permission_denied_550_as_operation_failure() {
+        let (mut client, server) =
+            branch_client_for_mkd_response(Some(b"550 permission denied\r\n"));
+
+        let failure = BranchRemote::mkdir_p(&mut client, "/remote")
+            .expect_err("branch mkdir should report permission denied");
+
+        assert_eq!(failure.kind, RemoteFailureKind::Operation);
+        assert_eq!(
+            server.join().expect("MKD server should complete"),
+            b"MKD /remote\r\n"
+        );
+    }
+
+    #[test]
     fn branch_adapter_mkdir_reports_connection_loss() {
         let (mut client, server) = branch_client_for_mkd_response(None);
 
@@ -387,7 +408,7 @@ mod tests {
     #[test]
     fn branch_adapter_mkdir_ignores_directory_already_exists() {
         let (mut client, server) =
-            branch_client_for_mkd_response(Some(b"550 directory already exists\r\n"));
+            branch_client_for_mkd_response(Some(b"550 Directory Already Exists\r\n"));
 
         BranchRemote::mkdir_p(&mut client, "/remote")
             .expect("branch mkdir should ignore an existing directory");
@@ -551,10 +572,16 @@ mod tests {
             .set_binary_mode()
             .expect("adapter should select binary mode");
         client
-            .upload_bytes("branch-binary.bin", &expected)
+            .mkdir_p("branch-round-trip")
+            .expect("adapter should create the parent directory");
+        client
+            .mkdir_p("branch-round-trip")
+            .expect("adapter should accept the existing parent directory");
+        client
+            .upload_bytes("branch-round-trip/branch-binary.bin", &expected)
             .expect("adapter should upload binary data");
         let comparison = client
-            .compare_remote_bytes("branch-binary.bin", &expected)
+            .compare_remote_bytes("branch-round-trip/branch-binary.bin", &expected)
             .expect("adapter should retrieve and compare binary data");
         assert!(comparison.matches);
         assert_eq!(comparison.bytes_read, expected.len() as u64);
