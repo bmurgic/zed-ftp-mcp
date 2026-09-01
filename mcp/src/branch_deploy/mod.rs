@@ -391,6 +391,7 @@ pub fn dry_run_manifest(plan: BranchDeployPlan, verify: bool) -> BranchDeployMan
 
 pub fn deletion_dry_run_manifest(mut plan: BranchDeletePlan) -> BranchDeleteManifest {
     let preflight_rejected = !plan.blocked.is_empty();
+    let dry_run = plan.dry_run;
     let paths = if preflight_rejected {
         Vec::new()
     } else {
@@ -402,7 +403,7 @@ pub fn deletion_dry_run_manifest(mut plan: BranchDeletePlan) -> BranchDeleteMani
             })
             .collect()
     };
-    deletion_manifest(plan, paths, preflight_rejected, preflight_rejected)
+    deletion_manifest(plan, paths, preflight_rejected, dry_run)
 }
 
 pub(crate) fn deletion_manifest(

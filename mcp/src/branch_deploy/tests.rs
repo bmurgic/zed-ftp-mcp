@@ -286,6 +286,42 @@ fn deletion_preflight_rejects_unsafe_non_ascii_and_case_colliding_paths_atomical
 }
 
 #[test]
+fn deletion_preflight_preserves_requested_dry_run_without_execution() {
+    let repository = TestRepo::new();
+    repository.write("gone.txt", b"before");
+    repository.commit("base");
+    let base = repository.rev_parse("HEAD");
+    fs::remove_file(repository.path().join("gone.txt")).expect("fixture file should delete");
+    repository.commit("delete");
+    let head = repository.rev_parse("HEAD");
+
+    for expected_dry_run in [false, true] {
+        let mut request = deletion_request(
+            repository.path(),
+            &base,
+            &head,
+            vec!["gone.txt", "not-deleted.txt"],
+            "reason",
+        );
+        request.dry_run = expected_dry_run;
+        let mut execution_calls = 0;
+
+        let manifest =
+            delete_branch_files_with_handoff(&request, &test_profile("/remote/root"), |_| {
+                execution_calls += 1;
+                panic!("blocked preflight must not reach credential or FTP execution")
+            })
+            .expect("blocked preflight should return a manifest");
+
+        assert!(!manifest.success);
+        assert_eq!(manifest.dry_run, expected_dry_run);
+        assert!(!manifest.blocked.is_empty());
+        assert!(manifest.paths.is_empty());
+        assert_eq!(execution_calls, 0);
+    }
+}
+
+#[test]
 fn deletion_executor_dry_run_returns_planned_paths_without_remote_calls() {
     let mut remote = TestRemote::default();
     let mut plan = deletion_executor_plan();

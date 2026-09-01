@@ -314,6 +314,9 @@ mod tests {
         compare_reader_bytes, map_branch_ftp_error, AnyFtpStream, BranchRemote, FtpClient,
         RemoteFailureKind,
     };
+    use crate::branch_deploy::{
+        execute_deletion, BranchDeletePlan, DeletePathResult, DeletePathStatus, RepositorySummary,
+    };
     use crate::config::Profile;
     use std::io::{self, BufRead, BufReader, Read, Write};
     use std::net::AddrParseError;
@@ -653,8 +656,9 @@ mod tests {
         };
         let control_port = published_control_port(&container.name);
         wait_for_ftp(control_port);
+        let (proxy_port, commands) = start_control_proxy(control_port);
 
-        let mut stream = FtpStream::connect(format!("127.0.0.1:{control_port}"))
+        let mut stream = FtpStream::connect(format!("127.0.0.1:{proxy_port}"))
             .expect("FTP client should connect");
         stream.set_mode(Mode::Passive);
         stream
@@ -671,8 +675,52 @@ mod tests {
         BranchRemote::upload_bytes(&mut client, "branch-deletion/keep.bin", &[0x80, 1])
             .expect("adapter should seed the unrequested file");
 
-        BranchRemote::delete_file(&mut client, "branch-deletion/remove.bin")
-            .expect("adapter should delete only the requested file");
+        commands
+            .lock()
+            .expect("command log should not be poisoned")
+            .clear();
+        let manifest = execute_deletion(
+            BranchDeletePlan {
+                profile: "disposable".to_string(),
+                repository: RepositorySummary {
+                    root: "/approved/repository".to_string(),
+                    dirty: false,
+                },
+                base_commit: "a".repeat(40),
+                head_commit: "b".repeat(40),
+                reason: "remove the approved test file".to_string(),
+                dry_run: false,
+                paths: vec![DeletePathResult {
+                    git_path: "branch-deletion/remove.bin".to_string(),
+                    remote_path: "branch-deletion/remove.bin".to_string(),
+                    status: DeletePathStatus::Planned,
+                }],
+                blocked: Vec::new(),
+                failures: Vec::new(),
+            },
+            &mut client,
+        );
+
+        assert!(manifest.success);
+        assert!(!manifest.dry_run);
+        assert_eq!(manifest.counts.planned, 0);
+        assert_eq!(manifest.counts.deleted, 1);
+        assert_eq!(manifest.counts.failed, 0);
+        assert_eq!(manifest.counts.not_attempted, 0);
+        assert_eq!(manifest.counts.blocked, 0);
+        assert_eq!(manifest.paths.len(), 1);
+        assert_eq!(manifest.paths[0].status, DeletePathStatus::Deleted);
+        let commands = commands.lock().expect("command log should not be poisoned");
+        let type_index = commands
+            .iter()
+            .position(|command| command.starts_with("TYPE I"))
+            .expect("deletion executor should select binary mode");
+        let delete_index = commands
+            .iter()
+            .position(|command| command == "DELE branch-deletion/remove.bin")
+            .expect("deletion executor should delete the approved path");
+        assert!(type_index < delete_index);
+        drop(commands);
         assert!(
             client.get_bytes("branch-deletion/remove.bin").is_err(),
             "the requested file must be absent"
