@@ -191,6 +191,29 @@ fn executor_batch_blob_reader_returns_exact_committed_bytes() {
 }
 
 #[test]
+fn executor_batch_blob_reader_reads_two_committed_blobs_sequentially() {
+    let repository = TestRepo::new();
+    let first_expected = [0, b'\r', b'\n', 0xff, 0x80];
+    let second_expected = [0x81, 1, 2, b'\n'];
+    repository.write("first.bin", &first_expected);
+    repository.write("second.bin", &second_expected);
+    repository.commit("binary fixtures");
+    let first_object_id = repository.rev_parse("HEAD:first.bin");
+    let second_object_id = repository.rev_parse("HEAD:second.bin");
+    let mut blobs = BatchBlobReader::new(repository.path()).expect("batch reader should start");
+
+    let first_actual = blobs
+        .read_blob(&first_object_id)
+        .expect("batch reader should return the first committed blob");
+    let second_actual = blobs
+        .read_blob(&second_object_id)
+        .expect("batch reader should return the second committed blob");
+
+    assert_eq!(first_actual, first_expected);
+    assert_eq!(second_actual, second_expected);
+}
+
+#[test]
 fn executor_operation_upload_failure_continues() {
     let mut remote = TestRemote {
         failures: std::collections::BTreeMap::from([(
