@@ -310,34 +310,29 @@ pub fn delete_branch_files(
     request: &DeleteBranchFilesRequest,
     profile: &Profile,
 ) -> Result<BranchDeleteManifest, BranchDeployError> {
+    delete_branch_files_with_connector(request, profile, crate::ftp::FtpClient::connect)
+}
+
+fn delete_branch_files_with_connector<F>(
+    request: &DeleteBranchFilesRequest,
+    profile: &Profile,
+    connect: F,
+) -> Result<BranchDeleteManifest, BranchDeployError>
+where
+    F: FnOnce(&str, &Profile) -> anyhow::Result<crate::ftp::FtpClient>,
+{
     let plan = plan_deletion(request, profile)?;
     if !plan.blocked.is_empty() || request.dry_run {
         return Ok(deletion_dry_run_manifest(plan));
     }
 
-    let mut remote = match crate::ftp::FtpClient::connect(&request.profile, profile) {
+    let mut remote = match connect(&request.profile, profile) {
         Ok(remote) => remote,
         Err(error) => return Ok(deletion_connection_failure_manifest(plan, error)),
     };
     let manifest = execute_deletion(plan, &mut remote);
     remote.quit();
     Ok(manifest)
-}
-
-#[cfg(test)]
-pub(crate) fn delete_branch_files_with_handoff<F>(
-    request: &DeleteBranchFilesRequest,
-    profile: &Profile,
-    execution_handoff: F,
-) -> Result<BranchDeleteManifest, BranchDeployError>
-where
-    F: FnOnce(BranchDeletePlan) -> Result<BranchDeleteManifest, BranchDeployError>,
-{
-    let plan = plan_deletion(request, profile)?;
-    if !plan.blocked.is_empty() || request.dry_run {
-        return Ok(deletion_dry_run_manifest(plan));
-    }
-    execution_handoff(plan)
 }
 
 pub fn dry_run_manifest(plan: BranchDeployPlan, verify: bool) -> BranchDeployManifest {

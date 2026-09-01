@@ -1,7 +1,7 @@
 use super::git::null_device_for_platform;
 use super::git::BatchBlobReader;
 use super::{
-    delete_branch_files_with_handoff, deploy_branch, deploy_branch_with_connector,
+    delete_branch_files_with_connector, deploy_branch, deploy_branch_with_connector,
     dry_run_manifest, execute_deletion, execute_deploy, map_remote_path, plan_branch,
     plan_deletion, BlobSource, BranchDeletePlan, BranchDeployError, BranchDeployPlan, BranchRemote,
     DeleteBranchFilesRequest, DeletePathResult, DeletePathStatus, DeletedPathStatus,
@@ -208,17 +208,14 @@ fn deletion_preflight_requires_full_pinned_commits_paths_and_reason() {
             "reason",
         ),
     ] {
-        let mut execution_calls = 0;
         let manifest =
-            delete_branch_files_with_handoff(&request, &test_profile("/remote/root"), |_| {
-                execution_calls += 1;
+            delete_branch_files_with_connector(&request, &test_profile("/remote/root"), |_, _| {
                 panic!("invalid preflight must not reach credential or remote execution")
             })
             .expect("preflight should return its complete rejection");
         assert!(!manifest.success);
         assert!(!manifest.blocked.is_empty());
         assert!(manifest.paths.is_empty());
-        assert_eq!(execution_calls, 0);
     }
 
     let plan = plan_deletion(
@@ -305,11 +302,8 @@ fn deletion_preflight_preserves_requested_dry_run_without_execution() {
             "reason",
         );
         request.dry_run = expected_dry_run;
-        let mut execution_calls = 0;
-
         let manifest =
-            delete_branch_files_with_handoff(&request, &test_profile("/remote/root"), |_| {
-                execution_calls += 1;
+            delete_branch_files_with_connector(&request, &test_profile("/remote/root"), |_, _| {
                 panic!("blocked preflight must not reach credential or FTP execution")
             })
             .expect("blocked preflight should return a manifest");
@@ -318,7 +312,6 @@ fn deletion_preflight_preserves_requested_dry_run_without_execution() {
         assert_eq!(manifest.dry_run, expected_dry_run);
         assert!(!manifest.blocked.is_empty());
         assert!(manifest.paths.is_empty());
-        assert_eq!(execution_calls, 0);
     }
 }
 
@@ -340,18 +333,14 @@ fn deletion_preflight_dry_run_returns_planned_paths_without_execution() {
         "approved removal",
     );
     request.dry_run = true;
-    let mut execution_calls = 0;
-
     let manifest =
-        delete_branch_files_with_handoff(&request, &test_profile("/remote/root"), |_| {
-            execution_calls += 1;
+        delete_branch_files_with_connector(&request, &test_profile("/remote/root"), |_, _| {
             panic!("successful dry run must not reach credential or FTP execution")
         })
         .expect("dry run should return its authorized plan");
 
     assert!(manifest.success);
     assert!(manifest.dry_run);
-    assert_eq!(execution_calls, 0);
     assert_eq!(manifest.counts.planned, 1);
     assert_eq!(manifest.paths[0].git_path, "gone.txt");
     assert_eq!(manifest.paths[0].status, DeletePathStatus::Planned);
