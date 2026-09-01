@@ -1,3 +1,4 @@
+use super::git::null_device_for_platform;
 use super::{
     deploy_branch, deploy_branch_with_handoff, dry_run_manifest, map_remote_path, plan_branch,
     BranchDeployError, BranchDeployPlan, DeletedPathStatus, DeployBranchRequest, UploadStatus,
@@ -103,6 +104,12 @@ fn planner_path_rejects_absolute_dot_backslash_and_control_components() {
 #[test]
 fn planner_path_rejects_non_utf8() {
     assert!(map_remote_path("/remote/root", b"invalid-\xff").is_err());
+}
+
+#[test]
+fn planner_config_uses_platform_null_devices() {
+    assert_eq!(null_device_for_platform(true), "NUL");
+    assert_eq!(null_device_for_platform(false), "/dev/null");
 }
 
 #[test]

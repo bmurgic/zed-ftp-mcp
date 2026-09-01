@@ -9,9 +9,16 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-const GIT_CONFIG_DISABLED_PATH: &str = "/dev/null";
 const GIT_OPTIONAL_LOCKS_DISABLED: &str = "0";
 const GIT_SAFE_PAGER: &str = "cat";
+
+pub(super) fn null_device_for_platform(is_windows: bool) -> &'static str {
+    if is_windows {
+        "NUL"
+    } else {
+        "/dev/null"
+    }
+}
 
 #[derive(Debug)]
 struct TreeEntry {
@@ -309,6 +316,8 @@ where
     S: AsRef<std::ffi::OsStr>,
 {
     let mut command = Command::new("git");
+    let null_device = null_device_for_platform(cfg!(windows));
+    let hooks_path = format!("core.hooksPath={null_device}");
     // Planning must not inherit Git variables that can select another repository or inject config.
     command.env_clear();
     if let Some(path) = env::var_os("PATH") {
@@ -317,7 +326,7 @@ where
     // System and user configuration are outside the selected repository and cannot affect planning.
     command
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", GIT_CONFIG_DISABLED_PATH)
+        .env("GIT_CONFIG_GLOBAL", null_device)
         // `git status` must not refresh the index or create an optional lock while inspecting dirty state.
         .env("GIT_OPTIONAL_LOCKS", GIT_OPTIONAL_LOCKS_DISABLED)
         .env("GIT_PAGER", GIT_SAFE_PAGER)
@@ -326,7 +335,7 @@ where
             "-c",
             "core.fsmonitor=false",
             "-c",
-            "core.hooksPath=/dev/null",
+            hooks_path.as_str(),
             "-c",
             "core.pager=cat",
             "-c",
