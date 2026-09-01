@@ -11,6 +11,9 @@ use std::process::{Command, Output};
 use tempfile::TempDir;
 
 #[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
+#[cfg(unix)]
 use std::os::unix::ffi::OsStringExt;
 
 #[test]
@@ -445,6 +448,34 @@ fn dry_run_reads_metadata_only() {
     assert!(public_error.to_string().contains("not available"));
 }
 
+#[cfg(unix)]
+#[test]
+fn dry_run_does_not_run_repository_fsmonitor() {
+    let repository = TestRepo::new();
+    repository.write("tracked.txt", b"base");
+    repository.commit("base");
+    let base = repository.rev_parse("HEAD");
+    repository.write("tracked.txt", b"head");
+    repository.commit("head");
+    let sentinel = repository.enable_fsmonitor_sentinel();
+
+    let manifest = deploy_branch(
+        &request(
+            repository.path().to_str().expect("utf-8 path"),
+            &base,
+            "HEAD",
+        ),
+        &test_profile("/remote/root"),
+    )
+    .expect("dry run should succeed without running the fsmonitor command");
+
+    assert!(manifest.dry_run);
+    assert!(
+        !sentinel.exists(),
+        "dry-run planning must not execute repository-configured fsmonitor commands"
+    );
+}
+
 fn test_profile(remote_root: &str) -> Profile {
     Profile {
         host: "example.test".to_string(),
@@ -586,6 +617,29 @@ impl TestRepo {
 
     fn rev_parse(&self, expression: &str) -> String {
         self.git_text(&["rev-parse", expression])
+    }
+
+    #[cfg(unix)]
+    fn enable_fsmonitor_sentinel(&self) -> std::path::PathBuf {
+        let sentinel = self.path().join("fsmonitor-was-invoked");
+        let command = self.path().join("fsmonitor-sentinel.sh");
+        let script = format!(
+            "#!/bin/sh\n: > '{}'\nprintf 'version 2\\n\\n'\n",
+            sentinel.display()
+        );
+        fs::write(&command, script).expect("fsmonitor sentinel should be written");
+        let mut permissions = fs::metadata(&command)
+            .expect("fsmonitor sentinel metadata should be readable")
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&command, permissions)
+            .expect("fsmonitor sentinel should be executable");
+        self.git_success(&[
+            "config",
+            "core.fsmonitor",
+            command.to_str().expect("utf-8 path"),
+        ]);
+        sentinel
     }
 
     fn git_text(&self, arguments: &[&str]) -> String {

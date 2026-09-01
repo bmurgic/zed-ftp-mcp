@@ -5,8 +5,13 @@ use super::{
 };
 use crate::config::Profile;
 use std::collections::{BTreeMap, BTreeSet};
+use std::env;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+
+const GIT_CONFIG_DISABLED_PATH: &str = "/dev/null";
+const GIT_OPTIONAL_LOCKS_DISABLED: &str = "0";
+const GIT_SAFE_PAGER: &str = "cat";
 
 #[derive(Debug)]
 struct TreeEntry {
@@ -303,18 +308,42 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<std::ffi::OsStr>,
 {
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    // Planning must not inherit Git variables that can select another repository or inject config.
+    command.env_clear();
+    if let Some(path) = env::var_os("PATH") {
+        command.env("PATH", path);
+    }
+    // System and user configuration are outside the selected repository and cannot affect planning.
+    command
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", GIT_CONFIG_DISABLED_PATH)
+        // `git status` must not refresh the index or create an optional lock while inspecting dirty state.
+        .env("GIT_OPTIONAL_LOCKS", GIT_OPTIONAL_LOCKS_DISABLED)
+        .env("GIT_PAGER", GIT_SAFE_PAGER)
+        // Planner commands must not invoke repository-configured monitors, hooks, pagers, or external diffs.
+        .args([
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.pager=cat",
+            "-c",
+            "diff.external=",
+            "-c",
+            "submodule.recurse=false",
+        ])
         .arg("-C")
         .arg(repository_root)
-        .args(arguments)
-        .output()
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                BranchDeployError::InvalidArgs("`git` was not found on PATH".to_string())
-            } else {
-                BranchDeployError::Other(anyhow::Error::from(error).context("spawning git"))
-            }
-        })?;
+        .args(arguments);
+    let output = command.output().map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            BranchDeployError::InvalidArgs("`git` was not found on PATH".to_string())
+        } else {
+            BranchDeployError::Other(anyhow::Error::from(error).context("spawning git"))
+        }
+    })?;
     if output.status.success() {
         return Ok(output);
     }
