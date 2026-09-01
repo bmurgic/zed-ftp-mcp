@@ -22,28 +22,6 @@ pub enum BranchDeployError {
     Other(#[from] anyhow::Error),
 }
 
-pub(crate) trait BranchDeployExecution {
-    fn read_blob_contents(&mut self, plan: &BranchDeployPlan) -> Result<(), BranchDeployError>;
-    fn read_credentials(&mut self, profile_name: &str) -> Result<(), BranchDeployError>;
-    fn connect_remote(&mut self, profile: &Profile) -> Result<(), BranchDeployError>;
-}
-
-struct UnavailableBranchDeployExecution;
-
-impl BranchDeployExecution for UnavailableBranchDeployExecution {
-    fn read_blob_contents(&mut self, _plan: &BranchDeployPlan) -> Result<(), BranchDeployError> {
-        Err(branch_execution_unavailable())
-    }
-
-    fn read_credentials(&mut self, _profile_name: &str) -> Result<(), BranchDeployError> {
-        Err(branch_execution_unavailable())
-    }
-
-    fn connect_remote(&mut self, _profile: &Profile) -> Result<(), BranchDeployError> {
-        Err(branch_execution_unavailable())
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum UploadStatus {
@@ -210,38 +188,32 @@ pub fn deploy_branch(
     request: &DeployBranchRequest,
     profile: &Profile,
 ) -> Result<BranchDeployManifest, BranchDeployError> {
-    let mut execution = UnavailableBranchDeployExecution;
-    deploy_branch_with_execution(request, profile, &mut execution)
+    deploy_branch_with_handoff(request, profile, unavailable_branch_execution)
 }
 
-pub(crate) fn deploy_branch_with_execution(
+pub(crate) fn deploy_branch_with_handoff<F>(
     request: &DeployBranchRequest,
     profile: &Profile,
-    execution: &mut impl BranchDeployExecution,
-) -> Result<BranchDeployManifest, BranchDeployError> {
+    execution_handoff: F,
+) -> Result<BranchDeployManifest, BranchDeployError>
+where
+    F: FnOnce(BranchDeployPlan, bool) -> Result<BranchDeployManifest, BranchDeployError>,
+{
     let plan = plan_branch(request, profile)?;
     if request.dry_run {
         return Ok(dry_run_manifest(plan, request.verify));
     }
 
-    execute_branch_plan(&plan, profile, execution)
+    execution_handoff(plan, request.verify)
 }
 
-fn execute_branch_plan(
-    plan: &BranchDeployPlan,
-    profile: &Profile,
-    execution: &mut impl BranchDeployExecution,
+fn unavailable_branch_execution(
+    _plan: BranchDeployPlan,
+    _verify: bool,
 ) -> Result<BranchDeployManifest, BranchDeployError> {
-    execution.read_blob_contents(plan)?;
-    execution.read_credentials(&plan.profile)?;
-    execution.connect_remote(profile)?;
-    Err(branch_execution_unavailable())
-}
-
-fn branch_execution_unavailable() -> BranchDeployError {
-    BranchDeployError::Other(anyhow::anyhow!(
+    Err(BranchDeployError::Other(anyhow::anyhow!(
         "branch deployment execution is not available until upload verification is configured"
-    ))
+    )))
 }
 
 pub fn dry_run_manifest(plan: BranchDeployPlan, verify: bool) -> BranchDeployManifest {

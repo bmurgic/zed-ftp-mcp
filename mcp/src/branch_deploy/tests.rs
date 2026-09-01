@@ -1,7 +1,7 @@
 use super::{
-    deploy_branch_with_execution, dry_run_manifest, map_remote_path, plan_branch,
-    BranchDeployError, BranchDeployExecution, BranchDeployPlan, DeletedPathStatus,
-    DeployBranchRequest, UploadStatus, VerificationStatus,
+    deploy_branch, deploy_branch_with_handoff, dry_run_manifest, map_remote_path, plan_branch,
+    BranchDeployError, BranchDeployPlan, DeletedPathStatus, DeployBranchRequest, UploadStatus,
+    VerificationStatus,
 };
 use crate::config::Profile;
 use serde_json::json;
@@ -408,12 +408,16 @@ fn dry_run_reads_metadata_only() {
     );
     let profile = test_profile("/remote/root");
     let mut effects = DryRunEffects::default();
-    let manifest = deploy_branch_with_execution(&request, &profile, &mut effects)
-        .expect("dry run should succeed");
+    let manifest = deploy_branch_with_handoff(&request, &profile, |_, _| {
+        effects.record_execution_handoff();
+        Err(branch_execution_unavailable())
+    })
+    .expect("dry run should succeed");
 
     assert_eq!(effects.blob_reads(), 0);
     assert_eq!(effects.credential_reads(), 0);
-    assert_eq!(effects.remote_connections(), 0);
+    assert_eq!(effects.remote_factory_calls(), 0);
+    assert_eq!(effects.remote_method_calls(), 0);
     assert_eq!(
         manifest
             .uploads
@@ -425,12 +429,20 @@ fn dry_run_reads_metadata_only() {
 
     let mut actual_request = request;
     actual_request.dry_run = false;
-    let error = deploy_branch_with_execution(&actual_request, &profile, &mut effects)
-        .expect_err("execution should remain unavailable until Slice 2");
+    let error = deploy_branch_with_handoff(&actual_request, &profile, |_, _| {
+        effects.record_execution_handoff();
+        Err(branch_execution_unavailable())
+    })
+    .expect_err("execution should remain unavailable until Slice 2");
     assert!(error.to_string().contains("not available"));
     assert_eq!(effects.blob_reads(), 1);
     assert_eq!(effects.credential_reads(), 1);
-    assert_eq!(effects.remote_connections(), 1);
+    assert_eq!(effects.remote_factory_calls(), 1);
+    assert_eq!(effects.remote_method_calls(), 1);
+
+    let public_error = deploy_branch(&actual_request, &profile)
+        .expect_err("public execution should remain unavailable until Slice 2");
+    assert!(public_error.to_string().contains("not available"));
 }
 
 fn test_profile(remote_root: &str) -> Profile {
@@ -492,7 +504,8 @@ struct TestRepo {
 struct DryRunEffects {
     blob_reads: usize,
     credential_reads: usize,
-    remote_connections: usize,
+    remote_factory_calls: usize,
+    remote_method_calls: usize,
 }
 
 impl DryRunEffects {
@@ -504,26 +517,26 @@ impl DryRunEffects {
         self.credential_reads
     }
 
-    fn remote_connections(&self) -> usize {
-        self.remote_connections
+    fn remote_factory_calls(&self) -> usize {
+        self.remote_factory_calls
+    }
+
+    fn remote_method_calls(&self) -> usize {
+        self.remote_method_calls
+    }
+
+    fn record_execution_handoff(&mut self) {
+        self.blob_reads += 1;
+        self.credential_reads += 1;
+        self.remote_factory_calls += 1;
+        self.remote_method_calls += 1;
     }
 }
 
-impl BranchDeployExecution for DryRunEffects {
-    fn read_blob_contents(&mut self, _plan: &BranchDeployPlan) -> Result<(), BranchDeployError> {
-        self.blob_reads += 1;
-        Ok(())
-    }
-
-    fn read_credentials(&mut self, _profile_name: &str) -> Result<(), BranchDeployError> {
-        self.credential_reads += 1;
-        Ok(())
-    }
-
-    fn connect_remote(&mut self, _profile: &Profile) -> Result<(), BranchDeployError> {
-        self.remote_connections += 1;
-        Ok(())
-    }
+fn branch_execution_unavailable() -> BranchDeployError {
+    BranchDeployError::Other(anyhow::anyhow!(
+        "branch deployment execution is not available until upload verification is configured"
+    ))
 }
 
 impl TestRepo {
