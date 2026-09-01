@@ -296,11 +296,11 @@ where
         return Ok(dry_run_manifest(plan, request.verify));
     }
 
+    let mut blobs = BatchBlobReader::new(std::path::Path::new(&plan.repository.root))?;
     let mut remote = match connect(&request.profile, profile) {
         Ok(remote) => remote,
         Err(error) => return Ok(connection_failure_manifest(plan, request.verify, error)),
     };
-    let mut blobs = BatchBlobReader::new(std::path::Path::new(&plan.repository.root))?;
     let manifest = execute_deploy(plan, request.verify, &mut blobs, &mut remote);
     remote.quit();
     Ok(manifest)
