@@ -1,6 +1,7 @@
 use super::{
-    BranchDeployError, BranchDeployManifest, BranchDeployPlan, FailureRecord, ManifestCounts,
-    UploadResult, UploadStatus, VerificationStatus,
+    deletion_manifest, BranchDeleteManifest, BranchDeletePlan, BranchDeployError,
+    BranchDeployManifest, BranchDeployPlan, DeletePathResult, DeletePathStatus, FailureRecord,
+    ManifestCounts, UploadResult, UploadStatus, VerificationStatus,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,7 +48,6 @@ pub trait BranchRemote {
         path: &str,
         expected: &[u8],
     ) -> Result<RemoteComparison, RemoteFailure>;
-    #[allow(dead_code)]
     fn delete_file(&mut self, path: &str) -> Result<(), RemoteFailure>;
 }
 
@@ -167,6 +167,53 @@ pub fn execute_deploy<R: BranchRemote, B: BlobSource>(
     }
 
     manifest_from_execution(plan, verify, uploads, failures)
+}
+
+pub fn execute_deletion<R: BranchRemote>(
+    plan: BranchDeletePlan,
+    remote: &mut R,
+) -> BranchDeleteManifest {
+    if !plan.blocked.is_empty() || plan.dry_run {
+        return super::deletion_dry_run_manifest(plan);
+    }
+
+    let mut paths = plan.paths.clone();
+    let mut failures = plan.failures.clone();
+    if let Err(error) = remote.set_binary_mode() {
+        failures.push(remote_failure("binary_mode", None, &error));
+        mark_delete_not_attempted(&mut paths, 0);
+        let mut plan = plan;
+        plan.failures = failures;
+        return deletion_manifest(plan, paths, false, false);
+    }
+
+    for index in 0..paths.len() {
+        match remote.delete_file(&paths[index].remote_path) {
+            Ok(()) => paths[index].status = DeletePathStatus::Deleted,
+            Err(error) => {
+                paths[index].status = DeletePathStatus::Failed;
+                failures.push(remote_failure(
+                    "delete",
+                    Some(&paths[index].git_path),
+                    &error,
+                ));
+                if error.kind == RemoteFailureKind::ConnectionLost {
+                    mark_delete_not_attempted(&mut paths, index + 1);
+                    break;
+                }
+            }
+        }
+    }
+
+    let mut plan = plan;
+    plan.failures = failures;
+    deletion_manifest(plan, paths, false, false)
+}
+
+fn mark_delete_not_attempted(paths: &mut [DeletePathResult], start: usize) {
+    for path in &mut paths[start..] {
+        path.status = DeletePathStatus::NotAttempted;
+    }
 }
 
 fn parent_directory(path: &str) -> Option<&str> {

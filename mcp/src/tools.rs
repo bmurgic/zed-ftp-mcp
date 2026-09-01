@@ -113,6 +113,24 @@ pub struct DeployBranchArgs {
     pub dry_run: bool,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DeleteBranchFilesArgs {
+    pub profile: String,
+    /// Absolute path to the exact Git worktree root.
+    pub repo_root: String,
+    /// Full, canonical base commit ID.
+    pub base_commit: String,
+    /// Full, canonical head commit ID.
+    pub head_commit: String,
+    /// Exact Git paths approved for deletion.
+    pub paths: Vec<String>,
+    /// Why the requested remote files must be deleted.
+    pub reason: String,
+    /// Return the preflight-authorized paths without credentials or FTP.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
 fn default_head_ref() -> String {
     "HEAD".to_string()
 }
@@ -465,6 +483,38 @@ impl FtpServer {
     }
 
     #[tool(
+        description = "Delete explicitly approved branch-removed files. Requires full pinned commits, exact paths, and a non-empty reason. This operation is separate from branch deployment."
+    )]
+    async fn ftp_delete_branch_files(
+        &self,
+        Parameters(args): Parameters<DeleteBranchFilesArgs>,
+    ) -> Result<Json<branch_deploy::BranchDeleteManifest>, ErrorData> {
+        let config = Config::load().map_err(internal)?;
+        let profile = config
+            .profile(&args.profile)
+            .ok_or_else(|| invalid(format!("no profile '{}'", args.profile)))?
+            .clone();
+        let request = branch_deploy::DeleteBranchFilesRequest {
+            profile: args.profile,
+            repo_root: args.repo_root,
+            base_commit: args.base_commit,
+            head_commit: args.head_commit,
+            paths: args.paths,
+            reason: args.reason,
+            dry_run: args.dry_run,
+        };
+        let result = tokio::task::spawn_blocking(move || {
+            branch_deploy::delete_branch_files(&request, &profile)
+        })
+        .await
+        .map_err(internal)?;
+
+        result
+            .map(deletion_manifest_output)
+            .map_err(branch_deploy_error)
+    }
+
+    #[tool(
         description = "Download a file from the FTP server and return its contents. \
             UTF-8 text is returned as-is; binary files are base64-encoded. \
             remote_root is prepended automatically."
@@ -662,6 +712,12 @@ fn branch_deploy_manifest_output(
     Json(manifest)
 }
 
+fn deletion_manifest_output(
+    manifest: branch_deploy::BranchDeleteManifest,
+) -> Json<branch_deploy::BranchDeleteManifest> {
+    Json(manifest)
+}
+
 fn use_base64(bytes: &[u8]) -> String {
     use std::fmt::Write;
     const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -704,7 +760,10 @@ fn use_base64(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{branch_deploy_error, branch_deploy_manifest_output, DeployBranchArgs};
+    use super::{
+        branch_deploy_error, branch_deploy_manifest_output, deletion_manifest_output,
+        DeleteBranchFilesArgs, DeployBranchArgs,
+    };
     use crate::branch_deploy::{
         dry_run_manifest, BranchDeployError, BranchDeployPlan, PlannedUpload,
     };
@@ -727,6 +786,45 @@ mod tests {
             branch_deploy_error(BranchDeployError::InvalidArgs("bad repository".to_string())).code,
             ErrorCode::INVALID_PARAMS
         );
+    }
+
+    #[test]
+    fn deletion_contract_mcp_requires_explicit_pinned_values() {
+        let args: DeleteBranchFilesArgs = serde_json::from_value(serde_json::json!({
+            "profile": "staging",
+            "repo_root": "/repo",
+            "base_commit": "aabbccddeeff00112233445566778899aabbccdd",
+            "head_commit": "11223344556677889900aabbccddeeff11223344",
+            "paths": ["gone.txt"],
+            "reason": "approved cleanup",
+            "dry_run": true
+        }))
+        .expect("MCP deletion arguments should deserialize");
+
+        assert_eq!(args.paths, vec!["gone.txt"]);
+        assert_eq!(args.reason, "approved cleanup");
+        assert!(args.dry_run);
+
+        let manifest = crate::branch_deploy::deletion_dry_run_manifest(
+            crate::branch_deploy::BranchDeletePlan {
+                profile: args.profile,
+                repository: crate::branch_deploy::RepositorySummary {
+                    root: args.repo_root,
+                    dirty: false,
+                },
+                base_commit: args.base_commit,
+                head_commit: args.head_commit,
+                reason: args.reason,
+                dry_run: true,
+                paths: Vec::new(),
+                blocked: vec![crate::branch_deploy::BlockedPath {
+                    git_path: Some("gone.txt".to_string()),
+                    reason: "path is not deleted in the pinned commit range".to_string(),
+                }],
+                failures: Vec::new(),
+            },
+        );
+        assert!(!deletion_manifest_output(manifest).0.success);
     }
 
     #[test]

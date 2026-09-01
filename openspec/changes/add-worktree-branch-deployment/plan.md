@@ -518,21 +518,21 @@ pub fn execute_deletion<R: BranchRemote>(
 ) -> BranchDeleteManifest;
 ```
 
-- [ ] **3.1 Add failing pinned-authorization tests.**
+- [x] **3.1 Add failing pinned-authorization tests.**
 
   Add tests prefixed `deletion_preflight_` for empty reason, empty path list, abbreviated commit IDs, unresolved IDs, exact full IDs, a path outside the recomputed deleted set, duplicate exact paths, and deterministic order. Assert all invalid requests stop before credential and remote counters increment.
 
-- [ ] **3.2 Add failing atomic path-safety tests.**
+- [x] **3.2 Add failing atomic path-safety tests.**
 
   Cover one safe plus one unsafe path, non-UTF-8 Git deletion, every non-ASCII character class, two requested paths equal under `eq_ignore_ascii_case`, and a case-only rename where the requested old path collides with a surviving head blob. Assert every blocked path and reason appears and no path is authorized when any blocker exists.
 
-- [ ] **3.3 Implement deletion planning as pinned-set authorization.**
+- [x] **3.3 Implement deletion planning as pinned-set authorization.**
 
   Require both commit inputs to be 40 lowercase hexadecimal characters. Resolve each with `rev-parse --verify <id>^{commit}` and require the canonical output to equal the input exactly. Recompute the full-range touched set and head tree. Define the authorized deleted set as touched paths absent from the head tree.
 
   Validate every requested path before returning. Reject empty reason after trimming. Reject empty paths, duplicates, paths outside the deleted set, lexical failures, non-UTF-8, and every non-ASCII byte. Build one ASCII-folded index containing all requested paths and all surviving head blobs. Record collisions from that index. If `blocked` is non-empty, return the complete rejected deletion manifest without keychain or remote access.
 
-- [ ] **3.4 Run deletion preflight tests until they pass.**
+- [x] **3.4 Run deletion preflight tests until they pass.**
 
   Run:
 
@@ -542,15 +542,15 @@ pub fn execute_deletion<R: BranchRemote>(
 
   Expected result: all authorization and atomic rejection cases pass.
 
-- [ ] **3.5 Add failing deletion executor tests.**
+- [x] **3.5 Add failing deletion executor tests.**
 
   Add tests prefixed `deletion_executor_` for dry-run planned statuses, binary mode before delete, exact path order, an `Operation` failure followed by a successful delete, and `ConnectionLost` followed by remaining `not_attempted` paths. Assert no upload or comparison call appears in the fake log.
 
-- [ ] **3.6 Implement deletion execution.**
+- [x] **3.6 Implement deletion execution.**
 
   Dry run returns planned statuses without constructing a remote. Actual execution selects binary mode once and calls `delete_file` for exact preflight-approved remote paths. Continue after `Operation`. Stop after `ConnectionLost`, do not reconnect, and mark later paths `not_attempted`. Compute manifest counts and `success` from final statuses.
 
-- [ ] **3.7 Add deletion CLI, MCP, and schema contract tests.**
+- [x] **3.7 Add deletion CLI, MCP, and schema contract tests.**
 
   Parse this CLI shape:
 
@@ -560,23 +560,23 @@ pub fn execute_deletion<R: BranchRemote>(
 
   Add MCP `ftp_delete_branch_files` with the same required values. Test all-preflight rejection as a structured manifest, successful dry run, unsuccessful execution manifest, and CLI nonzero exit. Extend schema checks to every deletion count.
 
-- [ ] **3.8 Implement the separate deletion interfaces.**
+- [x] **3.8 Implement the separate deletion interfaces.**
 
   Both wrappers call `plan_deletion` before any connector. If preflight rejects, return its structured unsuccessful manifest. If dry run succeeds, return planned statuses. Otherwise create one `FtpClient`, execute, best-effort quit, and return the full result. Do not call this path from `deploy_branch`.
 
-- [ ] **3.9 Add the disposable deletion integration test.**
+- [x] **3.9 Add the disposable deletion integration test.**
 
   Reuse the Task 2 container guard. Seed two ASCII files through the test adapter. Invoke deletion for one exact path and assert that RETR fails for only that path while the unrequested file still returns its original bytes. Name the ignored test `disposable_branch_deletion`. Remove only the test-created container and its temporary data.
 
-- [ ] **3.10 Complete README documentation.**
+- [x] **3.10 Complete README documentation.**
 
   Add both interfaces, pinned commit requirements, exact path list, required reason, atomic blockers, ASCII-only limit, case-collision behavior, dry run, and failure statuses. State that an agent must explain a deletion and receive user approval before making the separate explicit call.
 
-- [ ] **3.11 Run compatibility and release gates.**
+- [x] **3.11 Run compatibility and release gates.**
 
   Run every command under `qa.md#slice-3-qa-explicit-pinned-deletion`. Also compare existing tool schemas before and after the change and run their current tests. Treat any warning, failure, or flake as blocking.
 
-- [ ] **3.12 Commit the Slice 3 implementation.**
+- [x] **3.12 Commit the Slice 3 implementation.**
 
   Run `git diff --check`, stage only Slice 3 files and its checked `plan.md` micro-steps, then commit:
 

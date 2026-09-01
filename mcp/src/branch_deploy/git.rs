@@ -1,7 +1,8 @@
 use super::{
-    map_remote_path, BlobSource, BranchDeployError, BranchDeployPlan, DeletedPathResult,
-    DeletedPathStatus, DeployBranchRequest, FailureRecord, PlannedUpload, RepositorySummary,
-    RequestedAndResolvedRef, ResolvedRefs,
+    map_remote_path, BlobSource, BlockedPath, BranchDeletePlan, BranchDeployError,
+    BranchDeployPlan, DeleteBranchFilesRequest, DeletePathResult, DeletePathStatus,
+    DeletedPathResult, DeletedPathStatus, DeployBranchRequest, FailureRecord, PlannedUpload,
+    RepositorySummary, RequestedAndResolvedRef, ResolvedRefs,
 };
 use crate::config::Profile;
 use std::collections::{BTreeMap, BTreeSet};
@@ -213,6 +214,181 @@ pub(super) fn plan_branch(
         deleted,
         failures,
     })
+}
+
+pub(super) fn plan_deletion(
+    request: &DeleteBranchFilesRequest,
+    profile: &Profile,
+) -> Result<BranchDeletePlan, BranchDeployError> {
+    let repository_root = validate_repository_root(&request.repo_root)?;
+    reject_partial_or_promisor_repository(&repository_root)?;
+    let mut plan = deletion_plan_shell(request, &repository_root);
+
+    let base_commit = resolve_pinned_commit(&repository_root, &request.base_commit)
+        .map_err(|reason| {
+            plan.blocked.push(BlockedPath {
+                git_path: None,
+                reason,
+            });
+        })
+        .ok();
+    let head_commit = resolve_pinned_commit(&repository_root, &request.head_commit)
+        .map_err(|reason| {
+            plan.blocked.push(BlockedPath {
+                git_path: None,
+                reason,
+            });
+        })
+        .ok();
+    if !plan.blocked.is_empty() {
+        plan.blocked
+            .sort_by(|left, right| left.reason.cmp(&right.reason));
+        return Ok(plan);
+    }
+    let base_commit = base_commit.expect("successful pinned commit should be present");
+    let head_commit = head_commit.expect("successful pinned commit should be present");
+    plan.base_commit = base_commit.clone();
+    plan.head_commit = head_commit.clone();
+
+    if request.reason.trim().is_empty() {
+        plan.blocked.push(BlockedPath {
+            git_path: None,
+            reason: "deletion reason must not be empty".to_string(),
+        });
+    }
+    if request.paths.is_empty() {
+        plan.blocked.push(BlockedPath {
+            git_path: None,
+            reason: "at least one deletion path is required".to_string(),
+        });
+    }
+
+    let commits = range_commits(&repository_root, &base_commit, &head_commit)?;
+    let touched = touched_paths(&repository_root, &commits)?;
+    let head_tree = head_tree(&repository_root, &head_commit)?;
+    let deleted: BTreeSet<Vec<u8>> = touched
+        .into_iter()
+        .filter(|path| !head_tree.contains_key(path))
+        .collect();
+
+    let mut requested = BTreeSet::new();
+    let mut checked_paths = Vec::new();
+    let mut candidates = Vec::new();
+    for path in &request.paths {
+        if !requested.insert(path.clone()) {
+            plan.blocked.push(BlockedPath {
+                git_path: Some(path.clone()),
+                reason: "duplicate deletion path".to_string(),
+            });
+            continue;
+        }
+        if !path.is_ascii() {
+            plan.blocked.push(BlockedPath {
+                git_path: Some(path.clone()),
+                reason: "deletion paths must contain ASCII characters only".to_string(),
+            });
+            continue;
+        }
+        let (git_path, remote_path) = match map_remote_path(&profile.remote_root, path.as_bytes()) {
+            Ok(path) => path,
+            Err(error) => {
+                plan.blocked.push(BlockedPath {
+                    git_path: Some(path.clone()),
+                    reason: error.to_string(),
+                });
+                continue;
+            }
+        };
+        checked_paths.push(git_path.clone());
+        if !deleted.contains(path.as_bytes()) {
+            plan.blocked.push(BlockedPath {
+                git_path: Some(path.clone()),
+                reason: "path is not deleted in the pinned commit range".to_string(),
+            });
+            continue;
+        }
+        candidates.push(DeletePathResult {
+            git_path,
+            remote_path,
+            status: DeletePathStatus::Planned,
+        });
+    }
+
+    let mut folded: BTreeMap<Vec<u8>, Vec<String>> = BTreeMap::new();
+    for path in &checked_paths {
+        folded
+            .entry(ascii_fold(path.as_bytes()))
+            .or_default()
+            .push(path.clone());
+    }
+    for (path, entry) in &head_tree {
+        if entry.object_type == "blob" {
+            folded
+                .entry(ascii_fold(path))
+                .or_default()
+                .push(String::from_utf8_lossy(path).into_owned());
+        }
+    }
+    for path in &checked_paths {
+        let collides = folded
+            .get(&ascii_fold(path.as_bytes()))
+            .is_some_and(|paths| paths.len() > 1);
+        if collides {
+            plan.blocked.push(BlockedPath {
+                git_path: Some(path.clone()),
+                reason: "path ASCII-case-collides with another requested or surviving path"
+                    .to_string(),
+            });
+        }
+    }
+
+    plan.blocked.sort_by(|left, right| {
+        left.git_path
+            .cmp(&right.git_path)
+            .then(left.reason.cmp(&right.reason))
+    });
+    if plan.blocked.is_empty() {
+        candidates.sort_by(|left, right| left.git_path.cmp(&right.git_path));
+        plan.paths = candidates;
+    }
+    Ok(plan)
+}
+
+fn deletion_plan_shell(
+    request: &DeleteBranchFilesRequest,
+    repository_root: &Path,
+) -> BranchDeletePlan {
+    BranchDeletePlan {
+        profile: request.profile.clone(),
+        repository: RepositorySummary {
+            root: repository_root.display().to_string(),
+            dirty: false,
+        },
+        base_commit: request.base_commit.clone(),
+        head_commit: request.head_commit.clone(),
+        reason: request.reason.clone(),
+        dry_run: request.dry_run,
+        paths: Vec::new(),
+        blocked: Vec::new(),
+        failures: Vec::new(),
+    }
+}
+
+fn resolve_pinned_commit(repository_root: &Path, commit: &str) -> Result<String, String> {
+    if commit.len() != 40
+        || !commit
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(
+            "commit identifier must be a 40-character lowercase hexadecimal ID".to_string(),
+        );
+    }
+    match resolve_commit(repository_root, commit) {
+        Ok(resolved) if resolved == commit => Ok(resolved),
+        Ok(_) => Err("commit identifier did not resolve to the supplied canonical ID".to_string()),
+        Err(error) => Err(format!("commit identifier could not be resolved: {error}")),
+    }
 }
 
 fn validate_repository_root(requested_root: &str) -> Result<PathBuf, BranchDeployError> {

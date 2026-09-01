@@ -121,6 +121,38 @@ lost connection marks the remaining paths as not attempted. The CLI always
 prints this complete manifest and exits nonzero when any upload or verification
 does not succeed. The MCP tool returns the same unsuccessful manifest as data.
 
+### Delete a reported branch path explicitly
+
+`deploy-branch` never deletes remote files. To delete a reported path, call the
+separate `delete-branch-files` command with the complete 40-character lowercase
+base and head commit IDs from the deployment manifest, every exact Git path to
+remove, and a non-empty reason.
+
+```sh
+zed-ftp-mcp delete-branch-files staging \
+	--repo-root /absolute/path/to/repository \
+	--base-commit 0123456789abcdef0123456789abcdef01234567 \
+	--head-commit 89abcdef0123456789abcdef0123456789abcdef \
+	--path old-file.txt \
+	--reason "The file was intentionally removed from this release"
+```
+
+The MCP equivalent is `ftp_delete_branch_files` with `profile`, `repo_root`,
+`base_commit`, `head_commit`, `paths`, `reason`, and optional `dry_run`.
+An agent must explain why deletion is needed and receive user approval before
+making this separate explicit call.
+
+Preflight recomputes the deleted set from those pinned commits before reading
+credentials or contacting FTP. It rejects the complete request when any path
+is not deleted in that range, is unsafe, is non-ASCII, is duplicated, or
+ASCII-case-collides with another requested path or a surviving head blob. This
+prevents a case-only rename from deleting its replacement on a case-insensitive
+server. Pass `--dry-run` to return the authorized planned paths without remote
+access. A deletion manifest records blocked, deleted, failed, and not-attempted
+paths. A normal FTP operation failure continues to the next approved path. A
+lost connection stops later paths without reconnecting and makes the command
+exit nonzero.
+
 ### Available tools
 
 | Tool | Purpose |
@@ -133,6 +165,7 @@ does not succeed. The MCP tool returns the same unsuccessful manifest as data.
 | `ftp_deploy` | Recursive upload of the full local project, gitignore-aware, optional `dry_run` |
 | `ftp_deploy_commits` | Upload only the files changed by specific commit SHAs, optional `dry_run` |
 | `ftp_deploy_branch` | Plan a committed range from an explicit Git worktree, optional `dry_run` |
+| `ftp_delete_branch_files` | Delete exact files from a pinned branch range after explicit approval |
 | `ftp_mkdir` | Create a directory and any missing parents |
 | `ftp_delete_file` | Delete a single remote file |
 | `ftp_delete_dir` | Delete an empty remote directory |

@@ -59,6 +59,29 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Delete exact branch-removed files after explicit approval.
+    DeleteBranchFiles {
+        /// Profile name as defined in connections.toml.
+        profile: String,
+        /// Absolute path to the exact Git worktree root.
+        #[arg(long)]
+        repo_root: String,
+        /// Full, canonical base commit ID.
+        #[arg(long)]
+        base_commit: String,
+        /// Full, canonical head commit ID.
+        #[arg(long)]
+        head_commit: String,
+        /// Exact Git path to delete. Repeat for each approved path.
+        #[arg(long = "path", required = true)]
+        paths: Vec<String>,
+        /// Why each requested remote deletion is needed.
+        #[arg(long)]
+        reason: String,
+        /// Return the authorized deletion plan without accessing FTP or credentials.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[tokio::main]
@@ -89,6 +112,23 @@ async fn main() -> Result<()> {
             base_ref,
             head_ref,
             verify,
+            dry_run,
+        }),
+        Cmd::DeleteBranchFiles {
+            profile,
+            repo_root,
+            base_commit,
+            head_commit,
+            paths,
+            reason,
+            dry_run,
+        } => delete_branch_files_command(branch_deploy::DeleteBranchFilesRequest {
+            profile,
+            repo_root,
+            base_commit,
+            head_commit,
+            paths,
+            reason,
             dry_run,
         }),
     }
@@ -159,9 +199,34 @@ fn deploy_branch_command(request: branch_deploy::DeployBranchRequest) -> Result<
     branch_execution_exit(manifest.success)
 }
 
+fn delete_branch_files_command(request: branch_deploy::DeleteBranchFilesRequest) -> Result<()> {
+    let config = config::Config::load()?;
+    let profile = config.profile(&request.profile).with_context(|| {
+        format!(
+            "no profile named '{}' in {}",
+            request.profile,
+            config::path_hint()
+        )
+    })?;
+    let manifest = branch_deploy::delete_branch_files(&request, profile)?;
+    let stdout = std::io::stdout();
+    let mut output = stdout.lock();
+    write_deletion_manifest(&mut output, &manifest)?;
+    branch_execution_exit(manifest.success)
+}
+
 fn write_branch_manifest(
     output: &mut impl std::io::Write,
     manifest: &branch_deploy::BranchDeployManifest,
+) -> Result<()> {
+    serde_json::to_writer_pretty(&mut *output, manifest)?;
+    writeln!(output)?;
+    Ok(())
+}
+
+fn write_deletion_manifest(
+    output: &mut impl std::io::Write,
+    manifest: &branch_deploy::BranchDeleteManifest,
 ) -> Result<()> {
     serde_json::to_writer_pretty(&mut *output, manifest)?;
     writeln!(output)?;
@@ -219,6 +284,42 @@ mod tests {
     fn deploy_branch_execution_contract_cli_exits_nonzero_for_unsuccessful_manifest() {
         assert!(branch_execution_exit(true).is_ok());
         assert!(branch_execution_exit(false).is_err());
+    }
+
+    #[test]
+    fn deletion_contract_cli_parses_all_required_pinned_values() {
+        let cli = Cli::try_parse_from([
+            "zed-ftp-mcp",
+            "delete-branch-files",
+            "staging",
+            "--repo-root",
+            "/repo",
+            "--base-commit",
+            "aabbccddeeff00112233445566778899aabbccdd",
+            "--head-commit",
+            "11223344556677889900aabbccddeeff11223344",
+            "--path",
+            "first.txt",
+            "--path",
+            "second.txt",
+            "--reason",
+            "approved cleanup",
+            "--dry-run",
+        ])
+        .expect("CLI arguments should parse");
+
+        let Some(Cmd::DeleteBranchFiles {
+            paths,
+            reason,
+            dry_run,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected delete-branch-files command");
+        };
+        assert_eq!(paths, vec!["first.txt", "second.txt"]);
+        assert_eq!(reason, "approved cleanup");
+        assert!(dry_run);
     }
 
     #[test]

@@ -1,10 +1,11 @@
 use super::git::null_device_for_platform;
 use super::git::BatchBlobReader;
 use super::{
-    deploy_branch, deploy_branch_with_handoff, dry_run_manifest, execute_deploy, map_remote_path,
-    plan_branch, BlobSource, BranchDeployError, BranchDeployPlan, BranchRemote, DeletedPathStatus,
-    DeployBranchRequest, PlannedUpload, RemoteComparison, RemoteFailure, UploadStatus,
-    VerificationStatus,
+    delete_branch_files_with_handoff, deploy_branch, deploy_branch_with_handoff, dry_run_manifest,
+    execute_deletion, execute_deploy, map_remote_path, plan_branch, plan_deletion, BlobSource,
+    BranchDeletePlan, BranchDeployError, BranchDeployPlan, BranchRemote, DeleteBranchFilesRequest,
+    DeletePathResult, DeletePathStatus, DeletedPathStatus, DeployBranchRequest, PlannedUpload,
+    RemoteComparison, RemoteFailure, RepositorySummary, UploadStatus, VerificationStatus,
 };
 use crate::config::Profile;
 use serde_json::json;
@@ -125,6 +126,226 @@ fn executor_blobs() -> TestBlobs {
         ]),
         ..TestBlobs::default()
     }
+}
+
+fn deletion_executor_plan() -> BranchDeletePlan {
+    BranchDeletePlan {
+        profile: "staging".to_string(),
+        repository: RepositorySummary {
+            root: "/repo".to_string(),
+            dirty: false,
+        },
+        base_commit: "a".repeat(40),
+        head_commit: "b".repeat(40),
+        reason: "approved removal".to_string(),
+        dry_run: false,
+        paths: vec![
+            DeletePathResult {
+                git_path: "a.txt".to_string(),
+                remote_path: "/remote/a.txt".to_string(),
+                status: DeletePathStatus::Planned,
+            },
+            DeletePathResult {
+                git_path: "b.txt".to_string(),
+                remote_path: "/remote/b.txt".to_string(),
+                status: DeletePathStatus::Planned,
+            },
+        ],
+        blocked: Vec::new(),
+        failures: Vec::new(),
+    }
+}
+
+#[test]
+fn deletion_preflight_requires_full_pinned_commits_paths_and_reason() {
+    let repository = TestRepo::new();
+    repository.write("gone.txt", b"before");
+    repository.write("also-gone.txt", b"before");
+    repository.commit("base");
+    let base = repository.rev_parse("HEAD");
+    fs::remove_file(repository.path().join("gone.txt")).expect("fixture file should delete");
+    fs::remove_file(repository.path().join("also-gone.txt")).expect("fixture file should delete");
+    repository.commit("delete");
+    let head = repository.rev_parse("HEAD");
+
+    for request in [
+        deletion_request(
+            repository.path(),
+            &base[..12],
+            &head,
+            vec!["gone.txt"],
+            "reason",
+        ),
+        deletion_request(
+            repository.path(),
+            &base,
+            &head[..12],
+            vec!["gone.txt"],
+            "reason",
+        ),
+        deletion_request(
+            repository.path(),
+            &"0".repeat(40),
+            &head,
+            vec!["gone.txt"],
+            "reason",
+        ),
+        deletion_request(repository.path(), &base, &head, Vec::new(), "reason"),
+        deletion_request(repository.path(), &base, &head, vec!["gone.txt"], "   "),
+        deletion_request(
+            repository.path(),
+            &base,
+            &head,
+            vec!["missing.txt"],
+            "reason",
+        ),
+        deletion_request(
+            repository.path(),
+            &base,
+            &head,
+            vec!["gone.txt", "gone.txt"],
+            "reason",
+        ),
+    ] {
+        let mut execution_calls = 0;
+        let manifest =
+            delete_branch_files_with_handoff(&request, &test_profile("/remote/root"), |_| {
+                execution_calls += 1;
+                panic!("invalid preflight must not reach credential or remote execution")
+            })
+            .expect("preflight should return its complete rejection");
+        assert!(!manifest.success);
+        assert!(!manifest.blocked.is_empty());
+        assert!(manifest.paths.is_empty());
+        assert_eq!(execution_calls, 0);
+    }
+
+    let plan = plan_deletion(
+        &deletion_request(
+            repository.path(),
+            &base,
+            &head,
+            vec!["gone.txt", "also-gone.txt"],
+            "reason",
+        ),
+        &test_profile("/remote/root"),
+    )
+    .expect("full canonical commits should authorize the exact deleted path");
+    assert!(plan.blocked.is_empty());
+    assert_eq!(
+        plan.paths
+            .iter()
+            .map(|path| path.git_path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["also-gone.txt", "gone.txt"]
+    );
+}
+
+#[test]
+fn deletion_preflight_rejects_unsafe_non_ascii_and_case_colliding_paths_atomically() {
+    let repository = TestRepo::new();
+    repository.write("gone.txt", b"before");
+    repository.write("Case.txt", b"before");
+    repository.commit("base");
+    let base = repository.rev_parse("HEAD");
+    fs::remove_file(repository.path().join("gone.txt")).expect("fixture file should delete");
+    fs::remove_file(repository.path().join("Case.txt")).expect("fixture file should delete");
+    repository.write("case.txt", b"after");
+    repository.commit("delete and case rename");
+    let head = repository.rev_parse("HEAD");
+
+    let plan = plan_deletion(
+        &deletion_request(
+            repository.path(),
+            &base,
+            &head,
+            vec!["gone.txt", "../unsafe", "GONE.TXT", "Case.txt", "café.txt"],
+            "reason",
+        ),
+        &test_profile("/remote/root"),
+    )
+    .expect("preflight should return all blockers");
+
+    assert!(plan.paths.is_empty());
+    assert!(plan
+        .blocked
+        .iter()
+        .any(|blocked| blocked.git_path == Some("../unsafe".to_string())));
+    assert!(plan
+        .blocked
+        .iter()
+        .any(|blocked| blocked.git_path == Some("GONE.TXT".to_string())));
+    assert!(plan
+        .blocked
+        .iter()
+        .any(|blocked| blocked.git_path == Some("Case.txt".to_string())));
+    assert!(plan
+        .blocked
+        .iter()
+        .any(|blocked| blocked.git_path == Some("café.txt".to_string())));
+}
+
+#[test]
+fn deletion_executor_dry_run_returns_planned_paths_without_remote_calls() {
+    let mut remote = TestRemote::default();
+    let mut plan = deletion_executor_plan();
+    plan.dry_run = true;
+
+    let manifest = execute_deletion(plan, &mut remote);
+
+    assert!(manifest.success);
+    assert!(remote.calls.is_empty());
+    assert!(manifest
+        .paths
+        .iter()
+        .all(|path| path.status == DeletePathStatus::Planned));
+}
+
+#[test]
+fn deletion_executor_uses_binary_mode_and_exact_deterministic_path_order() {
+    let mut remote = TestRemote::default();
+
+    let manifest = execute_deletion(deletion_executor_plan(), &mut remote);
+
+    assert!(manifest.success);
+    assert_eq!(
+        remote.calls,
+        vec![
+            RemoteCall::Binary,
+            RemoteCall::Delete("/remote/a.txt".to_string()),
+            RemoteCall::Delete("/remote/b.txt".to_string()),
+        ]
+    );
+    assert!(manifest
+        .paths
+        .iter()
+        .all(|path| path.status == DeletePathStatus::Deleted));
+}
+
+#[test]
+fn deletion_executor_operation_failure_continues_but_connection_loss_stops() {
+    let mut operation_remote = TestRemote {
+        failures: std::collections::BTreeMap::from([(2, RemoteFailure::operation("denied"))]),
+        ..TestRemote::default()
+    };
+    let operation_manifest = execute_deletion(deletion_executor_plan(), &mut operation_remote);
+    assert_eq!(operation_manifest.paths[0].status, DeletePathStatus::Failed);
+    assert_eq!(
+        operation_manifest.paths[1].status,
+        DeletePathStatus::Deleted
+    );
+
+    let mut lost_remote = TestRemote {
+        failures: std::collections::BTreeMap::from([(2, RemoteFailure::connection_lost("lost"))]),
+        ..TestRemote::default()
+    };
+    let lost_manifest = execute_deletion(deletion_executor_plan(), &mut lost_remote);
+    assert_eq!(lost_manifest.paths[0].status, DeletePathStatus::Failed);
+    assert_eq!(
+        lost_manifest.paths[1].status,
+        DeletePathStatus::NotAttempted
+    );
+    assert_eq!(lost_remote.calls.len(), 2);
 }
 
 #[test]
@@ -1262,6 +1483,24 @@ fn request(repo_root: &str, base_ref: &str, head_ref: &str) -> DeployBranchReque
         head_ref: head_ref.to_string(),
         verify: true,
         dry_run: true,
+    }
+}
+
+fn deletion_request(
+    repository_root: &Path,
+    base_commit: &str,
+    head_commit: &str,
+    paths: Vec<&str>,
+    reason: &str,
+) -> DeleteBranchFilesRequest {
+    DeleteBranchFilesRequest {
+        profile: "staging".to_string(),
+        repo_root: repository_root.display().to_string(),
+        base_commit: base_commit.to_string(),
+        head_commit: head_commit.to_string(),
+        paths: paths.into_iter().map(str::to_string).collect(),
+        reason: reason.to_string(),
+        dry_run: false,
     }
 }
 

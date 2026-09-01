@@ -191,7 +191,6 @@ impl FtpClient {
         }))
     }
 
-    #[allow(dead_code)]
     fn branch_delete_file(&mut self, remote_path: &str) -> Result<(), FtpError> {
         stream!(self, |s| s.rm(remote_path))
     }
@@ -602,6 +601,89 @@ mod tests {
             .expect("control log should contain RETR");
         assert!(type_index < stor_index);
         assert!(type_index < retr_index);
+    }
+
+    #[test]
+    #[ignore]
+    fn disposable_branch_deletion() {
+        assert_eq!(
+            std::env::var("ZED_FTP_RUN_FTP_INTEGRATION").as_deref(),
+            Ok("1"),
+            "set ZED_FTP_RUN_FTP_INTEGRATION=1 to run the disposable FTP test"
+        );
+
+        let passive_port = reserve_port();
+        let container_name = format!(
+            "zed-ftp-branch-delete-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time should be after epoch")
+                .as_nanos()
+        );
+        let image = "delfer/alpine-ftp-server:latest@sha256:60bb774d8408d9d4d5c74d05d1c086a34ce192c6c1a142ffac268cac0dbc6fac";
+        let output = Command::new("docker")
+            .args([
+                "run",
+                "-d",
+                "--name",
+                &container_name,
+                "-e",
+                "USERS=test|test|/home/test",
+                "-e",
+                "ADDRESS=127.0.0.1",
+                "-e",
+                &format!("MIN_PORT={passive_port}"),
+                "-e",
+                &format!("MAX_PORT={passive_port}"),
+                "-p",
+                "127.0.0.1::21",
+                "-p",
+                &format!("127.0.0.1:{passive_port}:{passive_port}"),
+                image,
+            ])
+            .output()
+            .expect("Docker CLI should start");
+        assert!(
+            output.status.success(),
+            "docker run failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let container = DockerContainer {
+            name: container_name,
+        };
+        let control_port = published_control_port(&container.name);
+        wait_for_ftp(control_port);
+
+        let mut stream = FtpStream::connect(format!("127.0.0.1:{control_port}"))
+            .expect("FTP client should connect");
+        stream.set_mode(Mode::Passive);
+        stream
+            .login("test", "test")
+            .expect("FTP client should authenticate");
+        let mut client = FtpClient {
+            stream: AnyFtpStream::Plain(stream),
+        };
+        BranchRemote::set_binary_mode(&mut client).expect("adapter should select binary mode");
+        BranchRemote::mkdir_p(&mut client, "branch-deletion")
+            .expect("adapter should create the test parent");
+        BranchRemote::upload_bytes(&mut client, "branch-deletion/remove.bin", &[0, 0xff])
+            .expect("adapter should seed the requested file");
+        BranchRemote::upload_bytes(&mut client, "branch-deletion/keep.bin", &[0x80, 1])
+            .expect("adapter should seed the unrequested file");
+
+        BranchRemote::delete_file(&mut client, "branch-deletion/remove.bin")
+            .expect("adapter should delete only the requested file");
+        assert!(
+            client.get_bytes("branch-deletion/remove.bin").is_err(),
+            "the requested file must be absent"
+        );
+        assert_eq!(
+            client
+                .get_bytes("branch-deletion/keep.bin")
+                .expect("the unrequested file must remain"),
+            vec![0x80, 1]
+        );
+        client.quit();
     }
 
     struct DockerContainer {

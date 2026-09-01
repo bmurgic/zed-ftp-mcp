@@ -6,7 +6,8 @@ mod execute;
 mod git;
 
 pub use execute::{
-    execute_deploy, BlobSource, BranchRemote, RemoteComparison, RemoteFailure, RemoteFailureKind,
+    execute_deletion, execute_deploy, BlobSource, BranchRemote, RemoteComparison, RemoteFailure,
+    RemoteFailureKind,
 };
 use git::BatchBlobReader;
 
@@ -17,6 +18,17 @@ pub struct DeployBranchRequest {
     pub base_ref: String,
     pub head_ref: String,
     pub verify: bool,
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeleteBranchFilesRequest {
+    pub profile: String,
+    pub repo_root: String,
+    pub base_commit: String,
+    pub head_commit: String,
+    pub paths: Vec<String>,
+    pub reason: String,
     pub dry_run: bool,
 }
 
@@ -127,6 +139,70 @@ pub struct FailureRecord {
     pub error: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DeletePathStatus {
+    Planned,
+    Deleted,
+    Failed,
+    NotAttempted,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct DeletePathResult {
+    pub git_path: String,
+    pub remote_path: String,
+    pub status: DeletePathStatus,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct BlockedPath {
+    pub git_path: Option<String>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct DeleteManifestCounts {
+    #[schemars(transform = crate::schema::remove_unsigned_integer_format)]
+    pub planned: usize,
+    #[schemars(transform = crate::schema::remove_unsigned_integer_format)]
+    pub deleted: usize,
+    #[schemars(transform = crate::schema::remove_unsigned_integer_format)]
+    pub failed: usize,
+    #[schemars(transform = crate::schema::remove_unsigned_integer_format)]
+    pub not_attempted: usize,
+    #[schemars(transform = crate::schema::remove_unsigned_integer_format)]
+    pub blocked: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct BranchDeletePlan {
+    pub profile: String,
+    pub repository: RepositorySummary,
+    pub base_commit: String,
+    pub head_commit: String,
+    pub reason: String,
+    pub dry_run: bool,
+    pub paths: Vec<DeletePathResult>,
+    pub blocked: Vec<BlockedPath>,
+    pub failures: Vec<FailureRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct BranchDeleteManifest {
+    pub success: bool,
+    pub profile: String,
+    pub repository: RepositorySummary,
+    pub base_commit: String,
+    pub head_commit: String,
+    pub reason: String,
+    pub dry_run: bool,
+    pub counts: DeleteManifestCounts,
+    pub paths: Vec<DeletePathResult>,
+    pub blocked: Vec<BlockedPath>,
+    pub failures: Vec<FailureRecord>,
+}
+
 #[derive(Debug, Clone)]
 pub struct BranchDeployPlan {
     pub profile: String,
@@ -193,6 +269,13 @@ pub fn plan_branch(
     git::plan_branch(request, profile)
 }
 
+pub fn plan_deletion(
+    request: &DeleteBranchFilesRequest,
+    profile: &Profile,
+) -> Result<BranchDeletePlan, BranchDeployError> {
+    git::plan_deletion(request, profile)
+}
+
 pub fn deploy_branch(
     request: &DeployBranchRequest,
     profile: &Profile,
@@ -210,6 +293,40 @@ pub fn deploy_branch(
     let manifest = execute_deploy(plan, request.verify, &mut blobs, &mut remote);
     remote.quit();
     Ok(manifest)
+}
+
+pub fn delete_branch_files(
+    request: &DeleteBranchFilesRequest,
+    profile: &Profile,
+) -> Result<BranchDeleteManifest, BranchDeployError> {
+    let plan = plan_deletion(request, profile)?;
+    if !plan.blocked.is_empty() || request.dry_run {
+        return Ok(deletion_dry_run_manifest(plan));
+    }
+
+    let mut remote = match crate::ftp::FtpClient::connect(&request.profile, profile) {
+        Ok(remote) => remote,
+        Err(error) => return Ok(deletion_connection_failure_manifest(plan, error)),
+    };
+    let manifest = execute_deletion(plan, &mut remote);
+    remote.quit();
+    Ok(manifest)
+}
+
+#[cfg(test)]
+pub(crate) fn delete_branch_files_with_handoff<F>(
+    request: &DeleteBranchFilesRequest,
+    profile: &Profile,
+    execution_handoff: F,
+) -> Result<BranchDeleteManifest, BranchDeployError>
+where
+    F: FnOnce(BranchDeletePlan) -> Result<BranchDeleteManifest, BranchDeployError>,
+{
+    let plan = plan_deletion(request, profile)?;
+    if !plan.blocked.is_empty() || request.dry_run {
+        return Ok(deletion_dry_run_manifest(plan));
+    }
+    execution_handoff(plan)
 }
 
 #[cfg(test)]
@@ -270,6 +387,82 @@ pub fn dry_run_manifest(plan: BranchDeployPlan, verify: bool) -> BranchDeployMan
         deleted: plan.deleted,
         failures: plan.failures,
     }
+}
+
+pub fn deletion_dry_run_manifest(mut plan: BranchDeletePlan) -> BranchDeleteManifest {
+    let preflight_rejected = !plan.blocked.is_empty();
+    let paths = if preflight_rejected {
+        Vec::new()
+    } else {
+        std::mem::take(&mut plan.paths)
+            .into_iter()
+            .map(|path| DeletePathResult {
+                status: DeletePathStatus::Planned,
+                ..path
+            })
+            .collect()
+    };
+    deletion_manifest(plan, paths, preflight_rejected, preflight_rejected)
+}
+
+pub(crate) fn deletion_manifest(
+    plan: BranchDeletePlan,
+    paths: Vec<DeletePathResult>,
+    preflight_rejected: bool,
+    dry_run: bool,
+) -> BranchDeleteManifest {
+    let counts = DeleteManifestCounts {
+        planned: paths
+            .iter()
+            .filter(|path| path.status == DeletePathStatus::Planned)
+            .count(),
+        deleted: paths
+            .iter()
+            .filter(|path| path.status == DeletePathStatus::Deleted)
+            .count(),
+        failed: paths
+            .iter()
+            .filter(|path| path.status == DeletePathStatus::Failed)
+            .count(),
+        not_attempted: paths
+            .iter()
+            .filter(|path| path.status == DeletePathStatus::NotAttempted)
+            .count(),
+        blocked: plan.blocked.len(),
+    };
+    BranchDeleteManifest {
+        success: !preflight_rejected
+            && plan.failures.is_empty()
+            && counts.failed == 0
+            && counts.not_attempted == 0,
+        profile: plan.profile,
+        repository: plan.repository,
+        base_commit: plan.base_commit,
+        head_commit: plan.head_commit,
+        reason: plan.reason,
+        dry_run,
+        counts,
+        paths,
+        blocked: plan.blocked,
+        failures: plan.failures,
+    }
+}
+
+fn deletion_connection_failure_manifest(
+    plan: BranchDeletePlan,
+    error: anyhow::Error,
+) -> BranchDeleteManifest {
+    let mut paths = plan.paths.clone();
+    for path in &mut paths {
+        path.status = DeletePathStatus::NotAttempted;
+    }
+    let mut plan = plan;
+    plan.failures.push(FailureRecord {
+        stage: "connect".to_string(),
+        git_path: None,
+        error: error.to_string(),
+    });
+    deletion_manifest(plan, paths, false, false)
 }
 
 fn connection_failure_manifest(

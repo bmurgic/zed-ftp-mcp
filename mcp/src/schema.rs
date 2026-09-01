@@ -13,7 +13,7 @@ pub(crate) fn remove_unsigned_integer_format(schema: &mut schemars::Schema) {
 
 #[cfg(test)]
 mod tests {
-    use crate::branch_deploy::BranchDeployManifest;
+    use crate::branch_deploy::{BranchDeleteManifest, BranchDeployManifest};
     use crate::deploy::DeployPlan;
     use crate::tools::{DownloadResponse, ProfilesResponse, UploadResponse};
     use schemars::{schema_for, JsonSchema};
@@ -151,6 +151,20 @@ mod tests {
             "/$defs/UploadResult/properties/remote_bytes_read",
             "/$defs/UploadResult/required",
         );
+    }
+
+    #[test]
+    fn deletion_contract_manifest_counts_have_compatible_integer_schemas() {
+        let manifest_schema: Value = schema::<BranchDeleteManifest>();
+
+        assert_no_unsupported_formats(&manifest_schema);
+        for count in ["planned", "deleted", "failed", "not_attempted", "blocked"] {
+            assert_integer_schema(
+                &manifest_schema,
+                &format!("/$defs/DeleteManifestCounts/properties/{count}"),
+                None,
+            );
+        }
     }
 
     fn schema<T: JsonSchema>() -> Value {
