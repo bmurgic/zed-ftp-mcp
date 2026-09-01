@@ -657,6 +657,126 @@ fn dry_run_rejects_blobless_partial_clone_without_remote_contact() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn dry_run_rejects_git_true_promisor_spellings_without_object_or_remote_access() {
+    let source = TestRepo::new();
+    source.write("tracked.txt", b"base");
+    source.commit("base");
+    let base = source.rev_parse("HEAD");
+    source.write("tracked.txt", b"head");
+    source.commit("head");
+    let head_blob = source.rev_parse("HEAD:tracked.txt");
+    source.git_success(&["config", "uploadpack.allowFilter", "true"]);
+
+    for spelling in ["yes", "on", "1"] {
+        let clone_parent = TempDir::new().expect("partial-clone parent should exist");
+        let clone_root = clone_parent
+            .path()
+            .join(format!("partial-clone-{spelling}"));
+        git_success_at(
+            clone_parent.path(),
+            &[
+                "clone",
+                "--filter=blob:none",
+                "--no-checkout",
+                &format!("file://{}", source.path().display()),
+                clone_root.to_str().expect("utf-8 path"),
+            ],
+        );
+        git_success_at(&clone_root, &["config", "remote.origin.promisor", spelling]);
+        let remote_contact_log = clone_parent.path().join("remote-contact.log");
+        let upload_pack = clone_parent.path().join("upload-pack-sentinel.sh");
+        fs::write(
+            &upload_pack,
+            format!(
+                "#!/bin/sh\nprintf remote-contact >> '{}'\nexec git-upload-pack \"$@\"\n",
+                remote_contact_log.display()
+            ),
+        )
+        .expect("upload-pack sentinel should be written");
+        let mut permissions = fs::metadata(&upload_pack)
+            .expect("upload-pack sentinel metadata should be readable")
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&upload_pack, permissions)
+            .expect("upload-pack sentinel should be executable");
+        git_success_at(
+            &clone_root,
+            &[
+                "config",
+                "remote.origin.uploadpack",
+                upload_pack.to_str().expect("utf-8 path"),
+            ],
+        );
+
+        assert_missing_blob(&clone_root, &head_blob);
+        let error = match deploy_branch(
+            &request(clone_root.to_str().expect("utf-8 path"), &base, "HEAD"),
+            &test_profile("/remote/root"),
+        ) {
+            Ok(_) => {
+                panic!("Git boolean spelling '{spelling}' must reject promisor repositories")
+            }
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("partial/promisor"));
+        assert_missing_blob(&clone_root, &head_blob);
+        assert!(
+            !remote_contact_log.exists(),
+            "Git boolean spelling '{spelling}' must reject before remote contact"
+        );
+    }
+}
+
+#[test]
+fn dry_run_accepts_git_false_promisor_spellings() {
+    let repository = TestRepo::new();
+    repository.write("tracked.txt", b"base");
+    repository.commit("base");
+    let base = repository.rev_parse("HEAD");
+    repository.write("tracked.txt", b"head");
+    repository.commit("head");
+
+    for spelling in ["false", "no", "off", "0"] {
+        repository.git_success(&["config", "remote.origin.promisor", spelling]);
+        deploy_branch(
+            &request(
+                repository.path().to_str().expect("utf-8 path"),
+                &base,
+                "HEAD",
+            ),
+            &test_profile("/remote/root"),
+        )
+        .unwrap_or_else(|error| {
+            panic!("Git boolean spelling '{spelling}' must not mark a repository promisor: {error}")
+        });
+    }
+}
+
+#[test]
+fn dry_run_rejects_invalid_promisor_boolean() {
+    let repository = TestRepo::new();
+    repository.write("tracked.txt", b"base");
+    repository.commit("base");
+    repository.write("tracked.txt", b"head");
+    repository.commit("head");
+    repository.git_success(&["config", "remote.origin.promisor", "invalid"]);
+
+    let error = deploy_branch(
+        &request(
+            repository.path().to_str().expect("utf-8 path"),
+            "missing-ref",
+            "HEAD",
+        ),
+        &test_profile("/remote/root"),
+    )
+    .expect_err("invalid Git booleans must fail closed");
+
+    assert!(error.to_string().contains("boolean"));
+}
+
 #[test]
 fn planner_reports_same_length_tracked_worktree_change_as_dirty() {
     let repository = TestRepo::new();

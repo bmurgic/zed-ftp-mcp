@@ -314,12 +314,12 @@ fn ascii_fold(path: &[u8]) -> Vec<u8> {
 
 fn reject_partial_or_promisor_repository(repository_root: &Path) -> Result<(), BranchDeployError> {
     let output = run_git(repository_root, ["config", "--null", "--list"])?;
-    for (key, value) in parse_repository_git_config(&output.stdout)? {
-        let key = key.to_ascii_lowercase();
-        if key == "extensions.partialclone"
-            || key.starts_with("remote.")
-                && key.ends_with(".promisor")
-                && value.eq_ignore_ascii_case("true")
+    for (key, _) in parse_repository_git_config(&output.stdout)? {
+        let normalized_key = key.to_ascii_lowercase();
+        if normalized_key == "extensions.partialclone"
+            || normalized_key.starts_with("remote.")
+                && normalized_key.ends_with(".promisor")
+                && git_config_boolean_is_true(repository_root, &key)?
         {
             return Err(BranchDeployError::InvalidArgs(
                 "partial/promisor repositories are not supported for branch deployment planning"
@@ -328,6 +328,33 @@ fn reject_partial_or_promisor_repository(repository_root: &Path) -> Result<(), B
         }
     }
     Ok(())
+}
+
+fn git_config_boolean_is_true(
+    repository_root: &Path,
+    key: &str,
+) -> Result<bool, BranchDeployError> {
+    let output = run_git(repository_root, ["config", "--type=bool", "--get-all", key])?;
+    let values = output_text(&output, "git config --type=bool --get-all")?;
+    if values.is_empty() {
+        return Err(BranchDeployError::Other(anyhow::anyhow!(
+            "git config returned no canonical boolean values for '{key}'"
+        )));
+    }
+
+    let mut has_true_value = false;
+    for value in values.lines() {
+        match value {
+            "true" => has_true_value = true,
+            "false" => {}
+            _ => {
+                return Err(BranchDeployError::Other(anyhow::anyhow!(
+                    "git config returned invalid canonical boolean value for '{key}'"
+                )))
+            }
+        }
+    }
+    Ok(has_true_value)
 }
 
 fn preflight_dirty_state_filters(repository_root: &Path) -> Result<(), BranchDeployError> {
