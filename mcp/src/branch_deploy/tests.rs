@@ -157,6 +157,47 @@ fn executor_uploads_binary_bytes_in_git_path_order_and_verifies_immediately() {
 }
 
 #[test]
+fn executor_binary_mode_failure_stops_before_data_operations() {
+    let mut remote = TestRemote {
+        failures: std::collections::BTreeMap::from([(
+            1,
+            RemoteFailure::operation("TYPE I refused"),
+        )]),
+        ..TestRemote::default()
+    };
+    let mut blobs = executor_blobs();
+
+    let manifest = execute_deploy(executor_plan(), true, &mut blobs, &mut remote);
+
+    assert!(!manifest.success);
+    assert!(blobs.reads.is_empty());
+    assert_eq!(
+        remote.calls,
+        vec![RemoteCall::Binary],
+        "binary mode must succeed before any MKD, STOR, or RETR call"
+    );
+    assert_eq!(manifest.failures.len(), 1);
+    assert_eq!(manifest.failures[0].stage, "binary_mode");
+    assert_eq!(manifest.failures[0].git_path, None);
+    assert_eq!(manifest.failures[0].error, "TYPE I refused");
+    assert!(manifest
+        .uploads
+        .iter()
+        .all(|upload| upload.upload_status == UploadStatus::NotAttempted));
+    assert!(manifest
+        .uploads
+        .iter()
+        .all(|upload| upload.verification_status == VerificationStatus::NotAttempted));
+    assert_eq!(manifest.counts.commits, 0);
+    assert_eq!(manifest.counts.touched_paths, 2);
+    assert_eq!(manifest.counts.planned_uploads, 2);
+    assert_eq!(manifest.counts.uploaded, 0);
+    assert_eq!(manifest.counts.verified, 0);
+    assert_eq!(manifest.counts.deleted_reported, 0);
+    assert_eq!(manifest.counts.failures, 1);
+}
+
+#[test]
 fn executor_skips_comparison_only_when_disabled() {
     let mut remote = TestRemote::default();
     let mut blobs = executor_blobs();
