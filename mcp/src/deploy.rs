@@ -109,7 +109,13 @@ pub fn deploy_commits(
         .filter(|p| p.is_file())
         .collect();
 
-    Ok(upload_files(profile_name, profile, &local_root, files, dry_run)?)
+    Ok(upload_files(
+        profile_name,
+        profile,
+        &local_root,
+        files,
+        dry_run,
+    )?)
 }
 
 // ─── Internals ───────────────────────────────────────────────────────────────
