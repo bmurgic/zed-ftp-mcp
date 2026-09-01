@@ -359,6 +359,30 @@ fn deletion_executor_uses_binary_mode_and_exact_deterministic_path_order() {
 }
 
 #[test]
+fn deletion_executor_binary_mode_failure_stops_before_any_delete() {
+    let mut remote = TestRemote {
+        failures: std::collections::BTreeMap::from([(
+            1,
+            RemoteFailure::operation("TYPE I refused"),
+        )]),
+        ..TestRemote::default()
+    };
+
+    let manifest = execute_deletion(deletion_executor_plan(), &mut remote);
+
+    assert!(!manifest.success);
+    assert_eq!(remote.calls, vec![RemoteCall::Binary]);
+    assert_eq!(manifest.failures.len(), 1);
+    assert_eq!(manifest.failures[0].stage, "binary_mode");
+    assert_eq!(manifest.failures[0].git_path, None);
+    assert_eq!(manifest.failures[0].error, "TYPE I refused");
+    assert!(manifest
+        .paths
+        .iter()
+        .all(|path| path.status == DeletePathStatus::NotAttempted));
+}
+
+#[test]
 fn deletion_executor_operation_failure_continues_but_connection_loss_stops() {
     let mut operation_remote = TestRemote {
         failures: std::collections::BTreeMap::from([(2, RemoteFailure::operation("denied"))]),
