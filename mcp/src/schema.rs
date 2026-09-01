@@ -158,6 +158,11 @@ mod tests {
         let manifest_schema: Value = schema::<BranchDeleteManifest>();
 
         assert_no_unsupported_formats(&manifest_schema);
+        assert_eq!(
+            manifest_schema.pointer("/properties/repository_root/type"),
+            Some(&json!("string"))
+        );
+        assert!(manifest_schema.pointer("/properties/repository").is_none());
         for count in ["planned", "deleted", "failed", "not_attempted", "blocked"] {
             assert_integer_schema(
                 &manifest_schema,

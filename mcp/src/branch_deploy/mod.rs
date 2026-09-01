@@ -178,7 +178,7 @@ pub struct DeleteManifestCounts {
 #[derive(Debug, Clone)]
 pub struct BranchDeletePlan {
     pub profile: String,
-    pub repository: RepositorySummary,
+    pub repository_root: String,
     pub base_commit: String,
     pub head_commit: String,
     pub reason: String,
@@ -192,7 +192,7 @@ pub struct BranchDeletePlan {
 pub struct BranchDeleteManifest {
     pub success: bool,
     pub profile: String,
-    pub repository: RepositorySummary,
+    pub repository_root: String,
     pub base_commit: String,
     pub head_commit: String,
     pub reason: String,
@@ -440,7 +440,7 @@ pub(crate) fn deletion_manifest(
             && counts.failed == 0
             && counts.not_attempted == 0,
         profile: plan.profile,
-        repository: plan.repository,
+        repository_root: plan.repository_root,
         base_commit: plan.base_commit,
         head_commit: plan.head_commit,
         reason: plan.reason,

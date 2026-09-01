@@ -477,9 +477,7 @@ impl FtpServer {
                 .await
                 .map_err(internal)?;
 
-        result
-            .map(branch_deploy_manifest_output)
-            .map_err(branch_deploy_error)
+        branch_deploy_manifest_from_operation(|| result)
     }
 
     #[tool(
@@ -509,9 +507,7 @@ impl FtpServer {
         .await
         .map_err(internal)?;
 
-        result
-            .map(deletion_manifest_output)
-            .map_err(branch_deploy_error)
+        deletion_manifest_from_operation(|| result)
     }
 
     #[tool(
@@ -712,10 +708,32 @@ fn branch_deploy_manifest_output(
     Json(manifest)
 }
 
+fn branch_deploy_manifest_from_operation<F>(
+    operation: F,
+) -> Result<Json<branch_deploy::BranchDeployManifest>, ErrorData>
+where
+    F: FnOnce() -> Result<branch_deploy::BranchDeployManifest, branch_deploy::BranchDeployError>,
+{
+    operation()
+        .map(branch_deploy_manifest_output)
+        .map_err(branch_deploy_error)
+}
+
 fn deletion_manifest_output(
     manifest: branch_deploy::BranchDeleteManifest,
 ) -> Json<branch_deploy::BranchDeleteManifest> {
     Json(manifest)
+}
+
+fn deletion_manifest_from_operation<F>(
+    operation: F,
+) -> Result<Json<branch_deploy::BranchDeleteManifest>, ErrorData>
+where
+    F: FnOnce() -> Result<branch_deploy::BranchDeleteManifest, branch_deploy::BranchDeployError>,
+{
+    operation()
+        .map(deletion_manifest_output)
+        .map_err(branch_deploy_error)
 }
 
 fn use_base64(bytes: &[u8]) -> String {
@@ -761,11 +779,13 @@ fn use_base64(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        branch_deploy_error, branch_deploy_manifest_output, deletion_manifest_output,
+        branch_deploy_error, branch_deploy_manifest_from_operation, branch_deploy_manifest_output,
+        deletion_manifest_from_operation, deletion_manifest_output, use_base64,
         DeleteBranchFilesArgs, DeployBranchArgs,
     };
     use crate::branch_deploy::{
-        dry_run_manifest, BranchDeployError, BranchDeployPlan, PlannedUpload,
+        deletion_dry_run_manifest, dry_run_manifest, BranchDeletePlan, BranchDeployError,
+        BranchDeployPlan, FailureRecord, PlannedUpload,
     };
     use rmcp::model::ErrorCode;
 
@@ -808,10 +828,7 @@ mod tests {
         let manifest = crate::branch_deploy::deletion_dry_run_manifest(
             crate::branch_deploy::BranchDeletePlan {
                 profile: args.profile,
-                repository: crate::branch_deploy::RepositorySummary {
-                    root: args.repo_root,
-                    dirty: false,
-                },
+                repository_root: args.repo_root,
                 base_commit: args.base_commit,
                 head_commit: args.head_commit,
                 reason: args.reason,
@@ -835,6 +852,60 @@ mod tests {
         let response = branch_deploy_manifest_output(manifest);
 
         assert!(!response.0.success);
+    }
+
+    #[test]
+    fn deploy_branch_handler_mapping_returns_unsuccessful_manifest_as_data() {
+        let mut plan = BranchDeployPlan::empty("staging", "/repo");
+        plan.failures.push(FailureRecord {
+            stage: "upload".to_string(),
+            git_path: Some("app.bin".to_string()),
+            error: "FTP write failed".to_string(),
+        });
+        let manifest = dry_run_manifest(plan, true);
+        let expected = serde_json::to_value(&manifest).expect("manifest should serialize");
+
+        let response = branch_deploy_manifest_from_operation(|| Ok(manifest))
+            .expect("unsuccessful deployment manifest should remain MCP data");
+
+        assert!(!response.0.success);
+        assert_eq!(
+            serde_json::to_value(response.0).expect("MCP response should serialize"),
+            expected
+        );
+    }
+
+    #[test]
+    fn deletion_handler_mapping_returns_unsuccessful_manifest_as_data() {
+        let manifest = deletion_dry_run_manifest(BranchDeletePlan {
+            profile: "staging".to_string(),
+            repository_root: "/repo".to_string(),
+            base_commit: "a".repeat(40),
+            head_commit: "b".repeat(40),
+            reason: "approved cleanup".to_string(),
+            dry_run: false,
+            paths: Vec::new(),
+            blocked: vec![crate::branch_deploy::BlockedPath {
+                git_path: None,
+                reason: "preflight failed".to_string(),
+            }],
+            failures: Vec::new(),
+        });
+        let expected = serde_json::to_value(&manifest).expect("manifest should serialize");
+
+        let response = deletion_manifest_from_operation(|| Ok(manifest))
+            .expect("unsuccessful deletion manifest should remain MCP data");
+
+        assert!(!response.0.success);
+        assert_eq!(
+            serde_json::to_value(response.0).expect("MCP response should serialize"),
+            expected
+        );
+    }
+
+    #[test]
+    fn base64_encoder_handles_complete_and_padded_chunks() {
+        assert_eq!(use_base64(&[0xff, 0xee, 0xdd, 0xcc, 0xbb]), "/+7dzLs=");
     }
 
     #[test]

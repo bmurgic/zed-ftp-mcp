@@ -292,7 +292,7 @@ mod tests {
     use crate::{
         branch_deploy::{
             deletion_manifest, dry_run_manifest, BlockedPath, BranchDeletePlan, BranchDeployPlan,
-            DeletePathResult, DeletePathStatus, FailureRecord, PlannedUpload, RepositorySummary,
+            DeletePathResult, DeletePathStatus, FailureRecord, PlannedUpload,
         },
         config::Profile,
     };
@@ -325,10 +325,7 @@ mod tests {
     fn unsuccessful_deletion_manifest() -> crate::branch_deploy::BranchDeleteManifest {
         let plan = BranchDeletePlan {
             profile: "staging".to_string(),
-            repository: RepositorySummary {
-                root: "/repo".to_string(),
-                dirty: false,
-            },
+            repository_root: "/repo".to_string(),
             base_commit: "aabbccddeeff00112233445566778899aabbccdd".to_string(),
             head_commit: "11223344556677889900aabbccddeeff11223344".to_string(),
             reason: "approved cleanup".to_string(),
@@ -483,7 +480,7 @@ mod tests {
             serde_json::json!({
                 "success": false,
                 "profile": "staging",
-                "repository": { "root": "/repo", "dirty": false },
+                "repository_root": "/repo",
                 "base_commit": "aabbccddeeff00112233445566778899aabbccdd",
                 "head_commit": "11223344556677889900aabbccddeeff11223344",
                 "reason": "approved cleanup",

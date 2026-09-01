@@ -364,10 +364,7 @@ fn deletion_plan_shell(
 ) -> BranchDeletePlan {
     BranchDeletePlan {
         profile: request.profile.clone(),
-        repository: RepositorySummary {
-            root: repository_root.display().to_string(),
-            dirty: false,
-        },
+        repository_root: repository_root.display().to_string(),
         base_commit: request.base_commit.clone(),
         head_commit: request.head_commit.clone(),
         reason: request.reason.clone(),

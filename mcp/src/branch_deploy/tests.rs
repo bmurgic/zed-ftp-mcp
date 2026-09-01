@@ -1,12 +1,12 @@
 use super::git::null_device_for_platform;
 use super::git::BatchBlobReader;
 use super::{
-    delete_branch_files_with_connector, deploy_branch, deploy_branch_with_connector,
-    deploy_branch_with_dependencies, dry_run_manifest, execute_deletion, execute_deploy,
-    map_remote_path, plan_branch, plan_deletion, BlobSource, BranchDeletePlan, BranchDeployError,
-    BranchDeployPlan, BranchRemote, DeleteBranchFilesRequest, DeletePathResult, DeletePathStatus,
-    DeletedPathStatus, DeployBranchRequest, PlannedUpload, RemoteComparison, RemoteFailure,
-    RepositorySummary, UploadStatus, VerificationStatus,
+    delete_branch_files_with_connector, deletion_dry_run_manifest, deploy_branch,
+    deploy_branch_with_connector, deploy_branch_with_dependencies, dry_run_manifest,
+    execute_deletion, execute_deploy, map_remote_path, plan_branch, plan_deletion, BlobSource,
+    BranchDeletePlan, BranchDeployError, BranchDeployPlan, BranchRemote, DeleteBranchFilesRequest,
+    DeletePathResult, DeletePathStatus, DeletedPathResult, DeletedPathStatus, DeployBranchRequest,
+    PlannedUpload, RemoteComparison, RemoteFailure, UploadStatus, VerificationStatus,
 };
 use crate::config::Profile;
 use serde_json::json;
@@ -147,10 +147,7 @@ fn executor_blobs() -> TestBlobs {
 fn deletion_executor_plan() -> BranchDeletePlan {
     BranchDeletePlan {
         profile: "staging".to_string(),
-        repository: RepositorySummary {
-            root: "/repo".to_string(),
-            dirty: false,
-        },
+        repository_root: "/repo".to_string(),
         base_commit: "a".repeat(40),
         head_commit: "b".repeat(40),
         reason: "approved removal".to_string(),
@@ -606,6 +603,33 @@ fn executor_operation_upload_failure_continues() {
 }
 
 #[test]
+fn deployment_executor_reports_removed_paths_without_deleting_them() {
+    let mut remote = TestRemote::default();
+    let mut blobs = executor_blobs();
+    let mut plan = executor_plan();
+    plan.deleted.push(DeletedPathResult {
+        git_path: "removed.txt".to_string(),
+        status: DeletedPathStatus::RequiresExplicitCall,
+    });
+
+    let manifest = execute_deploy(plan, true, &mut blobs, &mut remote);
+
+    assert!(manifest.success);
+    assert_eq!(manifest.deleted.len(), 1);
+    assert_eq!(
+        manifest.deleted[0].status,
+        DeletedPathStatus::RequiresExplicitCall
+    );
+    assert!(
+        remote
+            .calls
+            .iter()
+            .all(|call| !matches!(call, RemoteCall::Delete(_))),
+        "branch deployment must not delete reported paths"
+    );
+}
+
+#[test]
 fn executor_operation_mkdir_failure_skips_item_and_continues() {
     let mut remote = TestRemote {
         failures: std::collections::BTreeMap::from([(2, RemoteFailure::operation("MKD refused"))]),
@@ -911,6 +935,28 @@ fn planner_contract_serializes_stable_manifest_fields() {
     ] {
         assert_eq!(serde_json::to_value(status).unwrap(), json!(expected));
     }
+}
+
+#[test]
+fn deletion_manifest_reports_only_the_repository_root() {
+    let manifest = deletion_dry_run_manifest(BranchDeletePlan {
+        profile: "staging".to_string(),
+        repository_root: "/approved/repository".to_string(),
+        base_commit: "a".repeat(40),
+        head_commit: "b".repeat(40),
+        reason: "approved cleanup".to_string(),
+        dry_run: true,
+        paths: Vec::new(),
+        blocked: Vec::new(),
+        failures: Vec::new(),
+    });
+    let manifest = serde_json::to_value(manifest).expect("deletion manifest should serialize");
+
+    assert_eq!(
+        manifest.pointer("/repository_root"),
+        Some(&json!("/approved/repository"))
+    );
+    assert!(manifest.pointer("/repository").is_none());
 }
 
 #[test]

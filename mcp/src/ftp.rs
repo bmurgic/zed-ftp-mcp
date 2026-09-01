@@ -322,7 +322,7 @@ mod tests {
         RemoteFailureKind,
     };
     use crate::branch_deploy::{
-        execute_deletion, BranchDeletePlan, DeletePathResult, DeletePathStatus, RepositorySummary,
+        execute_deletion, BranchDeletePlan, DeletePathResult, DeletePathStatus,
     };
     use crate::config::Profile;
     use std::io::{self, BufRead, BufReader, Read, Write};
@@ -386,10 +386,7 @@ mod tests {
         let manifest = execute_deletion(
             BranchDeletePlan {
                 profile: "test".to_string(),
-                repository: RepositorySummary {
-                    root: "/approved/repository".to_string(),
-                    dirty: false,
-                },
+                repository_root: "/approved/repository".to_string(),
                 base_commit: "a".repeat(40),
                 head_commit: "b".repeat(40),
                 reason: "remove approved files".to_string(),
@@ -816,10 +813,7 @@ mod tests {
         let manifest = execute_deletion(
             BranchDeletePlan {
                 profile: "disposable".to_string(),
-                repository: RepositorySummary {
-                    root: "/approved/repository".to_string(),
-                    dirty: false,
-                },
+                repository_root: "/approved/repository".to_string(),
                 base_commit: "a".repeat(40),
                 head_commit: "b".repeat(40),
                 reason: "remove the approved test file".to_string(),

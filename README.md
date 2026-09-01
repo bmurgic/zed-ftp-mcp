@@ -148,8 +148,8 @@ is not deleted in that range, is unsafe, is non-ASCII, is duplicated, or
 ASCII-case-collides with another requested path or a surviving head blob. This
 prevents a case-only rename from deleting its replacement on a case-insensitive
 server. Pass `--dry-run` to return the authorized planned paths without remote
-access. A deletion manifest records blocked, deleted, failed, and not-attempted
-paths. A normal FTP operation failure continues to the next approved path. A
+access. A deletion manifest records the approved `repository_root`, blocked,
+deleted, failed, and not-attempted paths. A normal FTP operation failure continues to the next approved path. A
 lost connection stops later paths without reconnecting and makes the command
 exit nonzero.
 
