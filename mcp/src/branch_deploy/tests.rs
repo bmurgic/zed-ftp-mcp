@@ -1,11 +1,12 @@
 use super::git::null_device_for_platform;
 use super::git::BatchBlobReader;
 use super::{
-    delete_branch_files_with_handoff, deploy_branch, deploy_branch_with_handoff, dry_run_manifest,
-    execute_deletion, execute_deploy, map_remote_path, plan_branch, plan_deletion, BlobSource,
-    BranchDeletePlan, BranchDeployError, BranchDeployPlan, BranchRemote, DeleteBranchFilesRequest,
-    DeletePathResult, DeletePathStatus, DeletedPathStatus, DeployBranchRequest, PlannedUpload,
-    RemoteComparison, RemoteFailure, RepositorySummary, UploadStatus, VerificationStatus,
+    connection_failure_manifest, delete_branch_files_with_handoff, deploy_branch,
+    deploy_branch_with_handoff, dry_run_manifest, execute_deletion, execute_deploy,
+    map_remote_path, plan_branch, plan_deletion, BlobSource, BranchDeletePlan, BranchDeployError,
+    BranchDeployPlan, BranchRemote, DeleteBranchFilesRequest, DeletePathResult, DeletePathStatus,
+    DeletedPathStatus, DeployBranchRequest, PlannedUpload, RemoteComparison, RemoteFailure,
+    RepositorySummary, UploadStatus, VerificationStatus,
 };
 use crate::config::Profile;
 use serde_json::json;
@@ -1249,8 +1250,13 @@ fn dry_run_reads_metadata_only() {
     assert_eq!(effects.remote_factory_calls(), 1);
     assert_eq!(effects.remote_method_calls(), 1);
 
-    let public_manifest = deploy_branch(&actual_request, &profile)
-        .expect("connection failures should return an unsuccessful execution manifest");
+    let connection_failure_plan = plan_branch(&actual_request, &profile)
+        .expect("connection failure fixture should plan without external handoff");
+    let public_manifest = connection_failure_manifest(
+        connection_failure_plan,
+        actual_request.verify,
+        anyhow::anyhow!("test connection failure"),
+    );
     assert!(!public_manifest.success);
     assert_eq!(public_manifest.failures[0].stage, "connect");
     assert_eq!(
