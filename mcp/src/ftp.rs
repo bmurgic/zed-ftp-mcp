@@ -233,6 +233,13 @@ fn map_branch_ftp_error(error: FtpError) -> RemoteFailure {
             kind: RemoteFailureKind::ConnectionLost,
             error: error.to_string(),
         },
+        // FTP 421 closes the control connection, so deletion must stop rather than issue another command.
+        FtpError::UnexpectedResponse(response) if response.status == Status::NotAvailable => {
+            RemoteFailure {
+                kind: RemoteFailureKind::ConnectionLost,
+                error: error.to_string(),
+            }
+        }
         FtpError::UnexpectedResponse(_) | FtpError::InvalidAddress(_) => {
             RemoteFailure::operation(error.to_string())
         }
@@ -324,10 +331,12 @@ mod tests {
     use std::process::Command;
     use std::sync::{Arc, Mutex};
     use std::thread;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
     use suppaftp::types::Response;
     use suppaftp::{FtpError, Status};
     use suppaftp::{FtpStream, Mode};
+
+    type Deletion421Server = (Vec<Vec<u8>>, usize);
 
     #[test]
     fn branch_adapter_classifies_suppaftp_errors() {
@@ -347,6 +356,14 @@ mod tests {
                 FtpError::UnexpectedResponse(Response::new(Status::FileUnavailable, Vec::new())),
                 RemoteFailureKind::Operation,
             ),
+            (
+                FtpError::UnexpectedResponse(Response::new(Status::BadFilename, Vec::new())),
+                RemoteFailureKind::Operation,
+            ),
+            (
+                FtpError::UnexpectedResponse(Response::new(Status::NotAvailable, Vec::new())),
+                RemoteFailureKind::ConnectionLost,
+            ),
             (FtpError::BadResponse, RemoteFailureKind::ConnectionLost),
             (
                 FtpError::InvalidAddress(invalid_address),
@@ -361,6 +378,51 @@ mod tests {
         for (error, expected) in cases {
             assert_eq!(map_branch_ftp_error(error).kind, expected);
         }
+    }
+
+    #[test]
+    fn deletion_executor_stops_when_ftp_adapter_receives_421() {
+        let (mut client, server) = branch_client_for_deletion_421();
+        let manifest = execute_deletion(
+            BranchDeletePlan {
+                profile: "test".to_string(),
+                repository: RepositorySummary {
+                    root: "/approved/repository".to_string(),
+                    dirty: false,
+                },
+                base_commit: "a".repeat(40),
+                head_commit: "b".repeat(40),
+                reason: "remove approved files".to_string(),
+                dry_run: false,
+                paths: vec![
+                    DeletePathResult {
+                        git_path: "first.txt".to_string(),
+                        remote_path: "first.txt".to_string(),
+                        status: DeletePathStatus::Planned,
+                    },
+                    DeletePathResult {
+                        git_path: "second.txt".to_string(),
+                        remote_path: "second.txt".to_string(),
+                        status: DeletePathStatus::Planned,
+                    },
+                ],
+                blocked: Vec::new(),
+                failures: Vec::new(),
+            },
+            &mut client,
+        );
+
+        assert!(!manifest.success);
+        assert_eq!(manifest.paths[0].status, DeletePathStatus::Failed);
+        assert_eq!(manifest.paths[1].status, DeletePathStatus::NotAttempted);
+
+        let (commands, connections) = server.join().expect("FTP server should complete");
+        assert_eq!(connections, 1, "deletion must not reconnect after FTP 421");
+        assert_eq!(
+            commands,
+            vec![b"TYPE I\r\n".to_vec(), b"DELE first.txt\r\n".to_vec()],
+            "deletion must not send a second DELE after FTP 421"
+        );
     }
 
     #[test]
@@ -487,6 +549,78 @@ mod tests {
         });
         let stream =
             FtpStream::connect(address.to_string()).expect("client should connect to MKD server");
+
+        (
+            FtpClient {
+                stream: AnyFtpStream::Plain(stream),
+            },
+            server,
+        )
+    }
+
+    fn branch_client_for_deletion_421() -> (FtpClient, thread::JoinHandle<Deletion421Server>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("deletion server should bind");
+        let address = listener
+            .local_addr()
+            .expect("deletion server address should resolve");
+        let server = thread::spawn(move || {
+            let (mut connection, _) = listener.accept().expect("deletion server should accept");
+            connection
+                .write_all(b"220 ready\r\n")
+                .expect("deletion server should send greeting");
+            let reader_connection = connection
+                .try_clone()
+                .expect("deletion server connection should clone");
+            let mut reader = BufReader::new(reader_connection);
+            let mut commands = Vec::new();
+
+            for response in [
+                b"200 binary\r\n".as_slice(),
+                b"421 closing control connection\r\n",
+            ] {
+                let mut command = Vec::new();
+                reader
+                    .read_until(b'\n', &mut command)
+                    .expect("deletion server should receive command");
+                commands.push(command);
+                connection
+                    .write_all(response)
+                    .expect("deletion server should send response");
+            }
+
+            connection
+                .set_read_timeout(Some(Duration::from_millis(250)))
+                .expect("deletion server should set command timeout");
+            let mut unexpected_command = Vec::new();
+            match reader.read_until(b'\n', &mut unexpected_command) {
+                Ok(0) => {}
+                Ok(_) => commands.push(unexpected_command),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                    ) => {}
+                Err(error) => panic!("deletion server failed reading command: {error}"),
+            }
+
+            listener
+                .set_nonblocking(true)
+                .expect("deletion server should make listener nonblocking");
+            let deadline = Instant::now() + Duration::from_millis(250);
+            let mut connections = 1;
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((_connection, _)) => connections += 1,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("deletion server failed accepting connection: {error}"),
+                }
+            }
+            (commands, connections)
+        });
+        let stream = FtpStream::connect(address.to_string())
+            .expect("client should connect to deletion server");
 
         (
             FtpClient {
