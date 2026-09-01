@@ -1,6 +1,7 @@
 use super::{
-    dry_run_manifest, map_remote_path, plan_branch, BranchDeployError, BranchDeployPlan,
-    DeletedPathStatus, DeployBranchRequest, UploadStatus, VerificationStatus,
+    deploy_branch_with_execution, dry_run_manifest, map_remote_path, plan_branch,
+    BranchDeployError, BranchDeployExecution, BranchDeployPlan, DeletedPathStatus,
+    DeployBranchRequest, UploadStatus, VerificationStatus,
 };
 use crate::config::Profile;
 use serde_json::json;
@@ -400,8 +401,15 @@ fn dry_run_reads_metadata_only() {
     repository.write("tracked.txt", b"head");
     repository.commit("head");
 
-    let effects = DryRunEffects::default();
-    let manifest = dry_run_manifest(plan_for(&repository, &base), true);
+    let request = request(
+        repository.path().to_str().expect("utf-8 path"),
+        &base,
+        "HEAD",
+    );
+    let profile = test_profile("/remote/root");
+    let mut effects = DryRunEffects::default();
+    let manifest = deploy_branch_with_execution(&request, &profile, &mut effects)
+        .expect("dry run should succeed");
 
     assert_eq!(effects.blob_reads(), 0);
     assert_eq!(effects.credential_reads(), 0);
@@ -414,6 +422,15 @@ fn dry_run_reads_metadata_only() {
             .collect::<Vec<_>>(),
         vec![UploadStatus::Planned; manifest.uploads.len()]
     );
+
+    let mut actual_request = request;
+    actual_request.dry_run = false;
+    let error = deploy_branch_with_execution(&actual_request, &profile, &mut effects)
+        .expect_err("execution should remain unavailable until Slice 2");
+    assert!(error.to_string().contains("not available"));
+    assert_eq!(effects.blob_reads(), 1);
+    assert_eq!(effects.credential_reads(), 1);
+    assert_eq!(effects.remote_connections(), 1);
 }
 
 fn test_profile(remote_root: &str) -> Profile {
@@ -489,6 +506,23 @@ impl DryRunEffects {
 
     fn remote_connections(&self) -> usize {
         self.remote_connections
+    }
+}
+
+impl BranchDeployExecution for DryRunEffects {
+    fn read_blob_contents(&mut self, _plan: &BranchDeployPlan) -> Result<(), BranchDeployError> {
+        self.blob_reads += 1;
+        Ok(())
+    }
+
+    fn read_credentials(&mut self, _profile_name: &str) -> Result<(), BranchDeployError> {
+        self.credential_reads += 1;
+        Ok(())
+    }
+
+    fn connect_remote(&mut self, _profile: &Profile) -> Result<(), BranchDeployError> {
+        self.remote_connections += 1;
+        Ok(())
     }
 }
 
