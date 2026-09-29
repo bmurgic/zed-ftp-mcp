@@ -1,5 +1,6 @@
 use super::git::null_device_for_platform;
 use super::git::BatchBlobReader;
+use super::merge::{self, ConflictReason, MergeDecision};
 use super::{
     delete_branch_files_with_connector, deletion_dry_run_manifest, deploy_branch,
     deploy_branch_with_connector, deploy_branch_with_dependencies, dry_run_manifest,
@@ -1748,6 +1749,253 @@ fn planner_reports_same_length_tracked_worktree_change_as_dirty() {
     let plan = plan_for(&repository, &base);
 
     assert!(plan.repository.dirty);
+}
+
+const MERGE_BASE: &[u8] = b"line 1\nline 2\nline 3\nline 4\nline 5\nline 6\n";
+
+fn merge_lines(replacements: &[(usize, &str)]) -> Vec<u8> {
+    let mut lines: Vec<String> = (1..=6).map(|number| format!("line {number}")).collect();
+    for (line_number, text) in replacements {
+        lines[line_number - 1] = (*text).to_string();
+    }
+    format!("{}\n", lines.join("\n")).into_bytes()
+}
+
+fn assert_conflict(decision: MergeDecision, expected_reason: ConflictReason) -> Option<Vec<u8>> {
+    match decision {
+        MergeDecision::Conflict {
+            reason,
+            marked_text,
+        } => {
+            assert_eq!(reason, expected_reason);
+            marked_text
+        }
+        other => panic!("expected a {expected_reason:?} conflict, got {other:?}"),
+    }
+}
+
+#[test]
+fn merge_decide_applies_rules_2_to_8_in_order() {
+    let head = merge_lines(&[(2, "line 2 head")]);
+    let server_other_line = merge_lines(&[(5, "line 5 server")]);
+    let server_same_line = merge_lines(&[(2, "line 2 server")]);
+    let binary = b"a\0b".to_vec();
+    let binary_head = b"a\0c".to_vec();
+
+    // Rule 2 wins over every later rule, including the binary refusal.
+    assert_eq!(
+        merge::decide(Some(MERGE_BASE), &head, Some(&head)).unwrap(),
+        MergeDecision::AlreadyDeployed
+    );
+    assert_eq!(
+        merge::decide(None, &head, Some(&head)).unwrap(),
+        MergeDecision::AlreadyDeployed
+    );
+    assert_eq!(
+        merge::decide(Some(&binary), &binary_head, Some(&binary_head)).unwrap(),
+        MergeDecision::AlreadyDeployed
+    );
+    // Rule 3 wins over the binary refusal, so a binary file fast-forwards.
+    assert_eq!(
+        merge::decide(Some(MERGE_BASE), &head, Some(MERGE_BASE)).unwrap(),
+        MergeDecision::FastForward
+    );
+    assert_eq!(
+        merge::decide(Some(&binary), &binary_head, Some(&binary)).unwrap(),
+        MergeDecision::FastForward
+    );
+    // Rule 4.
+    assert_eq!(
+        merge::decide(Some(MERGE_BASE), &head, Some(&server_other_line)).unwrap(),
+        MergeDecision::Merged(merge_lines(&[(2, "line 2 head"), (5, "line 5 server")]))
+    );
+    assert_conflict(
+        merge::decide(Some(MERGE_BASE), &head, Some(&server_same_line)).unwrap(),
+        ConflictReason::TextConflict,
+    );
+    // Rule 5.
+    assert_eq!(
+        assert_conflict(
+            merge::decide(Some(&binary), &binary_head, Some(b"a\0d")).unwrap(),
+            ConflictReason::BinaryChanged
+        ),
+        None
+    );
+    // Rule 6.
+    assert_eq!(
+        assert_conflict(
+            merge::decide(Some(MERGE_BASE), &head, None).unwrap(),
+            ConflictReason::DeletedOnServer
+        ),
+        None
+    );
+    // Rule 7. A symbolic-link base arrives as an absent base.
+    assert_eq!(
+        merge::decide(None, &head, None).unwrap(),
+        MergeDecision::NewFile
+    );
+    // Rule 8.
+    assert_eq!(
+        assert_conflict(
+            merge::decide(None, &head, Some(&server_other_line)).unwrap(),
+            ConflictReason::AddedOnBoth
+        ),
+        None
+    );
+}
+
+#[test]
+fn merge_decide_refuses_a_nul_byte_in_any_single_version() {
+    let text_head = merge_lines(&[(2, "line 2 head")]);
+    let text_server = merge_lines(&[(5, "line 5 server")]);
+    let with_nul = |mut bytes: Vec<u8>| {
+        bytes.push(0);
+        bytes
+    };
+
+    for (base, head, server) in [
+        (
+            with_nul(MERGE_BASE.to_vec()),
+            text_head.clone(),
+            text_server.clone(),
+        ),
+        (
+            MERGE_BASE.to_vec(),
+            with_nul(text_head.clone()),
+            text_server.clone(),
+        ),
+        (
+            MERGE_BASE.to_vec(),
+            text_head.clone(),
+            with_nul(text_server.clone()),
+        ),
+    ] {
+        assert_conflict(
+            merge::decide(Some(&base), &head, Some(&server)).unwrap(),
+            ConflictReason::BinaryChanged,
+        );
+    }
+}
+
+#[test]
+fn merge_decide_refuses_a_nul_byte_beyond_the_first_8000_bytes() {
+    let mut late_nul_base = vec![b'x'; 9000];
+    late_nul_base.extend_from_slice(b"\n\0\n");
+    let mut head = late_nul_base.clone();
+    head.extend_from_slice(b"head\n");
+    let mut server = late_nul_base.clone();
+    server.extend_from_slice(b"server\n");
+
+    assert_conflict(
+        merge::decide(Some(&late_nul_base), &head, Some(&server)).unwrap(),
+        ConflictReason::BinaryChanged,
+    );
+}
+
+#[test]
+fn merge_rules_04_adjacent_edits_conflict() {
+    for (head_line, server_line) in [(2, 2), (2, 3)] {
+        let head = merge_lines(&[(head_line, "head edit")]);
+        let server = merge_lines(&[(server_line, "server edit")]);
+
+        let marked_text = assert_conflict(
+            merge::decide(Some(MERGE_BASE), &head, Some(&server)).unwrap(),
+            ConflictReason::TextConflict,
+        )
+        .expect("a text conflict carries its marked text");
+        let marked_text = String::from_utf8(marked_text).expect("ASCII fixture");
+
+        for marker in ["<<<<<<< server", "||||||| base", "=======", ">>>>>>> head"] {
+            assert!(
+                marked_text.contains(marker),
+                "missing {marker} for head line {head_line} and server line {server_line}: {marked_text}"
+            );
+        }
+        assert!(marked_text.contains("server edit") && marked_text.contains("head edit"));
+    }
+}
+
+#[test]
+fn merge_decide_keeps_latin_1_bytes_raw_in_marked_text() {
+    let base = b"1\n2\n3\n4 caf\xe9\n5\n6\n".to_vec();
+    let head = b"1\n2 head\n3\n4 caf\xe9\n5\n6\n".to_vec();
+    let server = b"1\n2\n3 server\n4 caf\xe9\n5\n6\n".to_vec();
+
+    let marked_text = assert_conflict(
+        merge::decide(Some(&base), &head, Some(&server)).unwrap(),
+        ConflictReason::TextConflict,
+    )
+    .expect("a text conflict carries its marked text");
+
+    assert!(marked_text.contains(&0xe9), "0xE9 must pass through raw");
+    assert!(String::from_utf8(marked_text).is_err());
+}
+
+#[test]
+fn merge_decide_removes_its_workspace_after_every_text_merge() {
+    let workspace_parent = TempDir::new().expect("workspace parent should exist");
+    let head = merge_lines(&[(2, "line 2 head")]);
+
+    let clean = merge::decide_in(
+        workspace_parent.path(),
+        Some(MERGE_BASE),
+        &head,
+        Some(&merge_lines(&[(5, "line 5 server")])),
+    )
+    .unwrap();
+    let conflicting = merge::decide_in(
+        workspace_parent.path(),
+        Some(MERGE_BASE),
+        &head,
+        Some(&merge_lines(&[(2, "line 2 server")])),
+    )
+    .unwrap();
+
+    assert!(matches!(clean, MergeDecision::Merged(_)));
+    assert!(matches!(conflicting, MergeDecision::Conflict { .. }));
+    assert_eq!(
+        fs::read_dir(workspace_parent.path()).unwrap().count(),
+        0,
+        "every merge must remove its private directory"
+    );
+}
+
+#[test]
+fn merge_decide_reports_a_workspace_failure_as_an_error() {
+    let workspace_parent = TempDir::new().expect("workspace parent should exist");
+    let missing_parent = workspace_parent.path().join("missing");
+
+    let result = merge::decide_in(
+        &missing_parent,
+        Some(MERGE_BASE),
+        &merge_lines(&[(2, "line 2 head")]),
+        Some(&merge_lines(&[(5, "line 5 server")])),
+    );
+
+    assert!(matches!(result, Err(BranchDeployError::Other(_))));
+}
+
+#[test]
+fn merge_file_exit_status_maps_to_clean_conflict_or_error() {
+    assert_eq!(
+        merge::interpret_merge_file_output(Some(0), b"clean".to_vec(), b"").unwrap(),
+        MergeDecision::Merged(b"clean".to_vec())
+    );
+    for conflicts in [1, 2, 127] {
+        assert_eq!(
+            merge::interpret_merge_file_output(Some(conflicts), b"marked".to_vec(), b"").unwrap(),
+            MergeDecision::Conflict {
+                reason: ConflictReason::TextConflict,
+                marked_text: Some(b"marked".to_vec()),
+            }
+        );
+    }
+    for failure in [Some(255), Some(128), Some(-1), None] {
+        assert!(
+            merge::interpret_merge_file_output(failure, b"partial".to_vec(), b"boom").is_err(),
+            "status {failure:?} must be an error"
+        );
+    }
 }
 
 fn test_profile(remote_root: &str) -> Profile {

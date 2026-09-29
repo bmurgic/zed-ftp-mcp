@@ -698,7 +698,7 @@ where
     Err(BranchDeployError::InvalidArgs(detail))
 }
 
-fn configure_git_command(command: &mut Command, repository_root: &Path) {
+pub(super) fn configure_git_command(command: &mut Command, repository_root: &Path) {
     let null_device = null_device_for_platform(cfg!(windows));
     let hooks_path = format!("core.hooksPath={null_device}");
     // Planning must not inherit Git variables that can select another repository or inject config.

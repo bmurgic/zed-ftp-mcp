@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 
 mod execute;
 mod git;
+#[allow(dead_code)] // The executor starts using the merge engine in task 1.5.
+mod merge;
 
 pub use execute::{
     execute_deletion, execute_deploy, BlobSource, BranchRemote, RemoteComparison, RemoteFailure,
