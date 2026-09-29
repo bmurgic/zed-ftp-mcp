@@ -457,7 +457,10 @@ impl FtpServer {
 
     #[tool(description = "Plan a committed Git range from an explicit worktree. \
             The plan uses exact head-commit blobs and reports removed Git paths. \
-            Set dry_run=true to avoid credential and FTP access.")]
+            Set dry_run=true to avoid credential and FTP access. \
+            When the user asks to merge into a server or profile (for example \
+            'merge into staging') or to preserve server-side changes, set \
+            mode=\"merge\"; run with dry_run=true first to preview conflicts.")]
     async fn ftp_deploy_branch(
         &self,
         Parameters(args): Parameters<DeployBranchArgs>,
@@ -792,6 +795,22 @@ mod tests {
         BranchDeployPlan, FailureRecord, PlannedUpload,
     };
     use rmcp::model::ErrorCode;
+
+    #[test]
+    fn deploy_branch_tool_description_tells_the_agent_when_to_merge() {
+        let tools = super::FtpServer::tool_router().list_all();
+        let tool = tools
+            .iter()
+            .find(|tool| tool.name == "ftp_deploy_branch")
+            .expect("ftp_deploy_branch should be listed");
+        let description = tool.description.as_deref().unwrap_or_default();
+
+        assert!(description.contains(
+            "When the user asks to merge into a server or profile (for example 'merge into \
+             staging') or to preserve server-side changes, set mode=\"merge\"; run with \
+             dry_run=true first to preview conflicts."
+        ));
+    }
 
     #[test]
     fn deploy_branch_contract_mcp_defaults_and_invalid_params() {

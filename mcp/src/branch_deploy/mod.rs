@@ -14,7 +14,9 @@ use git::BatchBlobReader;
 pub use merge::ConflictReason;
 
 /// How a branch deployment treats files that changed on the server.
-/// `overwrite` uploads head blobs as they are. `merge` three-way merges each file with its server copy.
+/// `overwrite` (the default) uploads head blobs as they are. `merge` three-way merges each file
+/// with its server copy and uploads nothing when any file conflicts. Use `merge` when the user
+/// asks to merge into a server or profile, or to preserve server-side changes.
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, clap::ValueEnum,
 )]

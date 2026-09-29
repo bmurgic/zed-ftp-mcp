@@ -35,7 +35,8 @@ enum Cmd {
     },
     /// List configured connection profiles.
     ListProfiles,
-    /// Plan a committed Git range from an explicit worktree.
+    /// Deploy a committed Git range from an explicit worktree. Use --mode merge to merge into
+    /// server-side changes instead of overwriting them.
     DeployBranch {
         /// Profile name as defined in connections.toml.
         profile: String,
@@ -58,7 +59,8 @@ enum Cmd {
         /// Return the deployment plan without accessing FTP or credentials.
         #[arg(long)]
         dry_run: bool,
-        /// Deployment mode: overwrite uploads head blobs as they are, merge three-way merges each file with its server copy.
+        /// Deployment mode. overwrite uploads head blobs as they are. merge three-way merges
+        /// each file with its server copy, and uploads nothing if any file conflicts.
         #[arg(long, value_enum, default_value_t = branch_deploy::DeployMode::Overwrite)]
         mode: branch_deploy::DeployMode,
     },
@@ -504,6 +506,21 @@ mod tests {
                 }]
             })
         );
+    }
+
+    #[test]
+    fn deploy_branch_help_tells_the_reader_when_to_merge() {
+        use clap::CommandFactory;
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("deploy-branch")
+            .expect("deploy-branch subcommand")
+            .render_long_help()
+            .to_string();
+
+        assert!(help.contains("--mode <MODE>"));
+        assert!(help.contains("merge into"));
+        assert!(help.contains("uploads nothing if any file conflicts"));
     }
 
     #[test]

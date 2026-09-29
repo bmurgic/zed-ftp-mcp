@@ -101,7 +101,8 @@ zed-ftp-mcp deploy-branch staging \
 ```
 
 The MCP equivalent is `ftp_deploy_branch`. It accepts `profile`, `repo_root`,
-and `base_ref`, plus optional `head_ref`, `verify`, and `dry_run` fields.
+and `base_ref`, plus optional `head_ref`, `verify`, `dry_run`, and `mode`
+fields. `mode` is `overwrite` (the default) or `merge`.
 
 The dry-run manifest lists the union of paths touched by every commit in the
 range. Each surviving path uses the blob from the resolved head commit, even
@@ -120,6 +121,75 @@ or per-file FTP failure leaves the other planned paths eligible to run, while a
 lost connection marks the remaining paths as not attempted. The CLI always
 prints this complete manifest and exits nonzero when any upload or verification
 does not succeed. The MCP tool returns the same unsuccessful manifest as data.
+
+### Merging into a server
+
+By default `deploy-branch` overwrites. It uploads every file in the range as
+the head commit has it, so any edit someone made to that file on the server is
+lost. To keep those edits, pass `--mode merge`. The MCP equivalent is
+`mode="merge"` on `ftp_deploy_branch`.
+
+```sh
+zed-ftp-mcp deploy-branch staging \
+	--repo-root /absolute/path/to/repository \
+	--base origin/main \
+	--mode merge
+```
+
+In merge mode the base ref is the common ancestor. For each file in the range,
+zed-ftp downloads the server copy and compares three versions: the file at the
+base commit, the file at the head commit, and the file on the server. The
+result is the file's `merge_status`.
+
+| `merge_status` | When | What happens |
+| --- | --- | --- |
+| `unchanged_in_range` | Base and head hold the same content. | Nothing is downloaded or uploaded. |
+| `already_deployed` | The server copy equals head. | Nothing is uploaded. |
+| `fast_forward` | The server copy equals base. | Head is uploaded as it is. |
+| `merged` | Server and head both changed the file, and the changes combine cleanly. | The merged content is uploaded. |
+| `new_file` | The file is new in head and absent on the server. | Head is uploaded. |
+| `conflict` | The changes cannot be combined. `conflict_reason` says why. | The whole run is blocked. |
+| `download_failed` | The server copy could not be read for a reason other than being absent. | The whole run is blocked. |
+| `not_decided` | The run was blocked before this file was checked. | Nothing is uploaded. |
+
+A `conflict` has one of four reasons in `conflict_reason`:
+
+- `text_conflict`: server and head changed nearby lines of a text file.
+- `binary_changed`: a version contains a NUL byte and the server copy differs from both base and head.
+- `deleted_on_server`: the file exists at base but is missing on the server.
+- `added_on_both`: the file is new in head, and the server already has a different copy.
+
+Merge mode is all or nothing. It decides every file before it uploads
+anything. If any file conflicts or fails to download, or the connection drops
+during the decisions, zed-ftp uploads nothing. The manifest then has
+`blocked_by_conflicts: true` and `success: false`, and the CLI exits nonzero.
+Files that would have uploaded show `upload_status: not_attempted`. Each
+cause has an entry in `failures`.
+
+For a `text_conflict`, the upload result carries `marked_text`. It holds the
+file with `<<<<<<< server`, `||||||| base`, `=======`, and `>>>>>>> head`
+markers, so you can see both edits and the original. Non-UTF-8 bytes appear as
+replacement characters. `marked_text` stops at 65,536 bytes and sets
+`marked_text_truncated` to true when it does. The server copy is never
+changed by a blocked run.
+
+To resolve a conflict, fix it on the branch and deploy again.
+
+1. Read `marked_text` and the `conflict_reason` for each conflicting file.
+2. Change the file on the branch so it includes the server-side edit or drops it on purpose.
+3. Commit the change.
+4. Run the same `deploy-branch --mode merge` command again.
+
+A merged file uploads content that no commit contains. Its `object_id` is still
+the head blob, and `bytes` is the size of the merged content. `uploaded_from`
+is `merged` for those files and `head_blob` for the others, and verification
+compares the server against the uploaded content.
+
+Merging works on lines. When the server edit and the head edit touch adjacent
+lines, Git treats them as one overlapping change and reports a
+`text_conflict`, even if a person would see two independent edits. A clean
+`merged` result also means only that the two edits did not overlap, not that
+the combined file is correct. Review the file after a merge.
 
 ### Delete a reported branch path explicitly
 
@@ -164,7 +234,7 @@ exit nonzero.
 | `ftp_upload_file` | Upload one local file; `before_changes=true` uploads the last-committed (git HEAD) version instead of the working tree |
 | `ftp_deploy` | Recursive upload of the full local project, gitignore-aware, optional `dry_run` |
 | `ftp_deploy_commits` | Upload only the files changed by specific commit SHAs, optional `dry_run` |
-| `ftp_deploy_branch` | Plan a committed range from an explicit Git worktree, optional `dry_run` |
+| `ftp_deploy_branch` | Plan a committed range from an explicit Git worktree, optional `dry_run`. `mode="merge"` merges into server-side edits |
 | `ftp_delete_branch_files` | Delete exact files from a pinned branch range after explicit approval |
 | `ftp_mkdir` | Create a directory and any missing parents |
 | `ftp_delete_file` | Delete a single remote file |
