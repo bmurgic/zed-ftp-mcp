@@ -232,6 +232,18 @@ impl UploadResult {
     }
 }
 
+/// One result per planned upload, each with the same statuses and no merge fields.
+fn uniform_results(
+    uploads: &[PlannedUpload],
+    upload_status: UploadStatus,
+    verification_status: VerificationStatus,
+) -> Vec<UploadResult> {
+    uploads
+        .iter()
+        .map(|upload| UploadResult::new(upload, upload_status, verification_status))
+        .collect()
+}
+
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct DeletedPathResult {
     pub git_path: String,
@@ -460,17 +472,11 @@ where
 }
 
 pub fn dry_run_manifest(plan: BranchDeployPlan, verify: bool) -> BranchDeployManifest {
-    let uploads: Vec<UploadResult> = plan
-        .uploads
-        .iter()
-        .map(|upload| {
-            UploadResult::new(
-                upload,
-                UploadStatus::Planned,
-                VerificationStatus::planned_for(verify),
-            )
-        })
-        .collect();
+    let uploads = uniform_results(
+        &plan.uploads,
+        UploadStatus::Planned,
+        VerificationStatus::planned_for(verify),
+    );
     let counts = ManifestCounts {
         commits: plan.commits.len(),
         touched_paths: plan.touched_paths,
@@ -580,20 +586,7 @@ fn connection_failure_manifest(
     verify: bool,
     error: anyhow::Error,
 ) -> BranchDeployManifest {
-    let uploads = match plan.mode {
-        DeployMode::Overwrite => plan
-            .uploads
-            .iter()
-            .map(|upload| {
-                UploadResult::new(
-                    upload,
-                    UploadStatus::NotAttempted,
-                    VerificationStatus::not_attempted_for(verify),
-                )
-            })
-            .collect(),
-        DeployMode::Merge => execute::undecided_merge_results(&plan, verify),
-    };
+    let uploads = execute::not_attempted_results(&plan, verify);
     let mut failures = plan.failures;
     failures.push(FailureRecord {
         stage: "connect".to_string(),

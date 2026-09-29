@@ -3,13 +3,13 @@
 //! `decide` applies spec rules 2 through 8 to the base, head, and server copies of one file.
 //! Rule 1 (`unchanged_in_range`) compares blob IDs, so the executor decides it before any download.
 
-use super::git::configure_git_command;
+use super::git::{configure_git_command, git_spawn_error};
 use super::BranchDeployError;
 use schemars::JsonSchema;
 use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -74,29 +74,45 @@ pub(super) fn decide_in(
     head: &[u8],
     server: Option<&[u8]>,
 ) -> Result<MergeDecision, BranchDeployError> {
+    // Rule 2.
     if server == Some(head) {
         return Ok(MergeDecision::AlreadyDeployed);
     }
     match (base, server) {
-        (Some(base), Some(server)) if server == base => Ok(MergeDecision::FastForward),
-        (Some(base), Some(server)) => {
-            if [base, head, server].into_iter().any(contains_nul_byte) {
-                return Ok(MergeDecision::Conflict {
-                    reason: ConflictReason::BinaryChanged,
-                    marked_text: None,
-                });
-            }
-            merge_text(workspace_parent, base, head, server)
-        }
-        (Some(_), None) => Ok(MergeDecision::Conflict {
-            reason: ConflictReason::DeletedOnServer,
-            marked_text: None,
-        }),
+        (Some(base), Some(server)) => decide_server_changed(workspace_parent, base, head, server),
+        // Rule 6.
+        (Some(_), None) => Ok(conflict_without_text(ConflictReason::DeletedOnServer)),
+        // Rule 7.
         (None, None) => Ok(MergeDecision::NewFile),
-        (None, Some(_)) => Ok(MergeDecision::Conflict {
-            reason: ConflictReason::AddedOnBoth,
-            marked_text: None,
-        }),
+        // Rule 8.
+        (None, Some(_)) => Ok(conflict_without_text(ConflictReason::AddedOnBoth)),
+    }
+}
+
+/// Rules 3 to 5, for a file whose base and server copies both exist and the server copy is not
+/// the head blob.
+fn decide_server_changed(
+    workspace_parent: &Path,
+    base: &[u8],
+    head: &[u8],
+    server: &[u8],
+) -> Result<MergeDecision, BranchDeployError> {
+    // Rule 3.
+    if server == base {
+        return Ok(MergeDecision::FastForward);
+    }
+    // Rule 5.
+    if [base, head, server].into_iter().any(contains_nul_byte) {
+        return Ok(conflict_without_text(ConflictReason::BinaryChanged));
+    }
+    // Rule 4.
+    merge_text(workspace_parent, base, head, server)
+}
+
+fn conflict_without_text(reason: ConflictReason) -> MergeDecision {
+    MergeDecision::Conflict {
+        reason,
+        marked_text: None,
     }
 }
 
@@ -127,18 +143,16 @@ fn merge_text(
     server: &[u8],
 ) -> Result<MergeDecision, BranchDeployError> {
     let workspace = MergeWorkspace::create(workspace_parent)?;
-    for (name, bytes) in [("server", server), ("base", base), ("head", head)] {
-        fs::write(workspace.path.join(name), bytes).map_err(|error| {
-            BranchDeployError::Other(
-                anyhow::Error::from(error).context(format!("writing the {name} merge input")),
-            )
-        })?;
-    }
+    workspace.write_inputs(base, head, server)?;
+    let output = run_merge_file(&workspace.path)?;
+    interpret_merge_file_output(output.status.code(), output.stdout, &output.stderr)
+}
 
+fn run_merge_file(workspace: &Path) -> Result<Output, BranchDeployError> {
     let mut command = Command::new("git");
-    configure_git_command(&mut command, &workspace.path);
+    configure_git_command(&mut command, workspace);
     // The server copy is the "current" file, so its layout wins wherever both sides agree.
-    let output = command
+    command
         .args([
             "merge-file",
             "-p",
@@ -154,16 +168,7 @@ fn merge_text(
             "head",
         ])
         .output()
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                BranchDeployError::InvalidArgs("`git` was not found on PATH".to_string())
-            } else {
-                BranchDeployError::Other(
-                    anyhow::Error::from(error).context("spawning git merge-file"),
-                )
-            }
-        })?;
-    interpret_merge_file_output(output.status.code(), output.stdout, &output.stderr)
+        .map_err(|error| git_spawn_error(error, "spawning git merge-file"))
 }
 
 pub(super) fn interpret_merge_file_output(
@@ -210,6 +215,23 @@ impl MergeWorkspace {
             )
         })?;
         Ok(Self { path })
+    }
+
+    /// Writes the files that `run_merge_file` names: `server`, `base`, and `head`.
+    fn write_inputs(
+        &self,
+        base: &[u8],
+        head: &[u8],
+        server: &[u8],
+    ) -> Result<(), BranchDeployError> {
+        for (name, bytes) in [("server", server), ("base", base), ("head", head)] {
+            fs::write(self.path.join(name), bytes).map_err(|error| {
+                BranchDeployError::Other(
+                    anyhow::Error::from(error).context(format!("writing the {name} merge input")),
+                )
+            })?;
+        }
+        Ok(())
     }
 }
 

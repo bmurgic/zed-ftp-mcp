@@ -319,6 +319,20 @@ mod tests {
         }
     }
 
+    fn deploy_branch_request(
+        mode: crate::branch_deploy::DeployMode,
+    ) -> crate::branch_deploy::DeployBranchRequest {
+        crate::branch_deploy::DeployBranchRequest {
+            profile: "staging".to_string(),
+            repo_root: "/repo".to_string(),
+            base_ref: "origin/main".to_string(),
+            head_ref: "HEAD".to_string(),
+            verify: true,
+            dry_run: false,
+            mode,
+        }
+    }
+
     fn unsuccessful_deployment_manifest() -> crate::branch_deploy::BranchDeployManifest {
         let mut plan = BranchDeployPlan::empty("staging", "/repo");
         plan.failures.push(FailureRecord {
@@ -453,15 +467,7 @@ mod tests {
 
     #[test]
     fn deploy_branch_command_writes_unsuccessful_manifest_before_returning_error() {
-        let request = crate::branch_deploy::DeployBranchRequest {
-            profile: "staging".to_string(),
-            repo_root: "/repo".to_string(),
-            base_ref: "origin/main".to_string(),
-            head_ref: "HEAD".to_string(),
-            verify: true,
-            dry_run: false,
-            mode: crate::branch_deploy::DeployMode::Overwrite,
-        };
+        let request = deploy_branch_request(crate::branch_deploy::DeployMode::Overwrite);
         let expected_manifest = unsuccessful_deployment_manifest();
         let mut output = Vec::new();
 
@@ -525,15 +531,7 @@ mod tests {
 
     #[test]
     fn manifest_04_blocked_merge_is_unsuccessful_through_the_cli() {
-        let request = crate::branch_deploy::DeployBranchRequest {
-            profile: "staging".to_string(),
-            repo_root: "/repo".to_string(),
-            base_ref: "origin/main".to_string(),
-            head_ref: "HEAD".to_string(),
-            verify: true,
-            dry_run: false,
-            mode: crate::branch_deploy::DeployMode::Merge,
-        };
+        let request = deploy_branch_request(crate::branch_deploy::DeployMode::Merge);
         let mut blocked_manifest = unsuccessful_deployment_manifest();
         blocked_manifest.mode = crate::branch_deploy::DeployMode::Merge;
         blocked_manifest.blocked_by_conflicts = true;

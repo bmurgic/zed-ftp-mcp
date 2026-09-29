@@ -45,15 +45,7 @@ impl BatchBlobReader {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
-            .map_err(|error| {
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    BranchDeployError::InvalidArgs("`git` was not found on PATH".to_string())
-                } else {
-                    BranchDeployError::Other(
-                        anyhow::Error::from(error).context("spawning git cat-file"),
-                    )
-                }
-            })?;
+            .map_err(|error| git_spawn_error(error, "spawning git cat-file"))?;
         let stdin = child.stdin.take().ok_or_else(|| {
             BranchDeployError::Other(anyhow::anyhow!("git cat-file did not provide stdin"))
         })?;
@@ -144,10 +136,7 @@ pub(super) fn plan_branch(
     let commits = range_commits(&repository_root, &base_commit, &head_commit)?;
     let touched_paths = touched_paths(&repository_root, &commits)?;
     let head_tree = commit_tree(&repository_root, &head_commit)?;
-    let base_tree = match request.mode {
-        DeployMode::Merge => Some(commit_tree(&repository_root, &base_commit)?),
-        DeployMode::Overwrite => None,
-    };
+    let base_tree = base_tree_for_mode(&repository_root, request.mode, &base_commit)?;
     let dirty = !run_git(
         &repository_root,
         ["status", "--porcelain=v1", "-z", "--untracked-files=normal"],
@@ -572,6 +561,18 @@ fn commit_tree(
     Ok(tree)
 }
 
+/// Only merge mode reads the base tree, so an overwrite plan does no extra Git work.
+fn base_tree_for_mode(
+    repository_root: &Path,
+    mode: DeployMode,
+    base_commit: &str,
+) -> Result<Option<BTreeMap<Vec<u8>, TreeEntry>>, BranchDeployError> {
+    match mode {
+        DeployMode::Merge => Ok(Some(commit_tree(repository_root, base_commit)?)),
+        DeployMode::Overwrite => Ok(None),
+    }
+}
+
 /// A base entry that is not a regular blob, such as a symbolic link or submodule, counts as absent.
 fn base_object_id(base_tree: Option<&BTreeMap<Vec<u8>, TreeEntry>>, path: &[u8]) -> Option<String> {
     base_tree?
@@ -691,13 +692,10 @@ where
 {
     let mut command = Command::new("git");
     configure_git_command(&mut command, repository_root);
-    let output = command.args(arguments).output().map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            BranchDeployError::InvalidArgs("`git` was not found on PATH".to_string())
-        } else {
-            BranchDeployError::Other(anyhow::Error::from(error).context("spawning git"))
-        }
-    })?;
+    let output = command
+        .args(arguments)
+        .output()
+        .map_err(|error| git_spawn_error(error, "spawning git"))?;
     if output.status.success() {
         return Ok(output);
     }
@@ -709,6 +707,15 @@ where
         stderr
     };
     Err(BranchDeployError::InvalidArgs(detail))
+}
+
+/// A missing `git` executable is the caller's setup problem. Any other spawn error is internal.
+pub(super) fn git_spawn_error(error: std::io::Error, action: &str) -> BranchDeployError {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        BranchDeployError::InvalidArgs("`git` was not found on PATH".to_string())
+    } else {
+        BranchDeployError::Other(anyhow::Error::from(error).context(action.to_string()))
+    }
 }
 
 pub(super) fn configure_git_command(command: &mut Command, repository_root: &Path) {
