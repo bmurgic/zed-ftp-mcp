@@ -4,7 +4,6 @@ use serde::{Deserialize, Serialize};
 
 mod execute;
 mod git;
-#[allow(dead_code)] // The executor starts using the merge engine in task 1.5.
 mod merge;
 
 pub use execute::{
@@ -12,6 +11,7 @@ pub use execute::{
     RemoteFailureKind,
 };
 use git::BatchBlobReader;
+pub use merge::ConflictReason;
 
 /// How a branch deployment treats files that changed on the server.
 /// `overwrite` uploads head blobs as they are. `merge` three-way merges each file with its server copy.
@@ -62,6 +62,8 @@ pub enum UploadStatus {
     Uploaded,
     Failed,
     NotAttempted,
+    /// Merge mode only: the file needs no upload.
+    NotNeeded,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
@@ -73,6 +75,48 @@ pub enum VerificationStatus {
     NotRequested,
     Failed,
     NotAttempted,
+    /// Only where the upload status is `not_needed`.
+    NotNeeded,
+}
+
+impl VerificationStatus {
+    fn planned_for(verify: bool) -> Self {
+        if verify {
+            Self::Planned
+        } else {
+            Self::NotRequested
+        }
+    }
+
+    fn not_attempted_for(verify: bool) -> Self {
+        if verify {
+            Self::NotAttempted
+        } else {
+            Self::NotRequested
+        }
+    }
+}
+
+/// The merge-mode decision for one file. `not_decided` marks a file the run never decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MergeStatus {
+    UnchangedInRange,
+    AlreadyDeployed,
+    FastForward,
+    Merged,
+    NewFile,
+    Conflict,
+    DownloadFailed,
+    NotDecided,
+}
+
+/// Where the uploaded bytes of a merge-mode file come from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum UploadedFrom {
+    HeadBlob,
+    Merged,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
@@ -133,7 +177,6 @@ pub struct PlannedUpload {
 
 impl PlannedUpload {
     /// Rule 1 of the merge decision table: the range left this path's blob unchanged.
-    #[allow(dead_code)] // The merge executor starts using this in task 1.5.
     pub fn is_unchanged_in_range(&self) -> bool {
         self.base_object_id.as_deref() == Some(self.object_id.as_str())
     }
@@ -151,6 +194,40 @@ pub struct UploadResult {
     pub remote_bytes_read: Option<u64>,
     pub upload_status: UploadStatus,
     pub verification_status: VerificationStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merge_status: Option<MergeStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uploaded_from: Option<UploadedFrom>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conflict_reason: Option<ConflictReason>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub marked_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub marked_text_truncated: Option<bool>,
+}
+
+impl UploadResult {
+    /// A result with no merge fields, as an overwrite-mode manifest reports it.
+    fn new(
+        upload: &PlannedUpload,
+        upload_status: UploadStatus,
+        verification_status: VerificationStatus,
+    ) -> Self {
+        Self {
+            git_path: upload.git_path.clone(),
+            remote_path: upload.remote_path.clone(),
+            object_id: upload.object_id.clone(),
+            bytes: upload.bytes,
+            remote_bytes_read: None,
+            upload_status,
+            verification_status,
+            merge_status: None,
+            uploaded_from: None,
+            conflict_reason: None,
+            marked_text: None,
+            marked_text_truncated: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -383,19 +460,13 @@ where
 pub fn dry_run_manifest(plan: BranchDeployPlan, verify: bool) -> BranchDeployManifest {
     let uploads: Vec<UploadResult> = plan
         .uploads
-        .into_iter()
-        .map(|upload| UploadResult {
-            git_path: upload.git_path,
-            remote_path: upload.remote_path,
-            object_id: upload.object_id,
-            bytes: upload.bytes,
-            remote_bytes_read: None,
-            upload_status: UploadStatus::Planned,
-            verification_status: if verify {
-                VerificationStatus::Planned
-            } else {
-                VerificationStatus::NotRequested
-            },
+        .iter()
+        .map(|upload| {
+            UploadResult::new(
+                upload,
+                UploadStatus::Planned,
+                VerificationStatus::planned_for(verify),
+            )
         })
         .collect();
     let counts = ManifestCounts {
@@ -507,23 +578,20 @@ fn connection_failure_manifest(
     verify: bool,
     error: anyhow::Error,
 ) -> BranchDeployManifest {
-    let uploads = plan
-        .uploads
-        .iter()
-        .map(|upload| UploadResult {
-            git_path: upload.git_path.clone(),
-            remote_path: upload.remote_path.clone(),
-            object_id: upload.object_id.clone(),
-            bytes: upload.bytes,
-            remote_bytes_read: None,
-            upload_status: UploadStatus::NotAttempted,
-            verification_status: if verify {
-                VerificationStatus::NotAttempted
-            } else {
-                VerificationStatus::NotRequested
-            },
-        })
-        .collect::<Vec<_>>();
+    let uploads = match plan.mode {
+        DeployMode::Overwrite => plan
+            .uploads
+            .iter()
+            .map(|upload| {
+                UploadResult::new(
+                    upload,
+                    UploadStatus::NotAttempted,
+                    VerificationStatus::not_attempted_for(verify),
+                )
+            })
+            .collect(),
+        DeployMode::Merge => execute::undecided_merge_results(&plan, verify),
+    };
     let mut failures = plan.failures;
     failures.push(FailureRecord {
         stage: "connect".to_string(),
@@ -537,7 +605,7 @@ fn connection_failure_manifest(
         refs: plan.refs,
         merge_rule: "first_parent".to_string(),
         mode: plan.mode,
-        blocked_by_conflicts: false,
+        blocked_by_conflicts: plan.mode == DeployMode::Merge,
         dry_run: false,
         verify,
         counts: ManifestCounts {

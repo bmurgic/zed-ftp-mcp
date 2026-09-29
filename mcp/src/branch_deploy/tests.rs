@@ -1,3 +1,4 @@
+use super::execute::decide_merge_with;
 use super::git::null_device_for_platform;
 use super::git::BatchBlobReader;
 use super::merge::{self, ConflictReason, MergeDecision};
@@ -7,7 +8,8 @@ use super::{
     execute_deletion, execute_deploy, map_remote_path, plan_branch, plan_deletion, BlobSource,
     BranchDeletePlan, BranchDeployError, BranchDeployPlan, BranchRemote, DeleteBranchFilesRequest,
     DeletePathResult, DeletePathStatus, DeletedPathResult, DeletedPathStatus, DeployBranchRequest,
-    DeployMode, PlannedUpload, RemoteComparison, RemoteFailure, UploadStatus, VerificationStatus,
+    DeployMode, MergeStatus, PlannedUpload, RemoteComparison, RemoteFailure, UploadStatus,
+    UploadedFrom, VerificationStatus,
 };
 use crate::config::Profile;
 use serde_json::json;
@@ -2086,6 +2088,983 @@ fn merge_planner_treats_a_symbolic_link_base_as_absent_and_keeps_executable_base
         upload(&plan, "script.sh").base_object_id,
         Some(repository.rev_parse(&format!("{base}:script.sh")))
     );
+}
+
+struct MergeFile {
+    git_path: &'static str,
+    base: Option<Vec<u8>>,
+    head: Vec<u8>,
+    server: Option<Vec<u8>>,
+}
+
+fn merge_file(
+    git_path: &'static str,
+    base: Option<&[u8]>,
+    head: &[u8],
+    server: Option<&[u8]>,
+) -> MergeFile {
+    MergeFile {
+        git_path,
+        base: base.map(<[u8]>::to_vec),
+        head: head.to_vec(),
+        server: server.map(<[u8]>::to_vec),
+    }
+}
+
+/// Builds a merge-mode plan, blob source, and remote for the files, which must be in Git-path order.
+/// A base equal to the head shares the head's blob ID, as Git does.
+fn merge_setup(files: Vec<MergeFile>) -> (BranchDeployPlan, TestBlobs, TestRemote) {
+    let mut plan = BranchDeployPlan::empty("staging", "/repo");
+    plan.mode = DeployMode::Merge;
+    let mut blobs = TestBlobs::default();
+    let mut remote = TestRemote::default();
+    for file in files {
+        let head_id = format!("head:{}", file.git_path);
+        let base_id = file.base.as_ref().map(|base| {
+            if *base == file.head {
+                head_id.clone()
+            } else {
+                format!("base:{}", file.git_path)
+            }
+        });
+        if let (Some(id), Some(base)) = (&base_id, &file.base) {
+            blobs.blobs.insert(id.clone(), base.clone());
+        }
+        blobs.blobs.insert(head_id.clone(), file.head.clone());
+        let remote_path = format!("/remote/{}", file.git_path);
+        if let Some(server) = file.server {
+            remote.downloads.insert(remote_path.clone(), server);
+        }
+        plan.uploads.push(PlannedUpload {
+            git_path: file.git_path.to_string(),
+            remote_path,
+            object_id: head_id,
+            bytes: file.head.len() as u64,
+            base_object_id: base_id,
+        });
+    }
+    plan.touched_paths = plan.uploads.len();
+    (plan, blobs, remote)
+}
+
+fn run_merge(files: Vec<MergeFile>) -> (super::BranchDeployManifest, TestRemote, TestBlobs) {
+    let (plan, mut blobs, mut remote) = merge_setup(files);
+    let manifest = execute_deploy(plan, true, &mut blobs, &mut remote);
+    (manifest, remote, blobs)
+}
+
+fn result_for<'a>(
+    manifest: &'a super::BranchDeployManifest,
+    git_path: &str,
+) -> &'a super::UploadResult {
+    manifest
+        .uploads
+        .iter()
+        .find(|result| result.git_path == git_path)
+        .unwrap_or_else(|| panic!("missing upload result for {git_path}"))
+}
+
+fn writes_to_server(remote: &TestRemote) -> Vec<&RemoteCall> {
+    remote
+        .calls
+        .iter()
+        .filter(|call| {
+            matches!(
+                call,
+                RemoteCall::Mkdir(_)
+                    | RemoteCall::Upload(_, _)
+                    | RemoteCall::Compare(_, _)
+                    | RemoteCall::Delete(_)
+            )
+        })
+        .collect()
+}
+
+fn downloads_from_server(remote: &TestRemote) -> Vec<&str> {
+    remote
+        .calls
+        .iter()
+        .filter_map(|call| match call {
+            RemoteCall::Download(path) => Some(path.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn merge_head() -> Vec<u8> {
+    merge_lines(&[(2, "line 2 head")])
+}
+
+const BINARY_BASE: &[u8] = b"bin\0base";
+const BINARY_HEAD: &[u8] = b"bin\0head";
+
+type DecisionRow<'a> = (
+    Option<&'a [u8]>,
+    Option<&'a [u8]>,
+    &'a [u8],
+    MergeStatus,
+    Option<UploadedFrom>,
+);
+
+// (base, server, head, expected reason, whether marked text is produced)
+type ConflictRow<'a> = (
+    Option<&'a [u8]>,
+    Option<Vec<u8>>,
+    &'a [u8],
+    ConflictReason,
+    bool,
+);
+
+#[test]
+fn merge_rules_01_decision_table() {
+    let head = merge_head();
+    let server_other_line = merge_lines(&[(5, "line 5 server")]);
+    let server_same_line = merge_lines(&[(2, "line 2 server")]);
+    let merged = merge_lines(&[(2, "line 2 head"), (5, "line 5 server")]);
+    // (base, server, head, expected status, expected upload source)
+    let rows: Vec<DecisionRow> = vec![
+        (
+            Some(BINARY_HEAD),
+            Some(b"bin\0other"),
+            BINARY_HEAD,
+            MergeStatus::UnchangedInRange,
+            None,
+        ),
+        (
+            Some(&head),
+            None,
+            &head,
+            MergeStatus::UnchangedInRange,
+            None,
+        ),
+        (
+            Some(MERGE_BASE),
+            Some(&head),
+            &head,
+            MergeStatus::AlreadyDeployed,
+            None,
+        ),
+        (None, Some(&head), &head, MergeStatus::AlreadyDeployed, None),
+        (
+            Some(MERGE_BASE),
+            Some(MERGE_BASE),
+            &head,
+            MergeStatus::FastForward,
+            Some(UploadedFrom::HeadBlob),
+        ),
+        (
+            Some(BINARY_BASE),
+            Some(BINARY_BASE),
+            BINARY_HEAD,
+            MergeStatus::FastForward,
+            Some(UploadedFrom::HeadBlob),
+        ),
+        (
+            Some(MERGE_BASE),
+            Some(&server_other_line),
+            &head,
+            MergeStatus::Merged,
+            Some(UploadedFrom::Merged),
+        ),
+        (
+            Some(MERGE_BASE),
+            Some(&server_same_line),
+            &head,
+            MergeStatus::Conflict,
+            None,
+        ),
+        (
+            Some(BINARY_BASE),
+            Some(b"bin\0server"),
+            BINARY_HEAD,
+            MergeStatus::Conflict,
+            None,
+        ),
+        (Some(MERGE_BASE), None, &head, MergeStatus::Conflict, None),
+        (
+            None,
+            None,
+            &head,
+            MergeStatus::NewFile,
+            Some(UploadedFrom::HeadBlob),
+        ),
+        (
+            None,
+            Some(&server_other_line),
+            &head,
+            MergeStatus::Conflict,
+            None,
+        ),
+        // A symbolic-link base reaches the executor as an absent base.
+        (
+            None,
+            None,
+            &head,
+            MergeStatus::NewFile,
+            Some(UploadedFrom::HeadBlob),
+        ),
+    ];
+
+    for (index, (base, server, row_head, expected_status, expected_source)) in
+        rows.into_iter().enumerate()
+    {
+        let (manifest, remote, _) = run_merge(vec![merge_file("file.txt", base, row_head, server)]);
+
+        let result = result_for(&manifest, "file.txt");
+        assert_eq!(
+            result.merge_status,
+            Some(expected_status),
+            "row {}",
+            index + 1
+        );
+        assert_eq!(result.uploaded_from, expected_source, "row {}", index + 1);
+        if expected_status == MergeStatus::UnchangedInRange {
+            assert!(
+                downloads_from_server(&remote).is_empty(),
+                "row {}: rule 1 must not download",
+                index + 1
+            );
+        }
+        if expected_status == MergeStatus::Merged {
+            assert_eq!(result.bytes, merged.len() as u64);
+        }
+    }
+}
+
+#[test]
+fn merge_rules_02_conflict_reason_is_reported() {
+    let head = merge_head();
+    let situations: Vec<ConflictRow> = vec![
+        (
+            Some(MERGE_BASE),
+            Some(merge_lines(&[(2, "line 2 server")])),
+            &head,
+            ConflictReason::TextConflict,
+            true,
+        ),
+        (
+            Some(BINARY_BASE),
+            Some(b"bin\0server".to_vec()),
+            BINARY_HEAD,
+            ConflictReason::BinaryChanged,
+            false,
+        ),
+        (
+            Some(MERGE_BASE),
+            None,
+            &head,
+            ConflictReason::DeletedOnServer,
+            false,
+        ),
+        (
+            None,
+            Some(merge_lines(&[(5, "line 5 server")])),
+            &head,
+            ConflictReason::AddedOnBoth,
+            false,
+        ),
+    ];
+
+    for (base, server, row_head, expected_reason, has_marked_text) in situations {
+        let (manifest, _, _) = run_merge(vec![merge_file(
+            "file.txt",
+            base,
+            row_head,
+            server.as_deref(),
+        )]);
+
+        let result = result_for(&manifest, "file.txt");
+        assert_eq!(result.merge_status, Some(MergeStatus::Conflict));
+        assert_eq!(result.conflict_reason, Some(expected_reason));
+        assert_eq!(
+            result.marked_text.is_some(),
+            has_marked_text,
+            "{expected_reason:?}"
+        );
+        assert_eq!(result.marked_text_truncated.is_some(), has_marked_text);
+        assert!(
+            manifest.failures.iter().any(|failure| {
+                failure.stage == "merge" && failure.git_path.as_deref() == Some("file.txt")
+            }),
+            "{expected_reason:?} must add a merge failure record"
+        );
+        assert!(!manifest.success);
+    }
+}
+
+#[test]
+fn merge_rules_03_server_only_line_is_preserved() {
+    let head = merge_head();
+    let server = merge_lines(&[(5, "BCC staging")]);
+
+    let (manifest, remote, _) = run_merge(vec![merge_file(
+        "Mailer.php",
+        Some(MERGE_BASE),
+        &head,
+        Some(&server),
+    )]);
+
+    let uploaded = remote
+        .calls
+        .iter()
+        .find_map(|call| match call {
+            RemoteCall::Upload(_, bytes) => Some(String::from_utf8(bytes.clone()).unwrap()),
+            _ => None,
+        })
+        .expect("the merged file should upload");
+    assert!(uploaded.contains("BCC staging") && uploaded.contains("line 2 head"));
+    assert!(manifest.success);
+}
+
+#[test]
+fn merge_rules_05_download_failure_is_not_treated_as_missing() {
+    let head = merge_head();
+    for server_answer in [
+        "451 Local error in processing.",
+        "550 Failed to open file, and the parent listing contains the file name.",
+    ] {
+        let (mut plan, mut blobs, mut remote) = merge_setup(vec![
+            merge_file("a.txt", Some(MERGE_BASE), &head, Some(MERGE_BASE)),
+            merge_file("b.txt", Some(MERGE_BASE), &head, Some(MERGE_BASE)),
+        ]);
+        plan.uploads
+            .sort_by(|left, right| left.git_path.cmp(&right.git_path));
+        // Call 1 is binary mode and call 2 is the download of a.txt.
+        remote
+            .failures
+            .insert(2, RemoteFailure::operation(server_answer));
+
+        let manifest = execute_deploy(plan, true, &mut blobs, &mut remote);
+
+        assert_eq!(
+            result_for(&manifest, "a.txt").merge_status,
+            Some(MergeStatus::DownloadFailed)
+        );
+        assert_eq!(
+            result_for(&manifest, "b.txt").merge_status,
+            Some(MergeStatus::FastForward),
+            "the remaining files are still decided"
+        );
+        assert!(manifest.failures.iter().any(|failure| {
+            failure.stage == "download"
+                && failure.git_path.as_deref() == Some("a.txt")
+                && failure.error == server_answer
+        }));
+        assert!(manifest.blocked_by_conflicts);
+        assert!(writes_to_server(&remote).is_empty());
+    }
+}
+
+#[test]
+fn merge_rules_06_a_550_for_an_absent_file_means_missing() {
+    let head = merge_head();
+
+    let (manifest, remote, _) = run_merge(vec![merge_file("added.txt", None, &head, None)]);
+
+    assert_eq!(
+        result_for(&manifest, "added.txt").merge_status,
+        Some(MergeStatus::NewFile)
+    );
+    assert!(manifest.success);
+    assert!(remote
+        .calls
+        .contains(&RemoteCall::Upload("/remote/added.txt".to_string(), head)));
+}
+
+#[test]
+fn merge_blocking_01_one_conflict_blocks_clean_files() {
+    let head = merge_head();
+    let conflicting_server = merge_lines(&[(2, "line 2 server")]);
+    for clean_files in [1usize, 4] {
+        let mut files: Vec<MergeFile> = ["a1.txt", "a2.txt", "a3.txt", "a4.txt"]
+            .into_iter()
+            .take(clean_files)
+            .map(|git_path| merge_file(git_path, Some(MERGE_BASE), &head, Some(MERGE_BASE)))
+            .collect();
+        files.push(merge_file(
+            "z-conflict.txt",
+            Some(MERGE_BASE),
+            &head,
+            Some(&conflicting_server),
+        ));
+
+        let (manifest, remote, _) = run_merge(files);
+
+        assert!(
+            writes_to_server(&remote).is_empty(),
+            "{clean_files} clean files"
+        );
+        assert_eq!(manifest.uploads.len(), clean_files + 1);
+        for result in &manifest.uploads {
+            assert_eq!(result.upload_status, UploadStatus::NotAttempted);
+            assert_eq!(result.verification_status, VerificationStatus::NotAttempted);
+        }
+        assert_eq!(
+            result_for(&manifest, "a1.txt").merge_status,
+            Some(MergeStatus::FastForward)
+        );
+        assert_eq!(
+            result_for(&manifest, "z-conflict.txt").merge_status,
+            Some(MergeStatus::Conflict)
+        );
+        assert!(manifest.blocked_by_conflicts);
+        assert!(!manifest.success);
+        assert_eq!(manifest.counts.uploaded, 0);
+    }
+}
+
+#[test]
+fn merge_blocking_02_connection_lost_while_downloading() {
+    let head = merge_head();
+    let conflicting_server = merge_lines(&[(2, "line 2 server")]);
+    let (plan, mut blobs, mut remote) = merge_setup(vec![
+        merge_file("a.txt", Some(MERGE_BASE), &head, Some(MERGE_BASE)),
+        merge_file("b.txt", Some(MERGE_BASE), &head, Some(MERGE_BASE)),
+        // c.txt would conflict, so a run that kept deciding after the loss would report it.
+        merge_file("c.txt", Some(MERGE_BASE), &head, Some(&conflicting_server)),
+    ]);
+    // Call 1 is binary mode, call 2 downloads a.txt, and call 3 downloads b.txt.
+    remote
+        .failures
+        .insert(3, RemoteFailure::connection_lost("connection reset"));
+
+    let manifest = execute_deploy(plan, true, &mut blobs, &mut remote);
+
+    assert_eq!(
+        remote.calls,
+        vec![
+            RemoteCall::Binary,
+            RemoteCall::Download("/remote/a.txt".to_string()),
+            RemoteCall::Download("/remote/b.txt".to_string()),
+        ],
+        "no reconnection, no later download, and no upload"
+    );
+    assert_eq!(
+        result_for(&manifest, "a.txt").merge_status,
+        Some(MergeStatus::FastForward)
+    );
+    for git_path in ["b.txt", "c.txt"] {
+        let result = result_for(&manifest, git_path);
+        assert_eq!(
+            result.merge_status,
+            Some(MergeStatus::NotDecided),
+            "{git_path}"
+        );
+        assert_eq!(result.upload_status, UploadStatus::NotAttempted);
+    }
+    assert!(
+        manifest
+            .failures
+            .iter()
+            .any(|failure| failure.stage == "download"
+                && failure.git_path.as_deref() == Some("b.txt"))
+    );
+    assert!(manifest.blocked_by_conflicts);
+    assert!(!manifest.success);
+}
+
+#[test]
+fn merge_blocking_03_everything_resolves() {
+    let head = merge_head();
+    let server_other_line = merge_lines(&[(5, "line 5 server")]);
+    let merged = merge_lines(&[(2, "line 2 head"), (5, "line 5 server")]);
+    let (plan, mut blobs, mut remote) = merge_setup(vec![
+        merge_file("a-unchanged.txt", Some(&head), &head, Some(b"anything")),
+        merge_file(
+            "b-fast-forward.txt",
+            Some(MERGE_BASE),
+            &head,
+            Some(MERGE_BASE),
+        ),
+        merge_file(
+            "c-merged.txt",
+            Some(MERGE_BASE),
+            &head,
+            Some(&server_other_line),
+        ),
+        merge_file("d-new.txt", None, &head, None),
+        merge_file("e-already.txt", Some(MERGE_BASE), &head, Some(&head)),
+    ]);
+
+    let manifest = execute_deploy(plan, true, &mut blobs, &mut remote);
+
+    let uploads: Vec<(String, Vec<u8>)> = remote
+        .calls
+        .iter()
+        .filter_map(|call| match call {
+            RemoteCall::Upload(path, bytes) => Some((path.clone(), bytes.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        uploads,
+        vec![
+            ("/remote/b-fast-forward.txt".to_string(), head.clone()),
+            ("/remote/c-merged.txt".to_string(), merged),
+            ("/remote/d-new.txt".to_string(), head),
+        ]
+    );
+    for git_path in ["a-unchanged.txt", "e-already.txt"] {
+        let result = result_for(&manifest, git_path);
+        assert_eq!(result.upload_status, UploadStatus::NotNeeded, "{git_path}");
+        assert_eq!(result.verification_status, VerificationStatus::NotNeeded);
+    }
+    for git_path in ["b-fast-forward.txt", "c-merged.txt", "d-new.txt"] {
+        let result = result_for(&manifest, git_path);
+        assert_eq!(result.upload_status, UploadStatus::Uploaded, "{git_path}");
+        assert_eq!(result.verification_status, VerificationStatus::Verified);
+    }
+    assert_eq!(manifest.counts.uploaded, 3);
+    assert_eq!(manifest.counts.verified, 3);
+    assert!(!manifest.blocked_by_conflicts);
+    assert!(manifest.success);
+}
+
+#[test]
+fn merge_blocking_04_planning_failure_blocks_merge_uploads() {
+    let head = merge_head();
+    let (mut plan, mut blobs, mut remote) = merge_setup(vec![
+        merge_file("a.txt", Some(MERGE_BASE), &head, Some(MERGE_BASE)),
+        merge_file("b.txt", None, &head, None),
+    ]);
+    plan.failures.push(super::FailureRecord {
+        stage: "planning".to_string(),
+        git_path: Some("bad\\path".to_string()),
+        error: "Git path has an unsafe component".to_string(),
+    });
+
+    let manifest = execute_deploy(plan, true, &mut blobs, &mut remote);
+
+    assert!(writes_to_server(&remote).is_empty());
+    assert!(manifest.blocked_by_conflicts);
+    assert!(!manifest.success);
+    assert!(manifest
+        .failures
+        .iter()
+        .any(|failure| failure.stage == "planning"));
+    assert!(manifest
+        .uploads
+        .iter()
+        .all(|result| result.upload_status == UploadStatus::NotAttempted));
+}
+
+#[test]
+fn overwrite_mode_planning_failure_does_not_block_uploads() {
+    let mut plan = executor_plan();
+    plan.failures.push(super::FailureRecord {
+        stage: "planning".to_string(),
+        git_path: Some("skipped".to_string()),
+        error: "head entry is not a deployable regular blob".to_string(),
+    });
+    let mut remote = TestRemote::default();
+    let mut blobs = executor_blobs();
+
+    let manifest = execute_deploy(plan, true, &mut blobs, &mut remote);
+
+    assert_eq!(manifest.counts.uploaded, 2);
+    assert!(!manifest.blocked_by_conflicts);
+    assert!(!manifest.success);
+}
+
+#[test]
+fn merge_binary_mode_failure_blocks_before_any_download() {
+    let head = merge_head();
+    let (plan, mut blobs, mut remote) = merge_setup(vec![
+        merge_file("a.txt", Some(&head), &head, Some(MERGE_BASE)),
+        merge_file("b.txt", Some(MERGE_BASE), &head, Some(MERGE_BASE)),
+    ]);
+    remote
+        .failures
+        .insert(1, RemoteFailure::operation("TYPE I refused"));
+
+    let manifest = execute_deploy(plan, true, &mut blobs, &mut remote);
+
+    assert_eq!(remote.calls, vec![RemoteCall::Binary]);
+    assert_eq!(
+        result_for(&manifest, "a.txt").merge_status,
+        Some(MergeStatus::UnchangedInRange)
+    );
+    assert_eq!(
+        result_for(&manifest, "b.txt").merge_status,
+        Some(MergeStatus::NotDecided)
+    );
+    assert_eq!(
+        result_for(&manifest, "b.txt").upload_status,
+        UploadStatus::NotAttempted
+    );
+    assert!(manifest
+        .failures
+        .iter()
+        .any(|failure| failure.stage == "binary_mode"));
+    assert!(manifest.blocked_by_conflicts);
+    assert!(!manifest.success);
+}
+
+#[test]
+fn merge_blob_read_failure_blocks_the_run_and_leaves_the_file_undecided() {
+    let head = merge_head();
+    let (plan, mut blobs, mut remote) = merge_setup(vec![
+        merge_file("a.txt", Some(MERGE_BASE), &head, Some(MERGE_BASE)),
+        merge_file("b.txt", Some(MERGE_BASE), &head, Some(MERGE_BASE)),
+    ]);
+    blobs.blobs.remove("base:a.txt");
+
+    let manifest = execute_deploy(plan, true, &mut blobs, &mut remote);
+
+    assert_eq!(
+        result_for(&manifest, "a.txt").merge_status,
+        Some(MergeStatus::NotDecided)
+    );
+    assert_eq!(
+        result_for(&manifest, "b.txt").merge_status,
+        Some(MergeStatus::FastForward)
+    );
+    assert!(manifest.failures.iter().any(|failure| {
+        failure.stage == "read_blob" && failure.git_path.as_deref() == Some("a.txt")
+    }));
+    assert!(writes_to_server(&remote).is_empty());
+    assert!(manifest.blocked_by_conflicts);
+}
+
+#[test]
+fn merge_tool_failure_blocks_the_run_with_a_merge_stage_failure() {
+    let head = merge_head();
+    let (plan, mut blobs, mut remote) = merge_setup(vec![
+        merge_file(
+            "a.txt",
+            Some(MERGE_BASE),
+            &head,
+            Some(&merge_lines(&[(5, "server")])),
+        ),
+        merge_file("b.txt", Some(MERGE_BASE), &head, Some(MERGE_BASE)),
+    ]);
+
+    let phase = decide_merge_with(&plan, &mut blobs, &mut remote, |_, _, server| {
+        if server == Some(MERGE_BASE) {
+            merge::decide(Some(MERGE_BASE), &merge_head(), server)
+        } else {
+            Err(BranchDeployError::Other(anyhow::anyhow!(
+                "git merge-file exploded"
+            )))
+        }
+    });
+
+    assert!(phase.is_blocked);
+    assert_eq!(phase.outcomes[0].status, MergeStatus::NotDecided);
+    assert_eq!(phase.outcomes[1].status, MergeStatus::FastForward);
+    assert_eq!(phase.failures.len(), 1);
+    assert_eq!(phase.failures[0].stage, "merge");
+    assert_eq!(phase.failures[0].git_path.as_deref(), Some("a.txt"));
+    assert!(phase.failures[0].error.contains("git merge-file exploded"));
+}
+
+#[test]
+fn merge_upload_failure_after_a_clean_decision_is_not_a_conflict_block() {
+    let head = merge_head();
+    let (plan, mut blobs, mut remote) = merge_setup(vec![
+        merge_file("a.txt", Some(&head), &head, Some(MERGE_BASE)),
+        merge_file("b.txt", Some(MERGE_BASE), &head, Some(MERGE_BASE)),
+        merge_file("c.txt", Some(MERGE_BASE), &head, Some(MERGE_BASE)),
+    ]);
+    // Calls: binary, download b, download c, mkdir b, upload b.
+    remote
+        .failures
+        .insert(5, RemoteFailure::operation("STOR refused"));
+
+    let manifest = execute_deploy(plan, true, &mut blobs, &mut remote);
+
+    assert_eq!(
+        result_for(&manifest, "b.txt").upload_status,
+        UploadStatus::Failed
+    );
+    assert_eq!(
+        result_for(&manifest, "c.txt").upload_status,
+        UploadStatus::Uploaded
+    );
+    assert_eq!(
+        result_for(&manifest, "a.txt").upload_status,
+        UploadStatus::NotNeeded
+    );
+    assert!(!manifest.blocked_by_conflicts);
+    assert!(!manifest.success);
+}
+
+#[test]
+fn merge_connection_loss_while_uploading_keeps_not_needed_files_not_needed() {
+    let head = merge_head();
+    let (plan, mut blobs, mut remote) = merge_setup(vec![
+        merge_file("a.txt", Some(MERGE_BASE), &head, Some(MERGE_BASE)),
+        merge_file("b.txt", Some(&head), &head, Some(MERGE_BASE)),
+        merge_file("c.txt", Some(MERGE_BASE), &head, Some(MERGE_BASE)),
+    ]);
+    // Calls: binary, download a, download c, mkdir a, upload a fails with a lost connection.
+    remote
+        .failures
+        .insert(5, RemoteFailure::connection_lost("reset"));
+
+    let manifest = execute_deploy(plan, true, &mut blobs, &mut remote);
+
+    assert_eq!(
+        result_for(&manifest, "a.txt").upload_status,
+        UploadStatus::Failed
+    );
+    assert_eq!(
+        result_for(&manifest, "b.txt").upload_status,
+        UploadStatus::NotNeeded
+    );
+    assert_eq!(
+        result_for(&manifest, "b.txt").verification_status,
+        VerificationStatus::NotNeeded
+    );
+    assert_eq!(
+        result_for(&manifest, "c.txt").upload_status,
+        UploadStatus::NotAttempted
+    );
+    assert!(!manifest.blocked_by_conflicts);
+}
+
+#[test]
+fn merge_verification_disabled_records_not_requested_only_for_uploaded_files() {
+    let head = merge_head();
+    let (plan, mut blobs, mut remote) = merge_setup(vec![
+        merge_file("a.txt", Some(&head), &head, Some(MERGE_BASE)),
+        merge_file("b.txt", Some(MERGE_BASE), &head, Some(MERGE_BASE)),
+    ]);
+
+    let manifest = execute_deploy(plan, false, &mut blobs, &mut remote);
+
+    assert_eq!(
+        result_for(&manifest, "a.txt").verification_status,
+        VerificationStatus::NotNeeded
+    );
+    assert_eq!(
+        result_for(&manifest, "b.txt").verification_status,
+        VerificationStatus::NotRequested
+    );
+    assert!(manifest.success);
+}
+
+#[test]
+fn uploaded_bytes_match() {
+    let head = merge_head();
+    let merged = merge_lines(&[(2, "line 2 head"), (5, "line 5 server")]);
+    let server_other_line = merge_lines(&[(5, "line 5 server")]);
+
+    let (overwrite_plan, mut blobs, mut remote) =
+        merge_setup(vec![merge_file("f.txt", None, &head, None)]);
+    let mut overwrite_plan = overwrite_plan;
+    overwrite_plan.mode = DeployMode::Overwrite;
+    let overwrite = execute_deploy(overwrite_plan, true, &mut blobs, &mut remote);
+    let (merge_head_blob, remote_head, _) = run_merge(vec![merge_file("f.txt", None, &head, None)]);
+    let (merge_merged, remote_merged, _) = run_merge(vec![merge_file(
+        "f.txt",
+        Some(MERGE_BASE),
+        &head,
+        Some(&server_other_line),
+    )]);
+
+    for (manifest, remote, expected_bytes, expected_source) in [
+        (overwrite, remote, head.clone(), None),
+        (
+            merge_head_blob,
+            remote_head,
+            head.clone(),
+            Some(UploadedFrom::HeadBlob),
+        ),
+        (
+            merge_merged,
+            remote_merged,
+            merged,
+            Some(UploadedFrom::Merged),
+        ),
+    ] {
+        let result = result_for(&manifest, "f.txt");
+        assert_eq!(result.upload_status, UploadStatus::Uploaded);
+        assert_eq!(result.verification_status, VerificationStatus::Verified);
+        assert_eq!(result.remote_bytes_read, Some(expected_bytes.len() as u64));
+        assert_eq!(result.uploaded_from, expected_source);
+        assert!(
+            remote.calls.contains(&RemoteCall::Compare(
+                "/remote/f.txt".to_string(),
+                expected_bytes.clone()
+            )),
+            "verification must compare with the uploaded bytes"
+        );
+    }
+}
+
+#[test]
+fn uploaded_bytes_differ_for_merged_bytes() {
+    let head = merge_head();
+    let server_other_line = merge_lines(&[(5, "line 5 server")]);
+    let (plan, mut blobs, mut remote) = merge_setup(vec![merge_file(
+        "f.txt",
+        Some(MERGE_BASE),
+        &head,
+        Some(&server_other_line),
+    )]);
+    remote.mismatches.insert("/remote/f.txt".to_string());
+
+    let manifest = execute_deploy(plan, true, &mut blobs, &mut remote);
+
+    assert_eq!(
+        result_for(&manifest, "f.txt").verification_status,
+        VerificationStatus::Mismatch
+    );
+    assert!(manifest
+        .failures
+        .iter()
+        .any(|failure| failure.stage == "verification"));
+    assert!(!manifest.success);
+}
+
+#[test]
+fn deployment_succeeds() {
+    let head = merge_head();
+    for mode in [DeployMode::Overwrite, DeployMode::Merge] {
+        let (mut plan, mut blobs, mut remote) =
+            merge_setup(vec![merge_file("f.txt", None, &head, None)]);
+        plan.mode = mode;
+
+        let manifest = execute_deploy(plan, true, &mut blobs, &mut remote);
+
+        assert_eq!(manifest.mode, mode);
+        assert!(!manifest.blocked_by_conflicts);
+        assert!(manifest.success);
+        assert_eq!(manifest.counts.uploaded, 1);
+        assert_eq!(manifest.counts.verified, 1);
+    }
+}
+
+#[test]
+fn manifest_07_merged_upload_reports_head_blob_and_uploaded_size() {
+    let head = merge_head();
+    let server = merge_lines(&[(5, "line 5 server with extra length")]);
+    let merged = merge_lines(&[(2, "line 2 head"), (5, "line 5 server with extra length")]);
+
+    let (manifest, _, _) = run_merge(vec![merge_file(
+        "f.txt",
+        Some(MERGE_BASE),
+        &head,
+        Some(&server),
+    )]);
+
+    let result = result_for(&manifest, "f.txt");
+    assert_ne!(merged.len(), head.len());
+    assert_eq!(result.object_id, "head:f.txt");
+    assert_eq!(result.bytes, merged.len() as u64);
+    assert_eq!(result.uploaded_from, Some(UploadedFrom::Merged));
+}
+
+#[test]
+fn manifest_05_long_conflict_text_is_truncated() {
+    for (marked_bytes, expected_truncated) in [(200usize, false), (65_536, false), (70_000, true)] {
+        let (text, truncated) = merge::marked_text_for_manifest(&vec![b'x'; marked_bytes]);
+
+        assert_eq!(truncated, expected_truncated, "{marked_bytes} bytes");
+        assert_eq!(text.len(), marked_bytes.min(65_536));
+    }
+
+    // The cut moves back to a character boundary instead of splitting a character.
+    let mut straddling = vec![b'x'; 65_535];
+    straddling.extend_from_slice("é".as_bytes());
+    let (text, truncated) = merge::marked_text_for_manifest(&straddling);
+    assert!(truncated);
+    assert_eq!(text.len(), 65_535);
+}
+
+#[test]
+fn manifest_05_long_conflict_text_is_truncated_in_the_manifest() {
+    let numbered = |suffix: &str| -> Vec<u8> {
+        (0..1000)
+            .map(|line| format!("line {line:04} padding padding {suffix}\n"))
+            .collect::<String>()
+            .into_bytes()
+    };
+    let (manifest, _, _) = run_merge(vec![merge_file(
+        "big.txt",
+        Some(&numbered("base")),
+        &numbered("head"),
+        Some(&numbered("server")),
+    )]);
+
+    let result = result_for(&manifest, "big.txt");
+    let marked_text = result.marked_text.as_deref().expect("marked text");
+    assert_eq!(marked_text.len(), 65_536);
+    assert_eq!(result.marked_text_truncated, Some(true));
+}
+
+#[test]
+fn manifest_06_non_utf8_conflict_text_is_readable() {
+    let base = b"1\n2\n3\n4 caf\xe9\n5\n6\n".to_vec();
+    let head = b"1\n2 head\n3\n4 caf\xe9\n5\n6\n".to_vec();
+    let server = b"1\n2\n3 server\n4 caf\xe9\n5\n6\n".to_vec();
+
+    let (manifest, _, _) = run_merge(vec![merge_file(
+        "Mails.php",
+        Some(&base),
+        &head,
+        Some(&server),
+    )]);
+
+    let result = result_for(&manifest, "Mails.php");
+    let marked_text = result.marked_text.as_deref().expect("marked text");
+    assert!(marked_text.contains("caf\u{fffd}"));
+    assert!(marked_text.contains("<<<<<<<") && marked_text.contains(">>>>>>>"));
+    assert_eq!(result.marked_text_truncated, Some(false));
+    let json = serde_json::to_value(result).expect("result serializes");
+    assert_eq!(json["marked_text"].as_str(), Some(marked_text));
+}
+
+#[test]
+fn compatibility_02_branch_deployment_without_mode() {
+    let mut remote = TestRemote::default();
+    let mut blobs = executor_blobs();
+
+    let manifest = execute_deploy(executor_plan(), true, &mut blobs, &mut remote);
+
+    assert!(manifest.success);
+    assert!(
+        downloads_from_server(&remote).is_empty(),
+        "overwrite mode must not download before it uploads"
+    );
+    assert!(manifest.uploads.iter().all(|result| {
+        result.merge_status.is_none()
+            && result.uploaded_from.is_none()
+            && result.conflict_reason.is_none()
+    }));
+}
+
+#[test]
+fn head_blobs_05_merge_mode_ignores_working_tree_changes() {
+    let repository = TestRepo::new();
+    repository.write("tracked.txt", MERGE_BASE);
+    repository.commit("base");
+    let base = repository.rev_parse("HEAD");
+    let head = merge_head();
+    repository.write("tracked.txt", &head);
+    repository.commit("head");
+    repository.write("tracked.txt", b"uncommitted working tree bytes\n");
+    let plan = plan_for_mode(&repository, &base, DeployMode::Merge);
+    assert!(plan.repository.dirty);
+    let mut blobs = BatchBlobReader::new(repository.path()).expect("blob reader should start");
+    let mut remote = TestRemote::default();
+    remote
+        .downloads
+        .insert("/remote/root/tracked.txt".to_string(), MERGE_BASE.to_vec());
+
+    let manifest = execute_deploy(plan, true, &mut blobs, &mut remote);
+
+    assert!(manifest.success);
+    assert!(manifest.repository.dirty);
+    assert_eq!(
+        result_for(&manifest, "tracked.txt").merge_status,
+        Some(MergeStatus::FastForward)
+    );
+    assert!(remote.calls.contains(&RemoteCall::Upload(
+        "/remote/root/tracked.txt".to_string(),
+        head
+    )));
 }
 
 fn test_profile(remote_root: &str) -> Profile {

@@ -507,6 +507,35 @@ mod tests {
     }
 
     #[test]
+    fn manifest_04_blocked_merge_is_unsuccessful_through_the_cli() {
+        let request = crate::branch_deploy::DeployBranchRequest {
+            profile: "staging".to_string(),
+            repo_root: "/repo".to_string(),
+            base_ref: "origin/main".to_string(),
+            head_ref: "HEAD".to_string(),
+            verify: true,
+            dry_run: false,
+            mode: crate::branch_deploy::DeployMode::Merge,
+        };
+        let mut blocked_manifest = unsuccessful_deployment_manifest();
+        blocked_manifest.mode = crate::branch_deploy::DeployMode::Merge;
+        blocked_manifest.blocked_by_conflicts = true;
+        let mut output = Vec::new();
+
+        let result =
+            deploy_branch_command_with_operation(&request, &test_profile(), &mut output, |_, _| {
+                Ok(blocked_manifest)
+            });
+
+        assert!(result.is_err());
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&output).expect("CLI should write manifest JSON before error");
+        assert_eq!(manifest["mode"], "merge");
+        assert_eq!(manifest["blocked_by_conflicts"], true);
+        assert_eq!(manifest["success"], false);
+    }
+
+    #[test]
     fn delete_branch_files_command_writes_unsuccessful_manifest_before_returning_error() {
         let request = crate::branch_deploy::DeleteBranchFilesRequest {
             profile: "staging".to_string(),
