@@ -1,4 +1,4 @@
-use super::execute::decide_merge_with;
+use super::execute::{decide_merge_with, marked_text_for_manifest};
 use super::git::BatchBlobReader;
 use super::git::{git_spawn_error, null_device_for_platform};
 use super::merge::{self, ConflictReason, MergeDecision};
@@ -3077,7 +3077,7 @@ fn manifest_07_merged_upload_reports_head_blob_and_uploaded_size() {
 #[test]
 fn manifest_05_long_conflict_text_is_truncated() {
     for (marked_bytes, expected_truncated) in [(200usize, false), (65_536, false), (70_000, true)] {
-        let (text, truncated) = merge::marked_text_for_manifest(&vec![b'x'; marked_bytes]);
+        let (text, truncated) = marked_text_for_manifest(&vec![b'x'; marked_bytes]);
 
         assert_eq!(truncated, expected_truncated, "{marked_bytes} bytes");
         assert_eq!(text.len(), marked_bytes.min(65_536));
@@ -3086,7 +3086,7 @@ fn manifest_05_long_conflict_text_is_truncated() {
     // The cut moves back to a character boundary instead of splitting a character.
     let mut straddling = vec![b'x'; 65_535];
     straddling.extend_from_slice("é".as_bytes());
-    let (text, truncated) = merge::marked_text_for_manifest(&straddling);
+    let (text, truncated) = marked_text_for_manifest(&straddling);
     assert!(truncated);
     assert_eq!(text.len(), 65_535);
 }
@@ -3409,4 +3409,46 @@ impl TestRepo {
             .output()
             .expect("git should run")
     }
+}
+
+/// Source lines, outside comments, that name any of the forbidden paths.
+fn forbidden_references(source: &str, forbidden: &[&str]) -> Vec<String> {
+    source
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with("//"))
+        .filter(|line| forbidden.iter().any(|path| line.contains(path)))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Architecture rule `execute_talks_to_io_only_through_traits`: the executor reaches the server
+/// through `BranchRemote` and Git blobs through `BlobSource`, so it names no FTP, Git, or
+/// process module.
+#[test]
+fn architecture_execute_talks_to_io_only_through_traits() {
+    let violations = forbidden_references(
+        include_str!("execute.rs"),
+        &["crate::ftp", "suppaftp", "super::git", "std::process"],
+    );
+
+    assert!(
+        violations.is_empty(),
+        "execute_talks_to_io_only_through_traits: {violations:?}"
+    );
+}
+
+/// Architecture rule `merge_decides_without_ftp`: the merge decision takes bytes, never an FTP
+/// connection or the executor that owns one.
+#[test]
+fn architecture_merge_decides_without_ftp() {
+    let violations = forbidden_references(
+        include_str!("merge.rs"),
+        &["crate::ftp", "suppaftp", "super::execute", "BranchRemote"],
+    );
+
+    assert!(
+        violations.is_empty(),
+        "merge_decides_without_ftp: {violations:?}"
+    );
 }

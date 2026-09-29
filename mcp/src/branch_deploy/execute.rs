@@ -8,6 +8,9 @@ use super::{
 };
 use std::borrow::Cow;
 
+/// The longest `marked_text` a manifest carries.
+const MAX_MARKED_TEXT_BYTES: usize = 65_536;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemoteFailureKind {
     Operation,
@@ -592,10 +595,24 @@ fn record_upload_source(result: &mut UploadResult, source: &UploadSource) {
 fn record_conflict(result: &mut UploadResult, conflict: &ConflictDetail) {
     result.conflict_reason = Some(conflict.reason);
     if let Some(marked_text) = &conflict.marked_text {
-        let (text, is_truncated) = merge::marked_text_for_manifest(marked_text);
+        let (text, is_truncated) = marked_text_for_manifest(marked_text);
         result.marked_text = Some(text);
         result.marked_text_truncated = Some(is_truncated);
     }
+}
+
+/// Converts conflict-marked bytes to manifest text. Invalid UTF-8 becomes U+FFFD, and the text
+/// is cut to at most 65,536 bytes without splitting a character. The flag reports a cut.
+pub(super) fn marked_text_for_manifest(marked_text: &[u8]) -> (String, bool) {
+    let text = String::from_utf8_lossy(marked_text);
+    if text.len() <= MAX_MARKED_TEXT_BYTES {
+        return (text.into_owned(), false);
+    }
+    let mut cut = MAX_MARKED_TEXT_BYTES;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    (text[..cut].to_string(), true)
 }
 
 pub fn execute_deletion<R: BranchRemote>(

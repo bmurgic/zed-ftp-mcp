@@ -13,8 +13,6 @@ use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// The longest `marked_text` a manifest carries.
-const MAX_MARKED_TEXT_BYTES: usize = 65_536;
 /// `git merge-file` reports the number of conflicts as its exit status, capped at 127.
 const MAX_CONFLICT_EXIT_STATUS: i32 = 127;
 static WORKSPACE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -114,20 +112,6 @@ fn conflict_without_text(reason: ConflictReason) -> MergeDecision {
         reason,
         marked_text: None,
     }
-}
-
-/// Converts conflict-marked bytes to manifest text. Invalid UTF-8 becomes U+FFFD, and the text
-/// is cut to at most 65,536 bytes without splitting a character. The flag reports a cut.
-pub fn marked_text_for_manifest(marked_text: &[u8]) -> (String, bool) {
-    let text = String::from_utf8_lossy(marked_text);
-    if text.len() <= MAX_MARKED_TEXT_BYTES {
-        return (text.into_owned(), false);
-    }
-    let mut cut = MAX_MARKED_TEXT_BYTES;
-    while !text.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    (text[..cut].to_string(), true)
 }
 
 /// A file is binary when a NUL byte appears anywhere. Git checks only the first 8,000 bytes,
