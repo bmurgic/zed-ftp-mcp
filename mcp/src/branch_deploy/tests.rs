@@ -26,6 +26,7 @@ enum RemoteCall {
     Compare(String, Vec<u8>),
     #[allow(dead_code)]
     Delete(String),
+    Download(String),
 }
 
 #[derive(Default)]
@@ -34,6 +35,8 @@ struct TestRemote {
     failures: std::collections::BTreeMap<usize, RemoteFailure>,
     mismatches: std::collections::BTreeSet<String>,
     comparison_bytes_read: std::collections::BTreeMap<String, u64>,
+    /// Server copies by remote path. A path that is not listed here is missing on the server.
+    downloads: std::collections::BTreeMap<String, Vec<u8>>,
 }
 
 impl TestRemote {
@@ -84,6 +87,11 @@ impl BranchRemote for TestRemote {
 
     fn delete_file(&mut self, path: &str) -> Result<(), RemoteFailure> {
         self.record(RemoteCall::Delete(path.to_string()), ())
+    }
+
+    fn download_bytes(&mut self, path: &str) -> Result<Option<Vec<u8>>, RemoteFailure> {
+        let server_copy = self.downloads.get(path).cloned();
+        self.record(RemoteCall::Download(path.to_string()), server_copy)
     }
 }
 

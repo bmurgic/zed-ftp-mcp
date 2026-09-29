@@ -49,6 +49,10 @@ pub trait BranchRemote {
         expected: &[u8],
     ) -> Result<RemoteComparison, RemoteFailure>;
     fn delete_file(&mut self, path: &str) -> Result<(), RemoteFailure>;
+    /// Downloads a server file. `Ok(None)` means the file is missing, which only an FTP 550
+    /// reply confirmed by the parent listing may report. Every other error is a failure.
+    #[allow(dead_code)] // The merge executor starts calling this in task 1.5.
+    fn download_bytes(&mut self, path: &str) -> Result<Option<Vec<u8>>, RemoteFailure>;
 }
 
 pub trait BlobSource {

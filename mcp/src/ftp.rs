@@ -96,6 +96,33 @@ impl FtpClient {
         Ok(cursor.into_inner())
     }
 
+    /// Download `remote_path`, or return `None` when the file is missing.
+    ///
+    /// A 550 reply also covers a denied read and a non-file target, so only a 550 whose parent
+    /// directory listing lacks the file name means missing. A 550 with the name listed returns
+    /// the original 550 error. A failed listing returns the listing's error. Every other error
+    /// passes through unchanged.
+    pub fn download_or_missing(&mut self, remote_path: &str) -> Result<Option<Vec<u8>>, FtpError> {
+        let retrieve_error = match stream!(self, |s| s.retr_as_buffer(remote_path)) {
+            Ok(cursor) => return Ok(Some(cursor.into_inner())),
+            Err(error) => error,
+        };
+        if !is_file_unavailable(&retrieve_error) {
+            return Err(retrieve_error);
+        }
+
+        let (parent, file_name) = split_remote_path(remote_path);
+        let listing = stream!(self, |s| s.nlst(parent))?;
+        let is_listed = listing
+            .iter()
+            .any(|entry| listing_entry_name(entry) == file_name);
+        if is_listed {
+            Err(retrieve_error)
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Upload bytes to `remote_path`. Creates parent directories on demand.
     pub fn put_bytes(&mut self, remote_path: &str, bytes: &[u8]) -> Result<u64> {
         self.ensure_parent_dirs(remote_path)?;
@@ -222,6 +249,33 @@ impl BranchRemote for FtpClient {
     fn delete_file(&mut self, path: &str) -> Result<(), RemoteFailure> {
         self.branch_delete_file(path).map_err(map_branch_ftp_error)
     }
+
+    fn download_bytes(&mut self, path: &str) -> Result<Option<Vec<u8>>, RemoteFailure> {
+        self.download_or_missing(path).map_err(map_branch_ftp_error)
+    }
+}
+
+fn is_file_unavailable(error: &FtpError) -> bool {
+    matches!(
+        error,
+        FtpError::UnexpectedResponse(response) if response.status == Status::FileUnavailable
+    )
+}
+
+/// Splits a remote path into the directory to list and the file name. `None` lists the
+/// working directory, which is where a relative path with no directory part lives.
+fn split_remote_path(remote_path: &str) -> (Option<&str>, &str) {
+    match remote_path.rsplit_once('/') {
+        Some(("", file_name)) => (Some("/"), file_name),
+        Some((parent, file_name)) => (Some(parent), file_name),
+        None => (None, remote_path),
+    }
+}
+
+/// `NLST` servers return bare names or full paths, so compare on the last component.
+fn listing_entry_name(entry: &str) -> &str {
+    let entry = entry.trim();
+    entry.rsplit_once('/').map_or(entry, |(_, name)| name)
 }
 
 fn map_branch_ftp_error(error: FtpError) -> RemoteFailure {
@@ -569,6 +623,261 @@ mod tests {
         )
     }
 
+    #[test]
+    fn branch_adapter_download_returns_the_file_bytes_without_listing() {
+        let (mut client, server) = branch_client_for_download(
+            FakeAnswer::Data(vec![0, b'\r', b'\n', 0xff]),
+            FakeAnswer::Line("500 no listing expected"),
+        );
+
+        let downloaded = BranchRemote::download_bytes(&mut client, "/site/dir/a.txt")
+            .expect("a readable file should download");
+
+        assert_eq!(downloaded, Some(vec![0, b'\r', b'\n', 0xff]));
+        client.quit();
+        let commands = server.join().expect("download server should complete");
+        assert!(commands.iter().all(|command| !command.starts_with("NLST")));
+    }
+
+    #[test]
+    fn branch_adapter_download_treats_550_with_absent_name_in_parent_listing_as_missing() {
+        let (mut client, server) = branch_client_for_download(
+            FakeAnswer::Line("550 Failed to open file."),
+            FakeAnswer::Data(b"other.txt\r\nxa.txt\r\n".to_vec()),
+        );
+
+        let downloaded = BranchRemote::download_bytes(&mut client, "/site/dir/a.txt")
+            .expect("an absent file is not a failure");
+
+        assert_eq!(
+            downloaded, None,
+            "a listing entry that only ends with the name is not the file"
+        );
+        client.quit();
+        let commands = server.join().expect("download server should complete");
+        assert!(commands.contains(&"NLST /site/dir".to_string()));
+    }
+
+    #[test]
+    fn branch_adapter_download_reports_550_with_name_in_parent_listing_as_operation_failure() {
+        for listing in [&b"a.txt\r\nb.txt\r\n"[..], b"/site/dir/a.txt\r\n"] {
+            let (mut client, server) = branch_client_for_download(
+                FakeAnswer::Line("550 Failed to open file."),
+                FakeAnswer::Data(listing.to_vec()),
+            );
+
+            let failure = BranchRemote::download_bytes(&mut client, "/site/dir/a.txt")
+                .expect_err("an existing file that cannot be read is a failure");
+
+            assert_eq!(failure.kind, RemoteFailureKind::Operation);
+            client.quit();
+            server.join().expect("download server should complete");
+        }
+    }
+
+    #[test]
+    fn branch_adapter_download_reports_550_with_failed_listing_as_operation_failure() {
+        let (mut client, server) = branch_client_for_download(
+            FakeAnswer::Line("550 Failed to open file."),
+            FakeAnswer::Line("550 Permission denied."),
+        );
+
+        let failure = BranchRemote::download_bytes(&mut client, "/site/dir/a.txt")
+            .expect_err("an unverifiable 550 must not read as missing");
+
+        assert_eq!(failure.kind, RemoteFailureKind::Operation);
+        client.quit();
+        server.join().expect("download server should complete");
+    }
+
+    #[test]
+    fn branch_adapter_download_reports_connection_loss_during_the_listing() {
+        let (mut client, server) = branch_client_for_download(
+            FakeAnswer::Line("550 Failed to open file."),
+            FakeAnswer::Drop,
+        );
+
+        let failure = BranchRemote::download_bytes(&mut client, "/site/dir/a.txt")
+            .expect_err("a lost connection must not read as missing");
+
+        assert_eq!(failure.kind, RemoteFailureKind::ConnectionLost);
+        client.quit();
+        server.join().expect("download server should complete");
+    }
+
+    #[test]
+    fn branch_adapter_download_reports_other_replies_without_listing() {
+        for (reply, expected_kind) in [
+            (
+                "451 Local error in processing.",
+                RemoteFailureKind::Operation,
+            ),
+            (
+                "421 Service not available.",
+                RemoteFailureKind::ConnectionLost,
+            ),
+        ] {
+            let (mut client, server) = branch_client_for_download(
+                FakeAnswer::Line(reply),
+                FakeAnswer::Data(b"other.txt\r\n".to_vec()),
+            );
+
+            let failure = BranchRemote::download_bytes(&mut client, "/site/dir/a.txt")
+                .expect_err("only a 550 reply can mean missing");
+
+            assert_eq!(failure.kind, expected_kind, "{reply}");
+            client.quit();
+            let commands = server.join().expect("download server should complete");
+            assert!(
+                commands.iter().all(|command| !command.starts_with("NLST")),
+                "{reply} must not trigger a parent listing"
+            );
+        }
+    }
+
+    #[test]
+    fn branch_adapter_download_reports_a_dropped_control_connection() {
+        let (mut client, server) =
+            branch_client_for_download(FakeAnswer::Drop, FakeAnswer::Line("500 unused"));
+
+        let failure = BranchRemote::download_bytes(&mut client, "/site/dir/a.txt")
+            .expect_err("a dropped connection is a failure");
+
+        assert_eq!(failure.kind, RemoteFailureKind::ConnectionLost);
+        client.quit();
+        server.join().expect("download server should complete");
+    }
+
+    #[test]
+    fn branch_adapter_download_lists_the_root_and_the_working_directory_for_shallow_paths() {
+        for (remote_path, expected_listing_command) in [("/a.txt", "NLST /"), ("a.txt", "NLST")] {
+            let (mut client, server) = branch_client_for_download(
+                FakeAnswer::Line("550 Failed to open file."),
+                FakeAnswer::Data(b"other.txt\r\n".to_vec()),
+            );
+
+            let downloaded = BranchRemote::download_bytes(&mut client, remote_path)
+                .expect("an absent file is not a failure");
+
+            assert_eq!(downloaded, None);
+            client.quit();
+            let commands = server.join().expect("download server should complete");
+            assert!(
+                commands.contains(&expected_listing_command.to_string()),
+                "{remote_path} should list with {expected_listing_command}: {commands:?}"
+            );
+        }
+    }
+
+    enum FakeAnswer {
+        Data(Vec<u8>),
+        Line(&'static str),
+        Drop,
+    }
+
+    /// A scripted FTP server that answers `RETR` and `NLST` with the given answers over a
+    /// passive data connection, and returns every control command it received.
+    fn branch_client_for_download(
+        retr_answer: FakeAnswer,
+        nlst_answer: FakeAnswer,
+    ) -> (FtpClient, thread::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("download server should bind");
+        let address = listener
+            .local_addr()
+            .expect("download server address should resolve");
+        let server = thread::spawn(move || {
+            let (mut connection, _) = listener.accept().expect("download server should accept");
+            connection
+                .write_all(b"220 ready\r\n")
+                .expect("download server should send greeting");
+            let mut reader = BufReader::new(
+                connection
+                    .try_clone()
+                    .expect("download server connection should clone"),
+            );
+            let mut commands = Vec::new();
+            let mut data_listener: Option<TcpListener> = None;
+            loop {
+                let mut line = String::new();
+                if reader
+                    .read_line(&mut line)
+                    .expect("download server should read a command")
+                    == 0
+                {
+                    break;
+                }
+                let command = line.trim().to_string();
+                let verb = command.split(' ').next().unwrap_or_default().to_string();
+                commands.push(command);
+                match verb.as_str() {
+                    "PASV" => {
+                        let passive =
+                            TcpListener::bind("127.0.0.1:0").expect("data listener should bind");
+                        let port = passive.local_addr().expect("data address").port();
+                        write!(
+                            connection,
+                            "227 Entering Passive Mode (127,0,0,1,{},{})\r\n",
+                            port / 256,
+                            port % 256
+                        )
+                        .expect("download server should answer PASV");
+                        data_listener = Some(passive);
+                    }
+                    "RETR" | "NLST" => {
+                        let answer = if verb == "RETR" {
+                            &retr_answer
+                        } else {
+                            &nlst_answer
+                        };
+                        match answer {
+                            FakeAnswer::Data(bytes) => {
+                                connection
+                                    .write_all(b"150 Opening data connection\r\n")
+                                    .expect("download server should open the transfer");
+                                let (mut data, _) = data_listener
+                                    .take()
+                                    .expect("PASV should precede the transfer")
+                                    .accept()
+                                    .expect("data connection should arrive");
+                                data.write_all(bytes)
+                                    .expect("download server should send data");
+                                drop(data);
+                                connection
+                                    .write_all(b"226 Transfer complete\r\n")
+                                    .expect("download server should finish the transfer");
+                            }
+                            FakeAnswer::Line(reply) => {
+                                write!(connection, "{reply}\r\n")
+                                    .expect("download server should send its reply");
+                            }
+                            FakeAnswer::Drop => break,
+                        }
+                    }
+                    "QUIT" => {
+                        let _ = connection.write_all(b"221 bye\r\n");
+                        break;
+                    }
+                    _ => {
+                        connection
+                            .write_all(b"200 ok\r\n")
+                            .expect("download server should acknowledge");
+                    }
+                }
+            }
+            commands
+        });
+        let mut stream = FtpStream::connect(address.to_string())
+            .expect("client should connect to download server");
+        stream.set_mode(Mode::Passive);
+
+        (
+            FtpClient {
+                stream: AnyFtpStream::Plain(stream),
+            },
+            server,
+        )
+    }
+
     fn branch_client_for_deletion_421() -> (FtpClient, thread::JoinHandle<Deletion421Server>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("deletion server should bind");
         let address = listener
@@ -876,6 +1185,69 @@ mod tests {
         client.quit();
     }
 
+    #[test]
+    #[ignore]
+    fn disposable_branch_download() {
+        assert_eq!(
+            std::env::var("ZED_FTP_RUN_FTP_INTEGRATION").as_deref(),
+            Ok("1"),
+            "set ZED_FTP_RUN_FTP_INTEGRATION=1 to run the disposable FTP test"
+        );
+
+        let (_container, mut client, commands) = disposable_branch_client("download");
+        let expected = [0, b'\r', b'\n', 0xff, 0x80];
+        client
+            .set_binary_mode()
+            .expect("adapter should select binary mode");
+        client
+            .mkdir_p("branch-download/subdirectory")
+            .expect("adapter should create the test directories");
+        client
+            .upload_bytes("branch-download/present.bin", &expected)
+            .expect("adapter should seed the present file");
+
+        assert_eq!(
+            client
+                .download_bytes("branch-download/present.bin")
+                .expect("a present file should download"),
+            Some(expected.to_vec())
+        );
+        assert_eq!(
+            client
+                .download_bytes("branch-download/absent.bin")
+                .expect("an absent file in an existing directory is missing, not a failure"),
+            None
+        );
+        // vsftpd lists a directory that does not exist as empty, so a path in a new directory is missing.
+        assert_eq!(
+            client
+                .download_bytes("branch-download/new-directory/x.bin")
+                .expect("an absent directory lists as empty on this server"),
+            None
+        );
+        let unreadable = client
+            .download_bytes("branch-download/subdirectory")
+            .expect_err("a directory cannot be downloaded, and its name is listed");
+        assert_eq!(unreadable.kind, RemoteFailureKind::Operation);
+
+        let commands = commands.lock().expect("command log should not be poisoned");
+        let type_index = commands
+            .iter()
+            .position(|command| command.starts_with("TYPE I"))
+            .expect("control log should contain TYPE I");
+        let first_retr_index = commands
+            .iter()
+            .position(|command| command.starts_with("RETR "))
+            .expect("control log should contain RETR");
+        assert!(type_index < first_retr_index);
+        assert!(
+            commands.contains(&"NLST branch-download".to_string()),
+            "a 550 reply must be confirmed with a parent listing: {commands:?}"
+        );
+        drop(commands);
+        client.quit();
+    }
+
     struct DockerContainer {
         name: String,
     }
@@ -886,6 +1258,66 @@ mod tests {
                 .args(["rm", "-f", &self.name])
                 .output();
         }
+    }
+
+    /// Starts a disposable FTP container and returns a client that talks to it through a
+    /// control-command logging proxy.
+    fn disposable_branch_client(
+        name_suffix: &str,
+    ) -> (DockerContainer, FtpClient, Arc<Mutex<Vec<String>>>) {
+        let passive_port = reserve_port();
+        let container_name = format!(
+            "zed-ftp-branch-{name_suffix}-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time should be after epoch")
+                .as_nanos()
+        );
+        let image = "delfer/alpine-ftp-server:latest@sha256:60bb774d8408d9d4d5c74d05d1c086a34ce192c6c1a142ffac268cac0dbc6fac";
+        let output = Command::new("docker")
+            .args([
+                "run",
+                "-d",
+                "--name",
+                &container_name,
+                "-e",
+                "USERS=test|test|/home/test",
+                "-e",
+                "ADDRESS=127.0.0.1",
+                "-e",
+                &format!("MIN_PORT={passive_port}"),
+                "-e",
+                &format!("MAX_PORT={passive_port}"),
+                "-p",
+                "127.0.0.1::21",
+                "-p",
+                &format!("127.0.0.1:{passive_port}:{passive_port}"),
+                image,
+            ])
+            .output()
+            .expect("Docker CLI should start");
+        assert!(
+            output.status.success(),
+            "docker run failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let container = DockerContainer {
+            name: container_name,
+        };
+        let control_port = published_control_port(&container.name);
+        wait_for_ftp(control_port);
+        let (proxy_port, commands) = start_control_proxy(control_port);
+
+        let mut stream = FtpStream::connect(format!("127.0.0.1:{proxy_port}"))
+            .expect("FTP client should connect through the control proxy");
+        stream.set_mode(Mode::Passive);
+        stream
+            .login("test", "test")
+            .expect("FTP client should authenticate");
+        let client = FtpClient {
+            stream: AnyFtpStream::Plain(stream),
+        };
+        (container, client, commands)
     }
 
     fn reserve_port() -> u16 {
