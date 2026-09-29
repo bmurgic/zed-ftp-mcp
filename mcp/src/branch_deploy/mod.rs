@@ -125,6 +125,18 @@ pub struct PlannedUpload {
     pub object_id: String,
     #[schemars(transform = crate::schema::remove_unsigned_integer_format)]
     pub bytes: u64,
+    /// The base-commit blob for this path. It is set only in merge mode, and only when the
+    /// path is a regular blob at the base commit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_object_id: Option<String>,
+}
+
+impl PlannedUpload {
+    /// Rule 1 of the merge decision table: the range left this path's blob unchanged.
+    #[allow(dead_code)] // The merge executor starts using this in task 1.5.
+    pub fn is_unchanged_in_range(&self) -> bool {
+        self.base_object_id.as_deref() == Some(self.object_id.as_str())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]

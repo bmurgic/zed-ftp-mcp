@@ -123,12 +123,14 @@ fn executor_plan() -> BranchDeployPlan {
             remote_path: "/remote/a.bin".to_string(),
             object_id: "a".to_string(),
             bytes: 4,
+            base_object_id: None,
         },
         PlannedUpload {
             git_path: "nested/b.bin".to_string(),
             remote_path: "/remote/nested/b.bin".to_string(),
             object_id: "b".to_string(),
             bytes: 3,
+            base_object_id: None,
         },
     ];
     plan.touched_paths = plan.uploads.len();
@@ -1996,6 +1998,86 @@ fn merge_file_exit_status_maps_to_clean_conflict_or_error() {
             "status {failure:?} must be an error"
         );
     }
+}
+
+fn plan_for_mode(repository: &TestRepo, base: &str, mode: DeployMode) -> BranchDeployPlan {
+    let mut merge_request = request(
+        repository.path().to_str().expect("utf-8 path"),
+        base,
+        "HEAD",
+    );
+    merge_request.mode = mode;
+    plan_branch(&merge_request, &test_profile("/remote/root")).expect("planner should succeed")
+}
+
+#[test]
+fn merge_planner_records_base_blob_ids_only_in_merge_mode() {
+    let repository = TestRepo::new();
+    repository.write("changed.txt", b"v1");
+    repository.write("restored.txt", b"original");
+    repository.commit("base");
+    let base = repository.rev_parse("HEAD");
+    repository.write("changed.txt", b"v2");
+    repository.write("added.txt", b"new");
+    repository.write("restored.txt", b"temporary");
+    repository.commit("change");
+    repository.write("restored.txt", b"original");
+    repository.commit("restore");
+
+    let merge_plan = plan_for_mode(&repository, &base, DeployMode::Merge);
+
+    assert_eq!(
+        upload(&merge_plan, "changed.txt").base_object_id,
+        Some(repository.rev_parse(&format!("{base}:changed.txt")))
+    );
+    assert_ne!(
+        upload(&merge_plan, "changed.txt").base_object_id.as_deref(),
+        Some(upload(&merge_plan, "changed.txt").object_id.as_str())
+    );
+    assert_eq!(upload(&merge_plan, "added.txt").base_object_id, None);
+    let restored = upload(&merge_plan, "restored.txt");
+    assert!(
+        restored.is_unchanged_in_range(),
+        "a path touched but restored to its base blob is unchanged in the range"
+    );
+    assert!(!upload(&merge_plan, "changed.txt").is_unchanged_in_range());
+
+    let overwrite_plan = plan_for_mode(&repository, &base, DeployMode::Overwrite);
+    assert_eq!(overwrite_plan.uploads.len(), 3);
+    assert!(overwrite_plan
+        .uploads
+        .iter()
+        .all(|planned| planned.base_object_id.is_none() && !planned.is_unchanged_in_range()));
+}
+
+#[cfg(unix)]
+#[test]
+fn merge_planner_treats_a_symbolic_link_base_as_absent_and_keeps_executable_bases() {
+    let repository = TestRepo::new();
+    repository.write("target.txt", b"target");
+    repository.write("script.sh", b"#!/bin/sh\necho one\n");
+    let mut permissions = fs::metadata(repository.path().join("script.sh"))
+        .expect("fixture metadata should be readable")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(repository.path().join("script.sh"), permissions)
+        .expect("fixture should be executable");
+    std::os::unix::fs::symlink("target.txt", repository.path().join("was-link.txt"))
+        .expect("symlink fixture should exist");
+    repository.commit("base");
+    let base = repository.rev_parse("HEAD");
+    fs::remove_file(repository.path().join("was-link.txt")).expect("link should be removed");
+    repository.write("was-link.txt", b"now a regular file");
+    repository.write("script.sh", b"#!/bin/sh\necho two\n");
+    repository.commit("head");
+
+    let plan = plan_for_mode(&repository, &base, DeployMode::Merge);
+
+    assert_eq!(upload(&plan, "was-link.txt").base_object_id, None);
+    assert_eq!(
+        upload(&plan, "script.sh").base_object_id,
+        Some(repository.rev_parse(&format!("{base}:script.sh")))
+    );
 }
 
 fn test_profile(remote_root: &str) -> Profile {

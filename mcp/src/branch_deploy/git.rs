@@ -1,8 +1,8 @@
 use super::{
     map_remote_path, BlobSource, BlockedPath, BranchDeletePlan, BranchDeployError,
     BranchDeployPlan, DeleteBranchFilesRequest, DeletePathResult, DeletePathStatus,
-    DeletedPathResult, DeletedPathStatus, DeployBranchRequest, FailureRecord, PlannedUpload,
-    RepositorySummary, RequestedAndResolvedRef, ResolvedRefs,
+    DeletedPathResult, DeletedPathStatus, DeployBranchRequest, DeployMode, FailureRecord,
+    PlannedUpload, RepositorySummary, RequestedAndResolvedRef, ResolvedRefs,
 };
 use crate::config::Profile;
 use std::collections::{BTreeMap, BTreeSet};
@@ -143,7 +143,11 @@ pub(super) fn plan_branch(
     let head_commit = resolve_commit(&repository_root, &request.head_ref)?;
     let commits = range_commits(&repository_root, &base_commit, &head_commit)?;
     let touched_paths = touched_paths(&repository_root, &commits)?;
-    let head_tree = head_tree(&repository_root, &head_commit)?;
+    let head_tree = commit_tree(&repository_root, &head_commit)?;
+    let base_tree = match request.mode {
+        DeployMode::Merge => Some(commit_tree(&repository_root, &base_commit)?),
+        DeployMode::Overwrite => None,
+    };
     let dirty = !run_git(
         &repository_root,
         ["status", "--porcelain=v1", "-z", "--untracked-files=normal"],
@@ -168,6 +172,7 @@ pub(super) fn plan_branch(
                         remote_path,
                         object_id: entry.object_id.clone(),
                         bytes: entry.bytes,
+                        base_object_id: base_object_id(base_tree.as_ref(), path),
                     }),
                     Err(error) => failures.push(planning_failure(path, error.to_string())),
                 }
@@ -270,7 +275,7 @@ pub(super) fn plan_deletion(
 
     let commits = range_commits(&repository_root, &base_commit, &head_commit)?;
     let touched = touched_paths(&repository_root, &commits)?;
-    let head_tree = head_tree(&repository_root, &head_commit)?;
+    let head_tree = commit_tree(&repository_root, &head_commit)?;
     let deleted: BTreeSet<Vec<u8>> = touched
         .into_iter()
         .filter(|path| !head_tree.contains_key(path))
@@ -504,13 +509,13 @@ fn touched_paths(
     Ok(touched)
 }
 
-fn head_tree(
+fn commit_tree(
     repository_root: &Path,
-    head_commit: &str,
+    commit: &str,
 ) -> Result<BTreeMap<Vec<u8>, TreeEntry>, BranchDeployError> {
     let output = run_git(
         repository_root,
-        ["ls-tree", "-rz", "-l", "--full-tree", head_commit],
+        ["ls-tree", "-rz", "-l", "--full-tree", commit],
     )?;
     let mut tree = BTreeMap::new();
 
@@ -565,6 +570,14 @@ fn head_tree(
         );
     }
     Ok(tree)
+}
+
+/// A base entry that is not a regular blob, such as a symbolic link or submodule, counts as absent.
+fn base_object_id(base_tree: Option<&BTreeMap<Vec<u8>, TreeEntry>>, path: &[u8]) -> Option<String> {
+    base_tree?
+        .get(path)
+        .filter(|entry| is_regular_blob(entry))
+        .map(|entry| entry.object_id.clone())
 }
 
 fn is_regular_blob(entry: &TreeEntry) -> bool {

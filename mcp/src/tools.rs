@@ -943,6 +943,7 @@ mod tests {
             remote_path: "/remote/app.bin".to_string(),
             object_id: "object".to_string(),
             bytes: 4,
+            base_object_id: None,
         });
         let manifest = dry_run_manifest(plan, true);
         let response = branch_deploy_manifest_output(manifest);
@@ -959,6 +960,7 @@ mod tests {
             remote_path: "/remote/app.bin".to_string(),
             object_id: "object".to_string(),
             bytes: 4,
+            base_object_id: None,
         });
         let mut manifest = dry_run_manifest(plan, true);
         manifest.uploads[0].remote_bytes_read = Some(11);
