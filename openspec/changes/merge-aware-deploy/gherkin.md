@@ -1,0 +1,121 @@
+# Executable Gherkin manifest
+
+> OpenSpec scenarios are the behavioral source of truth.
+> The listed `.feature` files are generated executable representations.
+> Do not restate behavior in this manifest.
+
+## branch-deployment
+
+- **Spec:** `specs/branch-deployment/spec.md`
+- **Feature:** `features/openspec/merge-aware-deploy/branch-deployment.feature`
+- **Scenarios:**
+  - `branch-deployment / Branch deployment accepts an explicit repository and commit range / Deploy the default head`
+  - `branch-deployment / Branch deployment accepts an explicit repository and commit range / Reject a directory that is not the selected worktree root`
+  - `branch-deployment / Branch deployment accepts an explicit repository and commit range / Reject an unresolved ref`
+  - `branch-deployment / Branch deployment accepts an explicit repository and commit range / Branch range 04 - mode defaults to overwrite`
+  - `branch-deployment / Branch deployment accepts an explicit repository and commit range / Branch range 05 - reject an unknown mode`
+  - `branch-deployment / Deployment uploads exact committed head blobs / Working tree differs from the head commit`
+  - `branch-deployment / Deployment uploads exact committed head blobs / Touched path survives at head`
+  - `branch-deployment / Deployment uploads exact committed head blobs / Touched entry is not a deployable blob`
+  - `branch-deployment / Deployment uploads exact committed head blobs / Unsafe Git path`
+  - `branch-deployment / Deployment uploads exact committed head blobs / Head blobs 05 - merge mode ignores working-tree changes`
+  - `branch-deployment / Verification compares complete remote bytes / Uploaded bytes match`
+  - `branch-deployment / Verification compares complete remote bytes / Uploaded bytes differ`
+  - `branch-deployment / Verification compares complete remote bytes / Verification is disabled`
+  - `branch-deployment / Dry run performs no secret, content, or network access / Dry-run plan succeeds`
+  - `branch-deployment / Dry run performs no secret, content, or network access / Dry run 02 - merge preview writes nothing remotely`
+  - `branch-deployment / Dry run performs no secret, content, or network access / Dry run 03 - merge preview reports a conflict without uploading`
+  - `branch-deployment / Deployment returns a complete structured manifest / Deployment succeeds`
+  - `branch-deployment / Deployment returns a complete structured manifest / Execution completes unsuccessfully through MCP`
+  - `branch-deployment / Deployment returns a complete structured manifest / Execution completes unsuccessfully through the CLI`
+  - `branch-deployment / Deployment returns a complete structured manifest / Manifest 04 - blocked merge is unsuccessful through the CLI`
+  - `branch-deployment / Deployment returns a complete structured manifest / Manifest 05 - long conflict text is truncated`
+  - `branch-deployment / Deployment returns a complete structured manifest / Manifest 06 - non-UTF-8 conflict text is readable`
+  - `branch-deployment / Deployment returns a complete structured manifest / Manifest 07 - merged upload reports head blob and uploaded size`
+  - `branch-deployment / Existing FTP operations remain compatible / Existing tool is invoked`
+  - `branch-deployment / Existing FTP operations remain compatible / Compatibility 02 - branch deployment without mode`
+  - `branch-deployment / Merge mode decides each file from its base, head, and server copies / Merge rules 01 - decision table`
+  - `branch-deployment / Merge mode decides each file from its base, head, and server copies / Merge rules 02 - conflict reason is reported`
+  - `branch-deployment / Merge mode decides each file from its base, head, and server copies / Merge rules 03 - server-only line is preserved`
+  - `branch-deployment / Merge mode decides each file from its base, head, and server copies / Merge rules 04 - adjacent edits conflict`
+  - `branch-deployment / Merge mode decides each file from its base, head, and server copies / Merge rules 05 - download failure is not treated as missing`
+  - `branch-deployment / Merge mode decides each file from its base, head, and server copies / Merge rules 06 - a 550 for an absent file means missing`
+  - `branch-deployment / Merge mode uploads nothing unless every file resolves / Merge blocking 01 - one conflict blocks clean files`
+  - `branch-deployment / Merge mode uploads nothing unless every file resolves / Merge blocking 02 - connection lost while downloading`
+  - `branch-deployment / Merge mode uploads nothing unless every file resolves / Merge blocking 03 - everything resolves`
+  - `branch-deployment / Merge mode uploads nothing unless every file resolves / Merge blocking 04 - planning failure blocks merge uploads`
+- **Scenario names (as generated):**
+  - `Deploy the default head`
+  - `Reject a directory that is not the selected worktree root`
+  - `Reject an unresolved ref`
+  - `Branch range 04 - mode defaults to overwrite`
+  - `Branch range 05 - reject an unknown mode`
+  - `Working tree differs from the head commit`
+  - `Touched path survives at head`
+  - `Touched entry is not a deployable blob`
+  - `Unsafe Git path`
+  - `Head blobs 05 - merge mode ignores working-tree changes`
+  - `Uploaded bytes match`
+  - `Uploaded bytes differ`
+  - `Verification is disabled`
+  - `Dry-run plan succeeds`
+  - `Dry run 02 - merge preview writes nothing remotely`
+  - `Dry run 03 - merge preview reports a conflict without uploading`
+  - `Deployment succeeds`
+  - `Execution completes unsuccessfully through MCP`
+  - `Execution completes unsuccessfully through the CLI`
+  - `Manifest 04 - blocked merge is unsuccessful through the CLI`
+  - `Manifest 05 - long conflict text is truncated`
+  - `Manifest 06 - non-UTF-8 conflict text is readable`
+  - `Manifest 07 - merged upload reports head blob and uploaded size`
+  - `Existing tool is invoked`
+  - `Compatibility 02 - branch deployment without mode`
+  - `Merge rules 01 - decision table`
+  - `Merge rules 02 - conflict reason is reported`
+  - `Merge rules 03 - server-only line is preserved`
+  - `Merge rules 04 - adjacent edits conflict`
+  - `Merge rules 05 - download failure is not treated as missing`
+  - `Merge rules 06 - a 550 for an absent file means missing`
+  - `Merge blocking 01 - one conflict blocks clean files`
+  - `Merge blocking 02 - connection lost while downloading`
+  - `Merge blocking 03 - everything resolves`
+  - `Merge blocking 04 - planning failure blocks merge uploads`
+- **Parser:** `~/.local/share/openspec/schemas/openspec-bridge/tooling/aps/bin/gherkin-parser features/openspec/merge-aware-deploy/branch-deployment.feature /tmp/branch-deployment.json`, which exits 0.
+- **Gherkin DRY:** `~/.local/share/openspec/schemas/openspec-bridge/tooling/aps/bin/gherkin-ir-dry-checker /tmp/branch-deployment.json /tmp/branch-deployment.dry.txt`, which exits 0. 18 findings, all retained. Each pair differs in domain meaning: default mode versus bad mode versus mode-agnostic requests; merge-mode versus overwrite-mode steps; MCP versus CLI surfaces; single-file versus multi-file blocking outcomes; parameterized versus fixed preconditions. One accidental drift ("uploads it" versus "uploads that path") was normalized in the spec, and the feature was regenerated.
+- **Sync check:** `~/.local/share/openspec/schemas/openspec-bridge/scripts/spec-to-feature --spec openspec/changes/merge-aware-deploy/specs/branch-deployment/spec.md --feature features/openspec/merge-aware-deploy/branch-deployment.feature --check`, which exits 0.
+
+## server-drift-guard
+
+- **Spec:** `specs/server-drift-guard/spec.md`
+- **Feature:** `features/openspec/merge-aware-deploy/server-drift-guard.feature`
+- **Scenarios:**
+  - `server-drift-guard / Upload tools accept an optional expected ref / Expected ref 01 - omitted expected ref keeps overwrite behavior`
+  - `server-drift-guard / Upload tools accept an optional expected ref / Expected ref 02 - unresolvable expected ref is rejected`
+  - `server-drift-guard / Upload tools accept an optional expected ref / Expected ref 03 - upload source outside a repository`
+  - `server-drift-guard / Upload tools accept an optional expected ref / Expected ref 04 - expected path is not a regular file`
+  - `server-drift-guard / Upload tools accept an optional expected ref / Expected ref 05 - unreadable local file`
+  - `server-drift-guard / Drift check classifies each target file / Drift classification 01 - classification table`
+  - `server-drift-guard / Drift check classifies each target file / Drift classification 02 - single-file upload of the committed version`
+  - `server-drift-guard / Drift check classifies each target file / Drift classification 03 - download error is not treated as missing`
+  - `server-drift-guard / Any drifted file refuses the whole run / Drift refusal 01 - one drifted file blocks the others`
+  - `server-drift-guard / Any drifted file refuses the whole run / Drift refusal 02 - no drift uploads normally`
+  - `server-drift-guard / Any drifted file refuses the whole run / Drift refusal 03 - single-file upload refused`
+  - `server-drift-guard / Dry run with an expected ref checks drift without uploading / Drift dry run 01 - drift is reported without uploading`
+  - `server-drift-guard / Dry run with an expected ref checks drift without uploading / Drift dry run 02 - dry run without expected ref stays offline`
+- **Scenario names (as generated):**
+  - `Expected ref 01 - omitted expected ref keeps overwrite behavior`
+  - `Expected ref 02 - unresolvable expected ref is rejected`
+  - `Expected ref 03 - upload source outside a repository`
+  - `Expected ref 04 - expected path is not a regular file`
+  - `Expected ref 05 - unreadable local file`
+  - `Drift classification 01 - classification table`
+  - `Drift classification 02 - single-file upload of the committed version`
+  - `Drift classification 03 - download error is not treated as missing`
+  - `Drift refusal 01 - one drifted file blocks the others`
+  - `Drift refusal 02 - no drift uploads normally`
+  - `Drift refusal 03 - single-file upload refused`
+  - `Drift dry run 01 - drift is reported without uploading`
+  - `Drift dry run 02 - dry run without expected ref stays offline`
+- **Parser:** `~/.local/share/openspec/schemas/openspec-bridge/tooling/aps/bin/gherkin-parser features/openspec/merge-aware-deploy/server-drift-guard.feature /tmp/server-drift-guard.json`, which exits 0.
+- **Gherkin DRY:** `~/.local/share/openspec/schemas/openspec-bridge/tooling/aps/bin/gherkin-ir-dry-checker /tmp/server-drift-guard.json /tmp/server-drift-guard.dry.txt`, which exits 0. 21 findings, all retained. They pair runs with and without `expect_ref`, with and without `dry_run`, per-tool versus generic deployment steps, and invalid-arguments errors versus download errors. Each difference is a distinct precondition or outcome.
+- **Sync check:** `~/.local/share/openspec/schemas/openspec-bridge/scripts/spec-to-feature --spec openspec/changes/merge-aware-deploy/specs/server-drift-guard/spec.md --feature features/openspec/merge-aware-deploy/server-drift-guard.feature --check`, which exits 0.
