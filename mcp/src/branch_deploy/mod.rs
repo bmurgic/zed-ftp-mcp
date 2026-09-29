@@ -1,6 +1,6 @@
 use crate::config::Profile;
 use schemars::JsonSchema;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 mod execute;
 mod git;
@@ -11,6 +11,18 @@ pub use execute::{
 };
 use git::BatchBlobReader;
 
+/// How a branch deployment treats files that changed on the server.
+/// `overwrite` uploads head blobs as they are. `merge` three-way merges each file with its server copy.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, clap::ValueEnum,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum DeployMode {
+    #[default]
+    Overwrite,
+    Merge,
+}
+
 #[derive(Debug, Clone)]
 pub struct DeployBranchRequest {
     pub profile: String,
@@ -19,6 +31,7 @@ pub struct DeployBranchRequest {
     pub head_ref: String,
     pub verify: bool,
     pub dry_run: bool,
+    pub mode: DeployMode,
 }
 
 #[derive(Debug, Clone)]
@@ -206,6 +219,7 @@ pub struct BranchDeleteManifest {
 #[derive(Debug, Clone)]
 pub struct BranchDeployPlan {
     pub profile: String,
+    pub mode: DeployMode,
     pub repository: RepositorySummary,
     pub refs: ResolvedRefs,
     pub commits: Vec<String>,
@@ -220,6 +234,7 @@ impl BranchDeployPlan {
     pub fn empty(profile: &str, root: &str) -> Self {
         Self {
             profile: profile.to_string(),
+            mode: DeployMode::Overwrite,
             repository: RepositorySummary {
                 root: root.to_string(),
                 dirty: false,
@@ -250,6 +265,8 @@ pub struct BranchDeployManifest {
     pub repository: RepositorySummary,
     pub refs: ResolvedRefs,
     pub merge_rule: String,
+    pub mode: DeployMode,
+    pub blocked_by_conflicts: bool,
     pub dry_run: bool,
     pub verify: bool,
     pub counts: ManifestCounts,
@@ -383,6 +400,8 @@ pub fn dry_run_manifest(plan: BranchDeployPlan, verify: bool) -> BranchDeployMan
         repository: plan.repository,
         refs: plan.refs,
         merge_rule: "first_parent".to_string(),
+        mode: plan.mode,
+        blocked_by_conflicts: false,
         dry_run: true,
         verify,
         counts,
@@ -503,6 +522,8 @@ fn connection_failure_manifest(
         repository: plan.repository,
         refs: plan.refs,
         merge_rule: "first_parent".to_string(),
+        mode: plan.mode,
+        blocked_by_conflicts: false,
         dry_run: false,
         verify,
         counts: ManifestCounts {

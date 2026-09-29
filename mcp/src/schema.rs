@@ -146,6 +146,14 @@ mod tests {
             );
         }
 
+        assert_eq!(
+            manifest_schema.pointer("/properties/blocked_by_conflicts/type"),
+            Some(&json!("boolean"))
+        );
+        assert_eq!(
+            manifest_schema.pointer("/$defs/DeployMode/enum"),
+            Some(&json!(["overwrite", "merge"]))
+        );
         assert_optional_integer_schema(
             &manifest_schema,
             "/$defs/UploadResult/properties/remote_bytes_read",

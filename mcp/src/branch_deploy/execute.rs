@@ -267,6 +267,8 @@ fn manifest_from_execution(
         repository: plan.repository,
         refs: plan.refs,
         merge_rule: "first_parent".to_string(),
+        mode: plan.mode,
+        blocked_by_conflicts: false,
         dry_run: false,
         verify,
         counts,

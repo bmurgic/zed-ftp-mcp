@@ -6,7 +6,7 @@ use super::{
     execute_deletion, execute_deploy, map_remote_path, plan_branch, plan_deletion, BlobSource,
     BranchDeletePlan, BranchDeployError, BranchDeployPlan, BranchRemote, DeleteBranchFilesRequest,
     DeletePathResult, DeletePathStatus, DeletedPathResult, DeletedPathStatus, DeployBranchRequest,
-    PlannedUpload, RemoteComparison, RemoteFailure, UploadStatus, VerificationStatus,
+    DeployMode, PlannedUpload, RemoteComparison, RemoteFailure, UploadStatus, VerificationStatus,
 };
 use crate::config::Profile;
 use serde_json::json;
@@ -892,11 +892,13 @@ fn planner_contract_serializes_stable_manifest_fields() {
             .keys()
             .collect::<Vec<_>>(),
         vec![
+            "blocked_by_conflicts",
             "counts",
             "deleted",
             "dry_run",
             "failures",
             "merge_rule",
+            "mode",
             "profile",
             "refs",
             "repository",
@@ -935,6 +937,38 @@ fn planner_contract_serializes_stable_manifest_fields() {
     ] {
         assert_eq!(serde_json::to_value(status).unwrap(), json!(expected));
     }
+}
+
+#[test]
+fn branch_range_04_mode_defaults_to_overwrite() {
+    assert_eq!(DeployMode::default(), DeployMode::Overwrite);
+
+    let repository = TestRepo::new();
+    repository.write("tracked.txt", b"base");
+    repository.commit("base");
+    let base = repository.rev_parse("HEAD");
+    repository.write("tracked.txt", b"head");
+    repository.commit("head");
+    let plan = plan_for(&repository, &base);
+    assert_eq!(plan.mode, DeployMode::Overwrite);
+
+    let value = serde_json::to_value(dry_run_manifest(plan, true)).expect("manifest serializes");
+
+    assert_eq!(value["mode"], json!("overwrite"));
+    assert_eq!(value["blocked_by_conflicts"], json!(false));
+    assert!(value.pointer("/uploads/0/merge_status").is_none());
+}
+
+#[test]
+fn deploy_mode_serializes_as_lowercase_words() {
+    assert_eq!(
+        serde_json::to_value(DeployMode::Overwrite).unwrap(),
+        json!("overwrite")
+    );
+    assert_eq!(
+        serde_json::to_value(DeployMode::Merge).unwrap(),
+        json!("merge")
+    );
 }
 
 #[test]
@@ -1738,6 +1772,7 @@ fn request(repo_root: &str, base_ref: &str, head_ref: &str) -> DeployBranchReque
         head_ref: head_ref.to_string(),
         verify: true,
         dry_run: true,
+        mode: DeployMode::Overwrite,
     }
 }
 

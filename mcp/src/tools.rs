@@ -111,6 +111,9 @@ pub struct DeployBranchArgs {
     /// Return the plan without reading credentials or accessing FTP.
     #[serde(default)]
     pub dry_run: bool,
+    /// `overwrite` (default) uploads head blobs as they are. `merge` three-way merges each file with its server copy.
+    #[serde(default)]
+    pub mode: branch_deploy::DeployMode,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -471,6 +474,7 @@ impl FtpServer {
             head_ref: args.head_ref,
             verify: args.verify,
             dry_run: args.dry_run,
+            mode: args.mode,
         };
         let result =
             tokio::task::spawn_blocking(move || branch_deploy::deploy_branch(&request, &profile))
@@ -802,10 +806,33 @@ mod tests {
         assert_eq!(args.head_ref, "HEAD");
         assert!(args.verify);
         assert!(args.dry_run);
+        assert_eq!(args.mode, crate::branch_deploy::DeployMode::Overwrite);
         assert_eq!(
             branch_deploy_error(BranchDeployError::InvalidArgs("bad repository".to_string())).code,
             ErrorCode::INVALID_PARAMS
         );
+    }
+
+    #[test]
+    fn branch_range_05_mcp_rejects_an_unknown_mode() {
+        for bad_mode in ["rebase", "MERGE"] {
+            let result = serde_json::from_value::<DeployBranchArgs>(serde_json::json!({
+                "profile": "staging",
+                "repo_root": "/repo",
+                "base_ref": "origin/dev",
+                "mode": bad_mode
+            }));
+
+            assert!(result.is_err(), "mode {bad_mode} must not deserialize");
+        }
+        let merge: DeployBranchArgs = serde_json::from_value(serde_json::json!({
+            "profile": "staging",
+            "repo_root": "/repo",
+            "base_ref": "origin/dev",
+            "mode": "merge"
+        }))
+        .expect("merge mode should deserialize");
+        assert_eq!(merge.mode, crate::branch_deploy::DeployMode::Merge);
     }
 
     #[test]

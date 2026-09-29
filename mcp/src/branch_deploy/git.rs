@@ -198,6 +198,7 @@ pub(super) fn plan_branch(
 
     Ok(BranchDeployPlan {
         profile: request.profile.clone(),
+        mode: request.mode,
         repository: RepositorySummary {
             root: repository_root.display().to_string(),
             dirty,

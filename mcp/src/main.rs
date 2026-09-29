@@ -58,6 +58,9 @@ enum Cmd {
         /// Return the deployment plan without accessing FTP or credentials.
         #[arg(long)]
         dry_run: bool,
+        /// Deployment mode: overwrite uploads head blobs as they are, merge three-way merges each file with its server copy.
+        #[arg(long, value_enum, default_value_t = branch_deploy::DeployMode::Overwrite)]
+        mode: branch_deploy::DeployMode,
     },
     /// Delete exact branch-removed files after explicit approval.
     DeleteBranchFiles {
@@ -106,6 +109,7 @@ async fn main() -> Result<()> {
             head_ref,
             verify,
             dry_run,
+            mode,
         } => deploy_branch_command(branch_deploy::DeployBranchRequest {
             profile,
             repo_root,
@@ -113,6 +117,7 @@ async fn main() -> Result<()> {
             head_ref,
             verify,
             dry_run,
+            mode,
         }),
         Cmd::DeleteBranchFiles {
             profile,
@@ -379,6 +384,7 @@ mod tests {
             head_ref,
             verify,
             dry_run,
+            mode,
         }) = cli.command
         else {
             panic!("expected deploy-branch command");
@@ -389,6 +395,52 @@ mod tests {
         assert_eq!(head_ref, "HEAD");
         assert!(verify);
         assert!(dry_run);
+        assert_eq!(mode, crate::branch_deploy::DeployMode::Overwrite);
+    }
+
+    #[test]
+    fn branch_range_04_cli_accepts_merge_mode() {
+        let cli = Cli::try_parse_from([
+            "zed-ftp-mcp",
+            "deploy-branch",
+            "staging",
+            "--repo-root",
+            "/repo",
+            "--base",
+            "origin/dev",
+            "--mode",
+            "merge",
+        ])
+        .expect("CLI arguments should parse");
+
+        let Some(Cmd::DeployBranch { mode, .. }) = cli.command else {
+            panic!("expected deploy-branch command");
+        };
+        assert_eq!(mode, crate::branch_deploy::DeployMode::Merge);
+    }
+
+    #[test]
+    fn branch_range_05_cli_rejects_an_unknown_mode() {
+        for bad_mode in ["rebase", "MERGE"] {
+            let error = match Cli::try_parse_from([
+                "zed-ftp-mcp",
+                "deploy-branch",
+                "staging",
+                "--repo-root",
+                "/repo",
+                "--base",
+                "origin/dev",
+                "--mode",
+                bad_mode,
+            ]) {
+                Ok(_) => panic!("mode {bad_mode} must not parse"),
+                Err(error) => error,
+            };
+
+            assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
+            let message = error.to_string();
+            assert!(message.contains("overwrite") && message.contains("merge"));
+        }
     }
 
     #[test]
@@ -406,6 +458,7 @@ mod tests {
             head_ref: "HEAD".to_string(),
             verify: true,
             dry_run: false,
+            mode: crate::branch_deploy::DeployMode::Overwrite,
         };
         let expected_manifest = unsuccessful_deployment_manifest();
         let mut output = Vec::new();
@@ -429,6 +482,8 @@ mod tests {
                     "head": { "requested": "HEAD", "commit": "head" }
                 },
                 "merge_rule": "first_parent",
+                "mode": "overwrite",
+                "blocked_by_conflicts": false,
                 "dry_run": true,
                 "verify": true,
                 "counts": {
