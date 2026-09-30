@@ -380,7 +380,9 @@ mod tests {
         RemoteFailureKind,
     };
     use crate::branch_deploy::{
-        execute_deletion, BranchDeletePlan, DeletePathResult, DeletePathStatus,
+        execute_deletion, preview_merge, BlobSource, BranchDeletePlan, BranchDeployError,
+        BranchDeployPlan, DeletePathResult, DeletePathStatus, DeployMode, MergeStatus,
+        PlannedUpload, UploadStatus,
     };
     use std::io::{self, BufRead, BufReader, Read, Write};
     use std::net::AddrParseError;
@@ -1134,6 +1136,116 @@ mod tests {
             "a 550 reply must be confirmed with a parent listing: {commands:?}"
         );
         drop(commands);
+        client.quit();
+    }
+
+    /// Serves fixed blobs by object ID, so the preview test needs no Git repository.
+    struct FixedBlobs(std::collections::BTreeMap<&'static str, &'static [u8]>);
+
+    impl BlobSource for FixedBlobs {
+        fn read_blob(&mut self, object_id: &str) -> Result<Vec<u8>, BranchDeployError> {
+            self.0
+                .get(object_id)
+                .map(|blob| blob.to_vec())
+                .ok_or_else(|| BranchDeployError::Other(anyhow::anyhow!("no blob {object_id}")))
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn disposable_merge_preview_changes_nothing_on_the_server() {
+        assert_eq!(
+            std::env::var("ZED_FTP_RUN_FTP_INTEGRATION").as_deref(),
+            Ok("1"),
+            "set ZED_FTP_RUN_FTP_INTEGRATION=1 to run the disposable FTP test"
+        );
+
+        let base = b"one\ntwo\nthree\n";
+        let head = b"one\nTWO head\nthree\n";
+        let conflicting_server = b"one\nTWO server\nthree\n";
+        let (_container, mut client, commands) = disposable_branch_client("merge-preview");
+        client
+            .set_binary_mode()
+            .expect("adapter should select binary mode");
+        // The pinned image fails MKD on an existing directory, so the files sit in the home directory.
+        client
+            .upload_bytes("preview-a.txt", base)
+            .expect("adapter should seed the fast-forward file");
+        client
+            .upload_bytes("preview-b.txt", conflicting_server)
+            .expect("adapter should seed the conflicting file");
+
+        let mut plan = BranchDeployPlan::empty("disposable", "/repo");
+        plan.mode = DeployMode::Merge;
+        plan.uploads = ["preview-a.txt", "preview-b.txt"]
+            .into_iter()
+            .map(|path| PlannedUpload {
+                git_path: path.to_string(),
+                remote_path: path.to_string(),
+                object_id: "head".to_string(),
+                bytes: head.len() as u64,
+                base_object_id: Some("base".to_string()),
+            })
+            .collect();
+        plan.touched_paths = plan.uploads.len();
+        let mut blobs = FixedBlobs(std::collections::BTreeMap::from([
+            ("head", head.as_slice()),
+            ("base", base.as_slice()),
+        ]));
+        commands
+            .lock()
+            .expect("command log should not be poisoned")
+            .clear();
+
+        let manifest = preview_merge(plan, true, &mut blobs, &mut client);
+
+        assert!(manifest.dry_run);
+        assert!(manifest.blocked_by_conflicts);
+        assert!(!manifest.success);
+        assert_eq!(
+            manifest.uploads[0].merge_status,
+            Some(MergeStatus::FastForward)
+        );
+        assert_eq!(manifest.uploads[0].upload_status, UploadStatus::Planned);
+        assert_eq!(
+            manifest.uploads[1].merge_status,
+            Some(MergeStatus::Conflict)
+        );
+        {
+            let commands = commands.lock().expect("command log should not be poisoned");
+            let type_index = commands
+                .iter()
+                .position(|command| command.starts_with("TYPE I"))
+                .expect("a preview should select binary mode");
+            let first_retr_index = commands
+                .iter()
+                .position(|command| command.starts_with("RETR "))
+                .expect("a preview should download server copies");
+            assert!(type_index < first_retr_index);
+            let writes: Vec<&String> = commands
+                .iter()
+                .filter(|command| {
+                    [
+                        "STOR ", "STOU", "APPE ", "MKD ", "DELE ", "RMD ", "RNFR ", "RNTO ",
+                    ]
+                    .iter()
+                    .any(|write| command.starts_with(write))
+                })
+                .collect();
+            assert!(writes.is_empty(), "a preview must not write: {writes:?}");
+        }
+        assert_eq!(
+            client
+                .get_bytes("preview-a.txt")
+                .expect("the fast-forward file must remain"),
+            base.to_vec()
+        );
+        assert_eq!(
+            client
+                .get_bytes("preview-b.txt")
+                .expect("the conflicting file must remain"),
+            conflicting_server.to_vec()
+        );
         client.quit();
     }
 
