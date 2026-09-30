@@ -74,6 +74,8 @@ impl From<DriftError> for DeployError {
 /// implements it, and tests use an in-memory fake.
 pub(crate) trait DeployRemote: DriftRemote {
     fn mkdir_p(&mut self, path: &str) -> Result<()>;
+    /// Uploads `bytes`, creating the parent directories first.
+    fn put_bytes(&mut self, remote_path: &str, bytes: &[u8]) -> Result<u64>;
     fn put_reader<R: Read>(&mut self, remote_path: &str, reader: &mut R) -> Result<u64>;
     fn quit(self);
 }
@@ -182,6 +184,126 @@ fn deploy_commits_with<R: DeployRemote>(
         dry_run,
         expect_ref,
     )
+}
+
+/// One `ftp_upload_file` call.
+pub struct UploadFileRequest<'a> {
+    pub local_path: &'a str,
+    /// The full server path, including the profile's remote root.
+    pub remote_path: &'a str,
+    /// Upload the last-committed (git HEAD) version instead of the working-tree content.
+    pub before_changes: bool,
+    pub expect_ref: Option<&'a str>,
+}
+
+#[derive(Debug)]
+pub struct UploadFileOutcome {
+    /// The bytes uploaded. A refused upload writes nothing, so this is 0.
+    pub bytes: u64,
+    /// Present only when `expect_ref` was supplied.
+    pub drift_check: Option<DriftCheck>,
+}
+
+/// Uploads one file. With `expect_ref`, the file's server copy is checked for drift first, and a
+/// drifted file is left unchanged.
+pub fn upload_file(
+    profile_name: &str,
+    profile: &Profile,
+    request: &UploadFileRequest,
+) -> std::result::Result<UploadFileOutcome, DeployError> {
+    upload_file_with(request, || FtpClient::connect(profile_name, profile))
+}
+
+pub(crate) fn upload_file_with<R: DeployRemote>(
+    request: &UploadFileRequest,
+    connect: impl FnOnce() -> Result<R>,
+) -> std::result::Result<UploadFileOutcome, DeployError> {
+    let Some(expect_ref) = request.expect_ref else {
+        let content = if request.before_changes {
+            committed_content(request.local_path)?
+        } else {
+            std::fs::read(request.local_path)
+                .map_err(|e| anyhow::anyhow!("read {}: {e}", request.local_path))?
+        };
+        let mut client = connect()?;
+        let written = client.put_bytes(request.remote_path, &content)?;
+        client.quit();
+        return Ok(UploadFileOutcome {
+            bytes: written,
+            drift_check: None,
+        });
+    };
+
+    let local = Path::new(request.local_path).canonicalize().map_err(|e| {
+        DeployError::InvalidArgs(format!("cannot read {}: {e}", request.local_path))
+    })?;
+    let repo_dir = local
+        .parent()
+        .ok_or_else(|| DeployError::InvalidArgs(format!("{} has no directory", local.display())))?;
+    let resolved = drift::resolve_expect_ref(repo_dir, expect_ref)?;
+    let upload_bytes = if request.before_changes {
+        committed_content(request.local_path)?
+    } else {
+        std::fs::read(&local).map_err(|e| {
+            DeployError::InvalidArgs(format!("cannot read {}: {e}", request.local_path))
+        })?
+    };
+    let targets = [DriftTarget {
+        remote_path: request.remote_path.to_string(),
+        repo_path: drift::repo_relative_path(&resolved, &local)?,
+        upload_bytes,
+    }];
+    drift::validate_expected_paths(&resolved, &targets)?;
+
+    let mut client = connect()?;
+    let check = drift::check_drift(&mut client, &targets, &resolved)?;
+    let written = if check.refused {
+        0
+    } else {
+        client.put_bytes(request.remote_path, &targets[0].upload_bytes)?
+    };
+    client.quit();
+    Ok(UploadFileOutcome {
+        bytes: written,
+        drift_check: Some(check),
+    })
+}
+
+/// The file's content at git HEAD, found through the repository that contains it.
+fn committed_content(local_path: &str) -> Result<Vec<u8>> {
+    let local = Path::new(local_path);
+    let parent = local.parent().unwrap_or(Path::new("."));
+    let root_out = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(parent)
+        .output()
+        .map_err(|e| anyhow::anyhow!("git rev-parse: {e}"))?;
+    if !root_out.status.success() {
+        return Err(anyhow::anyhow!(
+            "not a git repo: {}",
+            String::from_utf8_lossy(&root_out.stderr).trim()
+        ));
+    }
+    let git_root = PathBuf::from(String::from_utf8_lossy(&root_out.stdout).trim());
+    let abs = local
+        .canonicalize()
+        .map_err(|e| anyhow::anyhow!("canonicalize {local_path}: {e}"))?;
+    let rel = abs
+        .strip_prefix(&git_root)
+        .map_err(|_| anyhow::anyhow!("file not under git root {}", git_root.display()))?;
+    let rel_str = rel.to_string_lossy();
+    let show_out = Command::new("git")
+        .args(["show", &format!("HEAD:{rel_str}")])
+        .current_dir(&git_root)
+        .output()
+        .map_err(|e| anyhow::anyhow!("git show: {e}"))?;
+    if !show_out.status.success() {
+        return Err(anyhow::anyhow!(
+            "git show HEAD:{rel_str} failed: {}",
+            String::from_utf8_lossy(&show_out.stderr).trim()
+        ));
+    }
+    Ok(show_out.stdout)
 }
 
 // ─── Internals ───────────────────────────────────────────────────────────────
@@ -532,17 +654,21 @@ mod tests {
             Ok(())
         }
 
-        fn put_reader<R: Read>(&mut self, remote_path: &str, reader: &mut R) -> Result<u64> {
-            let mut bytes = Vec::new();
-            reader.read_to_end(&mut bytes)?;
+        fn put_bytes(&mut self, remote_path: &str, bytes: &[u8]) -> Result<u64> {
             let mut state = self.0.borrow_mut();
             state.remote.calls.push(format!("STOR {remote_path}"));
             state
                 .remote
                 .files
-                .insert(remote_path.to_string(), bytes.clone());
-            state.stored.insert(remote_path.to_string(), bytes.clone());
+                .insert(remote_path.to_string(), bytes.to_vec());
+            state.stored.insert(remote_path.to_string(), bytes.to_vec());
             Ok(bytes.len() as u64)
+        }
+
+        fn put_reader<R: Read>(&mut self, remote_path: &str, reader: &mut R) -> Result<u64> {
+            let mut bytes = Vec::new();
+            reader.read_to_end(&mut bytes)?;
+            self.put_bytes(remote_path, &bytes)
         }
 
         fn quit(self) {}
@@ -1076,5 +1202,292 @@ mod tests {
                 Some("no-such-branch"),
             ));
         }
+    }
+
+    /// A repository with `Mails.php` at three versions: base, head (HEAD), and an uncommitted
+    /// working-tree edit.
+    fn single_file_site() -> Site {
+        let site = site(&["Mails.php"]);
+        site.repo.write("Mails.php", b"working-tree edit\n");
+        site
+    }
+
+    fn upload_single(
+        site: &Site,
+        state: &SharedState,
+        before_changes: bool,
+        expect_ref: Option<&str>,
+    ) -> std::result::Result<UploadFileOutcome, DeployError> {
+        let local = site.repo.path().join("Mails.php");
+        let remote = remote_path("Mails.php");
+        upload_file_with(
+            &UploadFileRequest {
+                local_path: &local.display().to_string(),
+                remote_path: &remote,
+                before_changes,
+                expect_ref,
+            },
+            connector(state),
+        )
+    }
+
+    fn expect_invalid_upload(
+        result: std::result::Result<UploadFileOutcome, DeployError>,
+    ) -> String {
+        match result {
+            Err(DeployError::InvalidArgs(message)) => message,
+            other => panic!("expected InvalidArgs, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn existing_tool_is_invoked_single_file_upload_without_expect_ref_downloads_nothing() {
+        for before_changes in [false, true] {
+            let site = single_file_site();
+            let state = new_state();
+
+            let outcome = upload_single(&site, &state, before_changes, None)
+                .expect("the upload should succeed");
+
+            let expected: &[u8] = if before_changes {
+                b"head Mails.php\n"
+            } else {
+                b"working-tree edit\n"
+            };
+            let state = state.borrow();
+            assert_eq!(outcome.bytes, expected.len() as u64);
+            assert!(outcome.drift_check.is_none());
+            assert_eq!(state.stored[&remote_path("Mails.php")], expected);
+            assert_eq!(
+                state.remote.calls,
+                vec![format!("STOR {}", remote_path("Mails.php"))],
+                "before_changes={before_changes}: no TYPE I and no RETR without expect_ref"
+            );
+        }
+    }
+
+    #[test]
+    fn expected_ref_01_single_file_upload_overwrites_without_expect_ref() {
+        let site = single_file_site();
+        let state = new_state();
+        state
+            .borrow_mut()
+            .seed(&remote_path("Mails.php"), b"server-only edit\n");
+
+        let outcome = upload_single(&site, &state, false, None).expect("the upload should succeed");
+
+        assert!(outcome.drift_check.is_none());
+        assert_eq!(
+            state.borrow().stored[&remote_path("Mails.php")],
+            b"working-tree edit\n".to_vec()
+        );
+    }
+
+    #[test]
+    fn expected_ref_02_single_file_unresolvable_expected_ref_is_rejected() {
+        let site = single_file_site();
+        let state = new_state();
+
+        expect_invalid_upload(upload_single(&site, &state, false, Some("no-such-branch")));
+
+        assert_eq!(state.borrow().connections, 0);
+        assert!(state.borrow().remote.calls.is_empty());
+    }
+
+    #[test]
+    fn expected_ref_03_single_file_upload_source_outside_a_repository() {
+        let outside = tempfile::TempDir::new().expect("temp directory should be created");
+        let loose = outside.path().join("loose.txt");
+        std::fs::write(&loose, b"loose\n").expect("fixture should be written");
+        let state = new_state();
+
+        for before_changes in [false, true] {
+            let message = expect_invalid_upload(upload_file_with(
+                &UploadFileRequest {
+                    local_path: &loose.display().to_string(),
+                    remote_path: "/home/test/loose.txt",
+                    before_changes,
+                    expect_ref: Some("HEAD"),
+                },
+                connector(&state),
+            ));
+
+            assert!(message.contains("Git worktree"), "{message}");
+        }
+        assert_eq!(state.borrow().connections, 0);
+    }
+
+    #[test]
+    fn expected_ref_04_single_file_expected_path_is_not_a_regular_file() {
+        let repo = TestRepo::new();
+        repo.write("Mails.php/inner.txt", b"inner\n");
+        let base = repo.commit_all("base");
+        std::fs::remove_dir_all(repo.path().join("Mails.php"))
+            .expect("directory should be removed");
+        repo.write("Mails.php", b"now a file\n");
+        let head = repo.commit_all("head");
+        let site = Site {
+            profile: profile_for(repo.path(), Vec::new()),
+            repo,
+            base: base.clone(),
+            head,
+        };
+        let state = new_state();
+
+        let message = expect_invalid_upload(upload_single(&site, &state, false, Some(&base)));
+
+        assert!(message.contains("Mails.php"), "{message}");
+        assert_eq!(state.borrow().connections, 0);
+    }
+
+    #[test]
+    fn expected_ref_05_single_file_unreadable_local_file() {
+        let site = single_file_site();
+        let state = new_state();
+        let directory = site.repo.path().join("folder");
+        std::fs::create_dir(&directory).expect("directory should be created");
+
+        for local_path in [directory, site.repo.path().join("missing.php")] {
+            let message = expect_invalid_upload(upload_file_with(
+                &UploadFileRequest {
+                    local_path: &local_path.display().to_string(),
+                    remote_path: "/home/test/x",
+                    before_changes: false,
+                    expect_ref: Some("HEAD"),
+                },
+                connector(&state),
+            ));
+
+            assert!(
+                message.contains(&local_path.display().to_string()),
+                "{message}"
+            );
+        }
+        assert_eq!(state.borrow().connections, 0);
+    }
+
+    #[test]
+    fn drift_refusal_03_single_file_upload_refused() {
+        let site = single_file_site();
+        let state = new_state();
+        // The server copy differs from the base copy and from the working-tree copy.
+        state
+            .borrow_mut()
+            .seed(&remote_path("Mails.php"), b"server-only edit\n");
+
+        let outcome =
+            upload_single(&site, &state, false, Some(&site.base)).expect("a refusal is a response");
+
+        let check = outcome.drift_check.expect("expect_ref adds a drift check");
+        assert_eq!(outcome.bytes, 0);
+        assert!(check.refused);
+        assert_eq!(
+            check.drifted,
+            vec![DriftedFile {
+                remote_path: remote_path("Mails.php"),
+                reason: DriftReason::ContentDiffers,
+            }]
+        );
+        let state = state.borrow();
+        assert!(state.stored.is_empty());
+        assert_eq!(
+            state.remote.files[&remote_path("Mails.php")],
+            b"server-only edit\n".to_vec()
+        );
+    }
+
+    #[test]
+    fn drift_classification_02_single_file_upload_of_the_committed_version() {
+        let site = single_file_site();
+        let state = new_state();
+        // The server holds the HEAD version. The expected copy is the older base version, so the
+        // file is clean only because the upload copy is HEAD, not the working-tree edit.
+        state
+            .borrow_mut()
+            .seed(&remote_path("Mails.php"), b"head Mails.php\n");
+
+        let outcome = upload_single(&site, &state, true, Some(&site.base))
+            .expect("the upload should succeed");
+
+        let check = outcome.drift_check.expect("expect_ref adds a drift check");
+        assert!(!check.refused);
+        assert!(check.drifted.is_empty());
+        assert_eq!(outcome.bytes, b"head Mails.php\n".len() as u64);
+    }
+
+    #[test]
+    fn drift_refusal_02_single_file_upload_without_drift_uploads_the_working_tree() {
+        let site = single_file_site();
+        let state = new_state();
+        state
+            .borrow_mut()
+            .seed(&remote_path("Mails.php"), &content("base", "Mails.php"));
+
+        let outcome = upload_single(&site, &state, false, Some(&site.base))
+            .expect("the upload should succeed");
+
+        let check = outcome.drift_check.expect("expect_ref adds a drift check");
+        assert!(!check.refused);
+        assert_eq!(check.checked, 1);
+        assert_eq!(outcome.bytes, b"working-tree edit\n".len() as u64);
+        let state = state.borrow();
+        assert_eq!(
+            state.remote.calls,
+            vec![
+                "TYPE I".to_string(),
+                format!("RETR {}", remote_path("Mails.php")),
+                format!("STOR {}", remote_path("Mails.php")),
+            ]
+        );
+        assert_eq!(state.connections, 1);
+    }
+
+    #[test]
+    fn drift_classification_03_single_file_download_error_uploads_nothing() {
+        let site = single_file_site();
+        let state = new_state();
+        state.borrow_mut().remote.failures.insert(
+            remote_path("Mails.php"),
+            RemoteFailure::operation("550 Failed to open file"),
+        );
+
+        let error = upload_single(&site, &state, false, Some(&site.base))
+            .expect_err("a download failure fails the upload");
+
+        assert!(
+            error.to_string().contains(&remote_path("Mails.php")),
+            "{error}"
+        );
+        assert!(state.borrow().writes().is_empty());
+    }
+
+    #[test]
+    fn single_file_expected_copy_is_found_by_the_path_inside_the_repository() {
+        let repo = TestRepo::new();
+        repo.write("app/models/Mails.php", b"base\n");
+        let base = repo.commit_all("base");
+        repo.write("app/models/Mails.php", b"edited\n");
+        let state = new_state();
+        // The server holds the base copy, so the file is clean only when the expected copy is
+        // looked up as `app/models/Mails.php`, not as the bare file name.
+        state
+            .borrow_mut()
+            .seed(&remote_path("Mails.php"), b"base\n");
+        let local = repo.path().join("app/models/Mails.php");
+        let remote = remote_path("Mails.php");
+
+        let outcome = upload_file_with(
+            &UploadFileRequest {
+                local_path: &local.display().to_string(),
+                remote_path: &remote,
+                before_changes: false,
+                expect_ref: Some(&base),
+            },
+            connector(&state),
+        )
+        .expect("the upload should succeed");
+
+        assert!(!outcome.drift_check.expect("check present").refused);
+        assert_eq!(outcome.bytes, b"edited\n".len() as u64);
     }
 }

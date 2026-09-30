@@ -3,7 +3,7 @@
 //! Each tool is a thin async wrapper that loads config, then runs blocking
 //! FTP work on a tokio blocking thread (suppaftp is sync).
 
-use crate::{branch_deploy, config::Config, deploy};
+use crate::{branch_deploy, config::Config, deploy, drift::DriftCheck};
 use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::{tool, tool_handler, tool_router, ErrorData, ServerHandler};
 use schemars::JsonSchema;
@@ -46,6 +46,11 @@ pub struct UploadFileArgs {
     /// current working-tree content. Requires the file to be inside a git repo.
     #[serde(default)]
     pub before_changes: bool,
+    /// Git ref (for example the branch or commit the server was last deployed from). When set,
+    /// the file's server copy is downloaded first, and nothing is uploaded if it differs from
+    /// both the copy at this ref and the copy being uploaded.
+    #[serde(default)]
+    pub expect_ref: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -195,8 +200,12 @@ pub struct UploadResponse {
     pub profile: String,
     pub local_path: String,
     pub remote_path: String,
+    /// The bytes uploaded. 0 when a drift check refused the upload.
     #[schemars(transform = crate::schema::remove_unsigned_integer_format)]
     pub bytes: u64,
+    /// Present only when `expect_ref` was supplied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub drift_check: Option<DriftCheck>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -349,6 +358,7 @@ impl FtpServer {
             local_path,
             remote_path,
             before_changes,
+            expect_ref,
         } = args;
         let pname = profile.clone();
         let remote_root = p.remote_root.trim_end_matches('/').to_string();
@@ -359,61 +369,22 @@ impl FtpServer {
         };
         let local_for_blocking = local_path.clone();
         let remote_for_blocking = full_remote.clone();
-        let bytes = tokio::task::spawn_blocking(move || -> anyhow::Result<u64> {
-            let content = if before_changes {
-                let local = std::path::Path::new(&local_for_blocking);
-                let parent = local.parent().unwrap_or(std::path::Path::new("."));
-                let root_out = std::process::Command::new("git")
-                    .args(["rev-parse", "--show-toplevel"])
-                    .current_dir(parent)
-                    .output()
-                    .map_err(|e| anyhow::anyhow!("git rev-parse: {e}"))?;
-                if !root_out.status.success() {
-                    return Err(anyhow::anyhow!(
-                        "not a git repo: {}",
-                        String::from_utf8_lossy(&root_out.stderr).trim()
-                    ));
-                }
-                let git_root =
-                    std::path::PathBuf::from(String::from_utf8_lossy(&root_out.stdout).trim());
-                let abs = local
-                    .canonicalize()
-                    .map_err(|e| anyhow::anyhow!("canonicalize {local_for_blocking}: {e}"))?;
-                let rel = abs.strip_prefix(&git_root).map_err(|_| {
-                    anyhow::anyhow!("file not under git root {}", git_root.display())
-                })?;
-                let rel_str = rel.to_string_lossy();
-                let show_out = std::process::Command::new("git")
-                    .args(["show", &format!("HEAD:{rel_str}")])
-                    .current_dir(&git_root)
-                    .output()
-                    .map_err(|e| anyhow::anyhow!("git show: {e}"))?;
-                if !show_out.status.success() {
-                    return Err(anyhow::anyhow!(
-                        "git show HEAD:{rel_str} failed: {}",
-                        String::from_utf8_lossy(&show_out.stderr).trim()
-                    ));
-                }
-                show_out.stdout
-            } else {
-                std::fs::read(&local_for_blocking)
-                    .map_err(|e| anyhow::anyhow!("read {local_for_blocking}: {e}"))?
-            };
-            let mut c = crate::ftp::FtpClient::connect(&pname, &p)?;
-            let written = c.put_bytes(&remote_for_blocking, &content)?;
-            c.quit();
-            Ok(written)
+        let result = tokio::task::spawn_blocking(move || {
+            deploy::upload_file(
+                &pname,
+                &p,
+                &deploy::UploadFileRequest {
+                    local_path: &local_for_blocking,
+                    remote_path: &remote_for_blocking,
+                    before_changes,
+                    expect_ref: expect_ref.as_deref(),
+                },
+            )
         })
         .await
-        .map_err(internal)?
         .map_err(internal)?;
 
-        Ok(Json(UploadResponse {
-            profile,
-            local_path,
-            remote_path: full_remote,
-            bytes,
-        }))
+        upload_response_from_result(profile, local_path, full_remote, result).map(Json)
     }
 
     #[tool(description = "Recursively deploy a local directory to the FTP \
@@ -717,6 +688,25 @@ fn invalid(msg: impl Into<String>) -> ErrorData {
     ErrorData::invalid_params(msg.into(), None)
 }
 
+fn upload_response_from_result(
+    profile: String,
+    local_path: String,
+    remote_path: String,
+    result: Result<deploy::UploadFileOutcome, deploy::DeployError>,
+) -> Result<UploadResponse, ErrorData> {
+    match result {
+        Ok(outcome) => Ok(UploadResponse {
+            profile,
+            local_path,
+            remote_path,
+            bytes: outcome.bytes,
+            drift_check: outcome.drift_check,
+        }),
+        Err(deploy::DeployError::InvalidArgs(message)) => Err(invalid(message)),
+        Err(deploy::DeployError::Other(error)) => Err(internal(error)),
+    }
+}
+
 fn deploy_plan_from_result(
     result: Result<deploy::DeployPlan, deploy::DeployError>,
 ) -> Result<Json<deploy::DeployPlan>, ErrorData> {
@@ -813,7 +803,8 @@ mod tests {
     use super::{
         branch_deploy_error, branch_deploy_manifest_from_operation, branch_deploy_manifest_output,
         deletion_manifest_from_operation, deletion_manifest_output, deploy_plan_from_result,
-        use_base64, DeleteBranchFilesArgs, DeployArgs, DeployBranchArgs, DeployCommitsArgs,
+        upload_response_from_result, use_base64, DeleteBranchFilesArgs, DeployArgs,
+        DeployBranchArgs, DeployCommitsArgs, UploadFileArgs,
     };
     use crate::branch_deploy::{
         deletion_dry_run_manifest, dry_run_manifest, BranchDeletePlan, BranchDeployError,
@@ -881,6 +872,17 @@ mod tests {
         )
         .expect("ftp_deploy_commits arguments with expect_ref should deserialize");
 
+        let upload_without: UploadFileArgs = serde_json::from_value(
+            serde_json::json!({"profile": "qa", "local_path": "a", "remote_path": "b"}),
+        )
+        .expect("ftp_upload_file arguments without expect_ref should deserialize");
+        let upload_with: UploadFileArgs = serde_json::from_value(serde_json::json!({
+            "profile": "qa", "local_path": "a", "remote_path": "b", "expect_ref": "HEAD"
+        }))
+        .expect("ftp_upload_file arguments with expect_ref should deserialize");
+
+        assert_eq!(upload_without.expect_ref, None);
+        assert_eq!(upload_with.expect_ref.as_deref(), Some("HEAD"));
         assert_eq!(without.expect_ref, None);
         assert_eq!(with.expect_ref.as_deref(), Some("base"));
         assert_eq!(commits_without.expect_ref, None);
@@ -904,6 +906,51 @@ mod tests {
         assert!(invalid.message.contains("does not resolve"), "{invalid:?}");
         assert_eq!(internal.code, ErrorCode::INTERNAL_ERROR);
         assert!(internal.message.contains("/site/a.txt"), "{internal:?}");
+    }
+
+    #[test]
+    fn upload_response_carries_the_drift_check_and_maps_errors() {
+        let refused = crate::deploy::UploadFileOutcome {
+            bytes: 0,
+            drift_check: Some(crate::drift::DriftCheck {
+                expect_ref: "HEAD".to_string(),
+                resolved_commit: "a".repeat(40),
+                checked: 1,
+                refused: true,
+                drifted: vec![crate::drift::DriftedFile {
+                    remote_path: "/home/test/Mails.php".to_string(),
+                    reason: crate::drift::DriftReason::ContentDiffers,
+                }],
+            }),
+        };
+
+        let response = upload_response_from_result(
+            "qa".to_string(),
+            "/site/Mails.php".to_string(),
+            "/home/test/Mails.php".to_string(),
+            Ok(refused),
+        )
+        .expect("a refusal is a response");
+        let value = serde_json::to_value(response).expect("response should serialize");
+
+        assert_eq!(value["bytes"], serde_json::json!(0));
+        assert_eq!(value["remote_path"], "/home/test/Mails.php");
+        assert_eq!(value["drift_check"]["refused"], serde_json::json!(true));
+        assert_eq!(
+            value["drift_check"]["drifted"][0]["reason"],
+            "content_differs"
+        );
+
+        let invalid = upload_response_from_result(
+            "qa".to_string(),
+            "a".to_string(),
+            "b".to_string(),
+            Err(crate::deploy::DeployError::InvalidArgs(
+                "expect_ref needs a Git worktree".to_string(),
+            )),
+        )
+        .expect_err("invalid arguments must be an error");
+        assert_eq!(invalid.code, ErrorCode::INVALID_PARAMS);
     }
 
     #[test]

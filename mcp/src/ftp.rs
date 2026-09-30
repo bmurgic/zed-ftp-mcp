@@ -266,6 +266,10 @@ impl DeployRemote for FtpClient {
         FtpClient::mkdir_p(self, path)
     }
 
+    fn put_bytes(&mut self, remote_path: &str, bytes: &[u8]) -> Result<u64> {
+        FtpClient::put_bytes(self, remote_path, bytes)
+    }
+
     fn put_reader<R: Read>(&mut self, remote_path: &str, reader: &mut R) -> Result<u64> {
         FtpClient::put_reader(self, remote_path, reader)
     }
@@ -410,7 +414,7 @@ mod tests {
         BranchDeployPlan, DeletePathResult, DeletePathStatus, DeployMode, MergeStatus,
         PlannedUpload, UploadStatus,
     };
-    use crate::deploy::deploy_with;
+    use crate::deploy::{deploy_with, upload_file_with, UploadFileRequest};
     use crate::drift::tests::TestRepo;
     use crate::drift::{check_drift, resolve_expect_ref, DriftReason, DriftTarget, DriftedFile};
     use std::io::{self, BufRead, BufReader, Read, Write};
@@ -1437,6 +1441,10 @@ mod tests {
             FtpClient::mkdir_p(self.0, path)
         }
 
+        fn put_bytes(&mut self, remote_path: &str, bytes: &[u8]) -> anyhow::Result<u64> {
+            FtpClient::put_bytes(self.0, remote_path, bytes)
+        }
+
         fn put_reader<R: Read>(
             &mut self,
             remote_path: &str,
@@ -1592,6 +1600,82 @@ mod tests {
             .expect("downloads precede the first upload");
         assert!(last_check_retr < first_stor_index);
         drop(commands);
+        client.quit();
+    }
+
+    #[test]
+    #[ignore]
+    fn disposable_drift_upload_file_uploads_a_matching_server_and_refuses_an_edited_one() {
+        assert_eq!(
+            std::env::var("ZED_FTP_RUN_FTP_INTEGRATION").as_deref(),
+            Ok("1"),
+            "set ZED_FTP_RUN_FTP_INTEGRATION=1 to run the disposable FTP test"
+        );
+
+        let committed = [b'h', 0, b'\r', b'\n', 0xff];
+        let edited_locally = [b'w', 0, b'\r', b'\n', 0x80];
+        let repo = TestRepo::new();
+        repo.write("Mails.php", &committed);
+        repo.commit_all("base");
+        repo.write("Mails.php", &edited_locally);
+        let local = repo.path().join("Mails.php").display().to_string();
+        // The disposable server's FTP user lives in `/home/test`.
+        let remote = "/home/test/Mails.php";
+        let (_container, mut client, commands) = disposable_branch_client("drift-upload");
+        client
+            .set_binary_mode()
+            .expect("adapter should select binary mode");
+        client
+            .upload_bytes("Mails.php", &committed)
+            .expect("adapter should seed the committed copy");
+        commands
+            .lock()
+            .expect("command log should not be poisoned")
+            .clear();
+
+        let uploaded = upload_file_with(
+            &UploadFileRequest {
+                local_path: &local,
+                remote_path: remote,
+                before_changes: false,
+                expect_ref: Some("HEAD"),
+            },
+            || Ok(BorrowedClient(&mut client)),
+        )
+        .expect("a server copy equal to HEAD is clean");
+        assert!(!uploaded.drift_check.expect("check present").refused);
+        assert_eq!(uploaded.bytes, edited_locally.len() as u64);
+        assert_eq!(
+            client.get_bytes("Mails.php").expect("file should exist"),
+            edited_locally.to_vec()
+        );
+
+        client
+            .upload_bytes("Mails.php", b"server-only edit")
+            .expect("adapter should seed the server-only edit");
+        commands
+            .lock()
+            .expect("command log should not be poisoned")
+            .clear();
+        let refused = upload_file_with(
+            &UploadFileRequest {
+                local_path: &local,
+                remote_path: remote,
+                before_changes: false,
+                expect_ref: Some("HEAD"),
+            },
+            || Ok(BorrowedClient(&mut client)),
+        )
+        .expect("a refusal is a response");
+        let check = refused.drift_check.expect("check present");
+        assert!(check.refused);
+        assert_eq!(check.drifted[0].remote_path, remote);
+        assert_eq!(refused.bytes, 0);
+        assert_eq!(write_commands(&commands), Vec::<String>::new());
+        assert_eq!(
+            client.get_bytes("Mails.php").expect("file should remain"),
+            b"server-only edit".to_vec()
+        );
         client.quit();
     }
 

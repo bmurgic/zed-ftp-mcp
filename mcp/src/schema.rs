@@ -48,6 +48,7 @@ mod tests {
             Some(65_535),
         );
         assert_integer_schema(&upload_schema, "/properties/bytes", None);
+        assert_integer_schema(&upload_schema, "/$defs/DriftCheck/properties/checked", None);
         assert_integer_schema(&download_schema, "/properties/bytes", None);
 
         assert!(
@@ -86,6 +87,7 @@ mod tests {
             local_path: "index.html".to_string(),
             remote_path: "/public/index.html".to_string(),
             bytes: 42,
+            drift_check: None,
         };
 
         assert_eq!(
