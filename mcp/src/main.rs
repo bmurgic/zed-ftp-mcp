@@ -56,7 +56,9 @@ enum Cmd {
             default_value_t = true
         )]
         verify: bool,
-        /// Return the deployment plan without accessing FTP or credentials.
+        /// Preview the deployment without uploading. In overwrite mode it accesses no FTP or
+        /// credentials. In merge mode it connects to the server to preview the merge, and
+        /// never writes.
         #[arg(long)]
         dry_run: bool,
         /// Deployment mode. overwrite uploads head blobs as they are. merge three-way merges
@@ -527,6 +529,15 @@ mod tests {
         assert!(help.contains("--mode <MODE>"));
         assert!(help.contains("merge into"));
         assert!(help.contains("uploads nothing if any file conflicts"));
+        assert!(
+            help.contains("In merge mode it connects to the server to preview the merge"),
+            "the --dry-run help must say a merge preview connects: {help}"
+        );
+        assert!(help.contains("never writes"));
+        assert!(
+            !help.contains("without accessing FTP or credentials"),
+            "the old dry-run wording is wrong for merge mode: {help}"
+        );
     }
 
     #[test]

@@ -108,7 +108,7 @@ pub struct DeployBranchArgs {
     /// Verify each uploaded file by default.
     #[serde(default = "default_verify")]
     pub verify: bool,
-    /// Return the plan without reading credentials or accessing FTP.
+    /// Preview instead of deploying. In overwrite mode, dry_run=true avoids credential and FTP access. In merge mode, dry_run=true connects to the server to preview the merge and never writes.
     #[serde(default)]
     pub dry_run: bool,
     /// `overwrite` (default) uploads head blobs as they are. `merge` three-way merges each file with its server copy.
@@ -457,7 +457,9 @@ impl FtpServer {
 
     #[tool(description = "Plan a committed Git range from an explicit worktree. \
             The plan uses exact head-commit blobs and reports removed Git paths. \
-            Set dry_run=true to avoid credential and FTP access. \
+            In overwrite mode, dry_run=true avoids credential and FTP access. \
+            In merge mode, dry_run=true connects to the server to preview the merge \
+            and never writes. \
             When the user asks to merge into a server or profile (for example \
             'merge into staging') or to preserve server-side changes, set \
             mode=\"merge\"; run with dry_run=true first to preview conflicts.")]
@@ -810,6 +812,34 @@ mod tests {
              staging') or to preserve server-side changes, set mode=\"merge\"; run with \
              dry_run=true first to preview conflicts."
         ));
+    }
+
+    #[test]
+    fn deploy_branch_docs_say_a_merge_preview_connects_but_never_writes() {
+        const PREVIEW_WORDING: &str = "In merge mode, dry_run=true connects to the server to \
+             preview the merge and never writes.";
+        let tools = super::FtpServer::tool_router().list_all();
+        let tool = tools
+            .iter()
+            .find(|tool| tool.name == "ftp_deploy_branch")
+            .expect("ftp_deploy_branch should be listed");
+        let description = tool.description.as_deref().unwrap_or_default();
+        let dry_run_doc = tool
+            .input_schema
+            .get("properties")
+            .and_then(|properties| properties.get("dry_run"))
+            .and_then(|dry_run| dry_run.get("description"))
+            .and_then(|description| description.as_str())
+            .expect("dry_run should carry a description");
+
+        assert!(description.contains(PREVIEW_WORDING), "{description}");
+        assert!(dry_run_doc.contains(PREVIEW_WORDING), "{dry_run_doc}");
+        for text in [description, dry_run_doc] {
+            assert!(
+                text.contains("In overwrite mode, dry_run=true avoids credential and FTP access."),
+                "{text}"
+            );
+        }
     }
 
     #[test]

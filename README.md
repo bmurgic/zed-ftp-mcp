@@ -91,7 +91,9 @@ Or just call the tools directly without the agent doing any reasoning:
 Use `deploy-branch` to deploy the committed files from a selected Git
 worktree. The command requires the absolute path to the exact worktree root
 and a base ref. The head ref defaults to `HEAD`. Pass `--dry-run` to preview
-the manifest without accessing saved credentials, Git blob contents, or FTP.
+the manifest. In the default overwrite mode, a dry run does not access saved
+credentials, Git blob contents, or FTP. In merge mode, a dry run connects to
+the server to preview the merge and never writes (see "Merging into a server").
 
 ```sh
 zed-ftp-mcp deploy-branch staging \
@@ -104,8 +106,8 @@ The MCP equivalent is `ftp_deploy_branch`. It accepts `profile`, `repo_root`,
 and `base_ref`, plus optional `head_ref`, `verify`, `dry_run`, and `mode`
 fields. `mode` is `overwrite` (the default) or `merge`.
 
-The dry-run manifest lists the union of paths touched by every commit in the
-range. Each surviving path uses the blob from the resolved head commit, even
+The overwrite dry-run manifest lists the union of paths touched by every
+commit in the range. Each surviving path uses the blob from the resolved head commit, even
 when the worktree is dirty or the profile's `local_root` and ignore rules point
 somewhere else. The manifest records the dirty state and reports removed Git
 paths. A reported removal never deletes a remote file.
@@ -163,8 +165,8 @@ Merge mode is all or nothing. It decides every file before it uploads
 anything. If any file conflicts or fails to download, or the connection drops
 during the decisions, zed-ftp uploads nothing. The manifest then has
 `blocked_by_conflicts: true` and `success: false`, and the CLI exits nonzero.
-Files that would have uploaded show `upload_status: not_attempted`. Each
-cause has an entry in `failures`.
+In a real run, files that would have uploaded show
+`upload_status: not_attempted`. Each cause has an entry in `failures`.
 
 For a `text_conflict`, the upload result carries `marked_text`. It holds the
 file with `<<<<<<< server`, `||||||| base`, `=======`, and `>>>>>>> head`
@@ -190,6 +192,29 @@ lines, Git treats them as one overlapping change and reports a
 `text_conflict`, even if a person would see two independent edits. A clean
 `merged` result also means only that the two edits did not overlap, not that
 the combined file is correct. Review the file after a merge.
+
+### Preview a merge
+
+Add `--dry-run` to see every file's `merge_status` before anything changes on
+the server. A merge preview connects to the server, but it never writes.
+
+```sh
+zed-ftp-mcp deploy-branch staging \
+	--repo-root /absolute/path/to/repository \
+	--base origin/main \
+	--mode merge \
+	--dry-run
+```
+
+The preview reads blob contents and saved credentials, opens one FTP session in
+binary mode, and downloads each server copy that needs a decision. It does not
+upload, create directories, verify, or delete. The manifest has `dry_run: true`
+and the same merge fields as a real run. A file that would upload shows
+`upload_status: planned`. When a file conflicts, the manifest has
+`blocked_by_conflicts: true` and `success: false`, and the CLI exits nonzero.
+The files that would have uploaded still show `planned`, so you can see what a
+real run would send once the conflict is resolved. The conflicting file shows
+`not_attempted`. Run the same command without `--dry-run` to deploy.
 
 ### Delete a reported branch path explicitly
 
@@ -234,7 +259,7 @@ exit nonzero.
 | `ftp_upload_file` | Upload one local file; `before_changes=true` uploads the last-committed (git HEAD) version instead of the working tree |
 | `ftp_deploy` | Recursive upload of the full local project, gitignore-aware, optional `dry_run` |
 | `ftp_deploy_commits` | Upload only the files changed by specific commit SHAs, optional `dry_run` |
-| `ftp_deploy_branch` | Plan a committed range from an explicit Git worktree, optional `dry_run`. `mode="merge"` merges into server-side edits |
+| `ftp_deploy_branch` | Plan a committed range from an explicit Git worktree, optional `dry_run`. `mode="merge"` merges into server-side edits, and a merge `dry_run` connects to preview without writing |
 | `ftp_delete_branch_files` | Delete exact files from a pinned branch range after explicit approval |
 | `ftp_mkdir` | Create a directory and any missing parents |
 | `ftp_delete_file` | Delete a single remote file |
