@@ -46,6 +46,27 @@ pub struct RemoteComparison {
     pub bytes_read: u64,
 }
 
+/// Whether a run deploys or only previews. A preview never writes to the server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RunKind {
+    Deploy,
+    Preview,
+}
+
+impl RunKind {
+    pub(super) fn from_dry_run(dry_run: bool) -> Self {
+        if dry_run {
+            RunKind::Preview
+        } else {
+            RunKind::Deploy
+        }
+    }
+
+    fn is_dry_run(self) -> bool {
+        self == RunKind::Preview
+    }
+}
+
 pub trait BranchRemote {
     fn set_binary_mode(&mut self) -> Result<(), RemoteFailure>;
     fn mkdir_p(&mut self, path: &str) -> Result<(), RemoteFailure>;
@@ -71,11 +92,12 @@ pub fn execute_deploy<R: BranchRemote, B: BlobSource>(
     blobs: &mut B,
     remote: &mut R,
 ) -> BranchDeployManifest {
-    let mut failures = plan.failures.clone();
     if let Err(error) = remote.set_binary_mode() {
-        return binary_mode_failure_manifest(plan, verify, failures, &error, false);
+        let failure = remote_failure("binary_mode", None, &error);
+        return nothing_transferred_manifest(plan, verify, failure, RunKind::Deploy);
     }
 
+    let mut failures = plan.failures.clone();
     let (mut uploads, sources) = match plan.mode {
         DeployMode::Overwrite => (
             uniform_results(
@@ -87,10 +109,18 @@ pub fn execute_deploy<R: BranchRemote, B: BlobSource>(
         ),
         DeployMode::Merge => {
             let phase = decide_merge(&plan, blobs, remote);
-            let uploads = merge_results(&plan, &phase, verify, blocked_report(phase.is_blocked));
+            let report = SourceReport::for_deploy(phase.is_blocked);
+            let uploads = merge_results(&plan, &phase, verify, report);
             failures.extend(phase.failures);
             if phase.is_blocked {
-                return manifest_from_execution(plan, verify, uploads, failures, true, false);
+                return manifest_from_execution(
+                    plan,
+                    verify,
+                    uploads,
+                    failures,
+                    true,
+                    RunKind::Deploy,
+                );
             }
             let sources = phase
                 .outcomes
@@ -110,7 +140,7 @@ pub fn execute_deploy<R: BranchRemote, B: BlobSource>(
         &mut uploads,
         &mut failures,
     );
-    manifest_from_execution(plan, verify, uploads, failures, false, false)
+    manifest_from_execution(plan, verify, uploads, failures, false, RunKind::Deploy)
 }
 
 /// A merge preview: binary mode, then phase 1 through the real connector, and nothing else. It
@@ -123,35 +153,44 @@ pub fn preview_merge<R: BranchRemote, B: BlobSource>(
     blobs: &mut B,
     remote: &mut R,
 ) -> BranchDeployManifest {
-    let mut failures = plan.failures.clone();
     if let Err(error) = remote.set_binary_mode() {
-        return binary_mode_failure_manifest(plan, verify, failures, &error, true);
+        let failure = remote_failure("binary_mode", None, &error);
+        return nothing_transferred_manifest(plan, verify, failure, RunKind::Preview);
     }
 
     let phase = decide_merge(&plan, blobs, remote);
     let uploads = merge_results(&plan, &phase, verify, SourceReport::Planned);
+    let mut failures = plan.failures.clone();
     failures.extend(phase.failures);
-    manifest_from_execution(plan, verify, uploads, failures, phase.is_blocked, true)
+    manifest_from_execution(
+        plan,
+        verify,
+        uploads,
+        failures,
+        phase.is_blocked,
+        RunKind::Preview,
+    )
 }
 
-/// The manifest for a run that transferred nothing because binary mode could not be selected.
-fn binary_mode_failure_manifest(
+/// The manifest for a run that transferred nothing because the connection or binary mode
+/// failed. `failure` records that cause. A merge-mode run is blocked.
+pub(super) fn nothing_transferred_manifest(
     plan: BranchDeployPlan,
     verify: bool,
-    mut failures: Vec<FailureRecord>,
-    error: &RemoteFailure,
-    is_dry_run: bool,
+    failure: FailureRecord,
+    run: RunKind,
 ) -> BranchDeployManifest {
-    failures.push(remote_failure("binary_mode", None, error));
+    let mut failures = plan.failures.clone();
+    failures.push(failure);
     let uploads = not_attempted_results(&plan, verify);
     let is_blocked = plan.mode == DeployMode::Merge;
-    manifest_from_execution(plan, verify, uploads, failures, is_blocked, is_dry_run)
+    manifest_from_execution(plan, verify, uploads, failures, is_blocked, run)
 }
 
 /// Results for a run that transferred nothing because the connection or binary mode failed.
 /// In merge mode, files that rule 1 settles are `unchanged_in_range`, and the rest are
 /// `not_decided`.
-pub(super) fn not_attempted_results(plan: &BranchDeployPlan, verify: bool) -> Vec<UploadResult> {
+fn not_attempted_results(plan: &BranchDeployPlan, verify: bool) -> Vec<UploadResult> {
     match plan.mode {
         DeployMode::Overwrite => uniform_results(
             &plan.uploads,
@@ -573,11 +612,14 @@ enum SourceReport {
     NotAttempted,
 }
 
-fn blocked_report(is_blocked: bool) -> SourceReport {
-    if is_blocked {
-        SourceReport::NotAttempted
-    } else {
-        SourceReport::Planned
+impl SourceReport {
+    /// A real run uploads nothing once phase 1 is blocked.
+    fn for_deploy(is_blocked: bool) -> Self {
+        if is_blocked {
+            SourceReport::NotAttempted
+        } else {
+            SourceReport::Planned
+        }
     }
 }
 
@@ -762,7 +804,7 @@ fn manifest_from_execution(
     uploads: Vec<UploadResult>,
     failures: Vec<FailureRecord>,
     blocked_by_conflicts: bool,
-    is_dry_run: bool,
+    run: RunKind,
 ) -> BranchDeployManifest {
     let counts = ManifestCounts {
         commits: plan.commits.len(),
@@ -787,7 +829,7 @@ fn manifest_from_execution(
         merge_rule: "first_parent".to_string(),
         mode: plan.mode,
         blocked_by_conflicts,
-        dry_run: is_dry_run,
+        dry_run: run.is_dry_run(),
         verify,
         counts,
         uploads,

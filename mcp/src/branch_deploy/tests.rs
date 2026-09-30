@@ -1,15 +1,15 @@
-use super::execute::{decide_merge_with, marked_text_for_manifest};
+use super::execute::{decide_merge_with, marked_text_for_manifest, RunKind};
 use super::git::BatchBlobReader;
 use super::git::{git_spawn_error, null_device_for_platform};
 use super::merge::{self, ConflictReason, MergeDecision};
 use super::{
     delete_branch_files_with_connector, deletion_dry_run_manifest, deploy_branch,
-    deploy_branch_with_connector, deploy_branch_with_dependencies, dry_run_manifest,
-    execute_deletion, execute_deploy, map_remote_path, plan_branch, plan_deletion, preview_merge,
-    BlobSource, BranchDeletePlan, BranchDeployError, BranchDeployPlan, BranchRemote,
-    DeleteBranchFilesRequest, DeletePathResult, DeletePathStatus, DeletedPathResult,
-    DeletedPathStatus, DeployBranchRequest, DeployMode, MergeStatus, PlannedUpload,
-    RemoteComparison, RemoteFailure, UploadStatus, UploadedFrom, VerificationStatus,
+    deploy_branch_with_connector, deploy_branch_with_dependencies, deploy_or_preview,
+    dry_run_manifest, execute_deletion, execute_deploy, map_remote_path, plan_branch,
+    plan_deletion, preview_merge, BlobSource, BranchDeletePlan, BranchDeployError,
+    BranchDeployPlan, BranchRemote, DeleteBranchFilesRequest, DeletePathResult, DeletePathStatus,
+    DeletedPathResult, DeletedPathStatus, DeployBranchRequest, DeployMode, MergeStatus,
+    PlannedUpload, RemoteComparison, RemoteFailure, UploadStatus, UploadedFrom, VerificationStatus,
 };
 use crate::config::Profile;
 use serde_json::json;
@@ -3258,6 +3258,28 @@ fn merge_dry_run_connects_and_reads_blobs_through_the_real_dependencies() {
     let tracked = result_for(&manifest, "tracked.txt");
     assert_eq!(tracked.merge_status, Some(MergeStatus::NotDecided));
     assert_eq!(tracked.upload_status, UploadStatus::NotAttempted);
+}
+
+#[test]
+fn a_connected_merge_run_previews_on_dry_run_and_deploys_otherwise() {
+    let head = merge_head();
+    let files = || {
+        vec![
+            merge_file("a.txt", Some(MERGE_BASE), &head, Some(MERGE_BASE)),
+            merge_file("b.txt", None, &head, None),
+        ]
+    };
+
+    let (plan, mut blobs, mut remote) = merge_setup(files());
+    let preview = deploy_or_preview(plan, true, RunKind::Preview, &mut blobs, &mut remote);
+    assert!(preview.dry_run);
+    assert_eq!(writes_to_server(&remote), Vec::<&RemoteCall>::new());
+
+    let (plan, mut blobs, mut remote) = merge_setup(files());
+    let deployment = deploy_or_preview(plan, true, RunKind::Deploy, &mut blobs, &mut remote);
+    assert!(!deployment.dry_run);
+    assert!(deployment.success);
+    assert_eq!(deployment.counts.uploaded, 2);
 }
 
 #[test]

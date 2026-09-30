@@ -798,13 +798,17 @@ mod tests {
     };
     use rmcp::model::ErrorCode;
 
+    fn deploy_branch_tool() -> rmcp::model::Tool {
+        super::FtpServer::tool_router()
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name == "ftp_deploy_branch")
+            .expect("ftp_deploy_branch should be listed")
+    }
+
     #[test]
     fn deploy_branch_tool_description_tells_the_agent_when_to_merge() {
-        let tools = super::FtpServer::tool_router().list_all();
-        let tool = tools
-            .iter()
-            .find(|tool| tool.name == "ftp_deploy_branch")
-            .expect("ftp_deploy_branch should be listed");
+        let tool = deploy_branch_tool();
         let description = tool.description.as_deref().unwrap_or_default();
 
         assert!(description.contains(
@@ -818,11 +822,7 @@ mod tests {
     fn deploy_branch_docs_say_a_merge_preview_connects_but_never_writes() {
         const PREVIEW_WORDING: &str = "In merge mode, dry_run=true connects to the server to \
              preview the merge and never writes.";
-        let tools = super::FtpServer::tool_router().list_all();
-        let tool = tools
-            .iter()
-            .find(|tool| tool.name == "ftp_deploy_branch")
-            .expect("ftp_deploy_branch should be listed");
+        let tool = deploy_branch_tool();
         let description = tool.description.as_deref().unwrap_or_default();
         let dry_run_doc = tool
             .input_schema

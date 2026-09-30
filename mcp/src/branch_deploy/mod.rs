@@ -6,6 +6,7 @@ mod execute;
 mod git;
 mod merge;
 
+use execute::RunKind;
 pub use execute::{
     execute_deletion, execute_deploy, preview_merge, BlobSource, BranchRemote, RemoteComparison,
     RemoteFailure, RemoteFailureKind,
@@ -428,29 +429,60 @@ where
     F: FnOnce(&str, &Profile) -> anyhow::Result<crate::ftp::FtpClient>,
 {
     let plan = plan_branch(request, profile)?;
-    if request.dry_run && plan.mode == DeployMode::Overwrite {
+    if stays_offline(request, &plan) {
         return Ok(dry_run_manifest(plan, request.verify));
     }
 
     let mut blobs = create_blob_source(std::path::Path::new(&plan.repository.root))?;
-    let mut remote = match connect(&request.profile, profile) {
-        Ok(remote) => remote,
-        Err(error) => {
-            return Ok(connection_failure_manifest(
-                plan,
-                request.verify,
-                error,
-                request.dry_run,
-            ))
+    Ok(connect_and_run(plan, request, profile, &mut blobs, connect))
+}
+
+/// An overwrite dry run reads Git metadata only: no credentials, blob content, or FTP.
+fn stays_offline(request: &DeployBranchRequest, plan: &BranchDeployPlan) -> bool {
+    request.dry_run && plan.mode == DeployMode::Overwrite
+}
+
+/// Opens the run's one FTP connection, deploys or previews over it, and closes it.
+fn connect_and_run<S, F>(
+    plan: BranchDeployPlan,
+    request: &DeployBranchRequest,
+    profile: &Profile,
+    blobs: &mut S,
+    connect: F,
+) -> BranchDeployManifest
+where
+    S: BlobSource,
+    F: FnOnce(&str, &Profile) -> anyhow::Result<crate::ftp::FtpClient>,
+{
+    let run = RunKind::from_dry_run(request.dry_run);
+    match connect(&request.profile, profile) {
+        Ok(mut remote) => {
+            let manifest = deploy_or_preview(plan, request.verify, run, blobs, &mut remote);
+            remote.quit();
+            manifest
         }
-    };
-    let manifest = if request.dry_run {
-        preview_merge(plan, request.verify, &mut blobs, &mut remote)
-    } else {
-        execute_deploy(plan, request.verify, &mut blobs, &mut remote)
-    };
-    remote.quit();
-    Ok(manifest)
+        Err(error) => {
+            let failure = FailureRecord {
+                stage: "connect".to_string(),
+                git_path: None,
+                error: error.to_string(),
+            };
+            execute::nothing_transferred_manifest(plan, request.verify, failure, run)
+        }
+    }
+}
+
+fn deploy_or_preview<R: BranchRemote, B: BlobSource>(
+    plan: BranchDeployPlan,
+    verify: bool,
+    run: RunKind,
+    blobs: &mut B,
+    remote: &mut R,
+) -> BranchDeployManifest {
+    match run {
+        RunKind::Deploy => execute_deploy(plan, verify, blobs, remote),
+        RunKind::Preview => preview_merge(plan, verify, blobs, remote),
+    }
 }
 
 pub fn delete_branch_files(
@@ -590,44 +622,6 @@ fn deletion_connection_failure_manifest(
         error: error.to_string(),
     });
     deletion_manifest(plan, paths, false, false)
-}
-
-fn connection_failure_manifest(
-    plan: BranchDeployPlan,
-    verify: bool,
-    error: anyhow::Error,
-    is_dry_run: bool,
-) -> BranchDeployManifest {
-    let uploads = execute::not_attempted_results(&plan, verify);
-    let mut failures = plan.failures;
-    failures.push(FailureRecord {
-        stage: "connect".to_string(),
-        git_path: None,
-        error: error.to_string(),
-    });
-    BranchDeployManifest {
-        success: false,
-        profile: plan.profile,
-        repository: plan.repository,
-        refs: plan.refs,
-        merge_rule: "first_parent".to_string(),
-        mode: plan.mode,
-        blocked_by_conflicts: plan.mode == DeployMode::Merge,
-        dry_run: is_dry_run,
-        verify,
-        counts: ManifestCounts {
-            commits: plan.commits.len(),
-            touched_paths: plan.touched_paths,
-            planned_uploads: uploads.len(),
-            uploaded: 0,
-            verified: 0,
-            deleted_reported: plan.deleted.len(),
-            failures: failures.len(),
-        },
-        uploads,
-        deleted: plan.deleted,
-        failures,
-    }
 }
 
 pub(crate) fn map_remote_path(
