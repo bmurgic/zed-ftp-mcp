@@ -20,7 +20,7 @@ Independent test criteria: against a disposable FTP server, `deploy-branch --mod
 - [x] 1.V **Slice verification gate**
 
 ## 2. Preview a merge without changing the server
-**Slice state:** [~] VERIFYING: QA
+**Slice state:** [x] VERIFIED
 **Depends on:** 1
 **Files:** mcp/src/branch_deploy/mod.rs, mcp/src/branch_deploy/execute.rs, mcp/src/branch_deploy/tests.rs, mcp/src/tools.rs, mcp/src/main.rs, README.md
 **Interfaces:** Consumes: `DeployMode` (enum `Overwrite` | `Merge`, serde `overwrite` | `merge`, default `Overwrite`), `execute::decide_merge<R: BranchRemote, B: BlobSource>(plan: &BranchDeployPlan, blobs: &mut B, remote: &mut R) -> MergePhase` / Produces: none
@@ -32,7 +32,7 @@ Independent test criteria: `deploy-branch --mode merge --dry-run` reports every 
 
 - [x] 2.1 Route a merge-mode dry run through the real blob source and connector: select binary mode, run `decide_merge`, and return before phase 2, with would-upload files `planned`. Prove with a recording fake that it makes no upload, mkdir, or delete call, and that an overwrite dry run makes no connector or blob call.
 - [x] 2.2 Update the dry-run wording in the CLI help, the MCP argument docs, and the README so they say that a merge preview connects to the server but never writes.
-- [ ] 2.V **Slice verification gate**
+- [x] 2.V **Slice verification gate**
 
 ## 3. Refuse to clobber drifted server files
 **Slice state:** [ ] QUEUED
