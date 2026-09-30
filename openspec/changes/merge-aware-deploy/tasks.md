@@ -35,7 +35,7 @@ Independent test criteria: `deploy-branch --mode merge --dry-run` reports every 
 - [x] 2.V **Slice verification gate**
 
 ## 3. Refuse to clobber drifted server files
-**Slice state:** [~] VERIFYING: REVIEW
+**Slice state:** [~] VERIFYING: QA
 **Depends on:** 1
 **Files:** mcp/src/drift.rs, mcp/src/deploy.rs, mcp/src/tools.rs, mcp/src/ftp.rs, mcp/src/schema.rs, README.md
 **Interfaces:** Consumes: `FtpClient::download_or_missing(&mut self, path: &str) -> Result<Option<Vec<u8>>, FtpError>` / Produces: `drift::resolve_expect_ref(repo_dir: &Path, expect_ref: &str) -> Result<ResolvedRef, DriftError>`, `drift::check_drift<R: DriftRemote>(remote: &mut R, targets: &[DriftTarget], resolved: &ResolvedRef) -> Result<DriftCheck, DriftError>`
