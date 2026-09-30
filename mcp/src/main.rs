@@ -8,6 +8,7 @@
 mod branch_deploy;
 mod config;
 mod deploy;
+mod drift;
 mod ftp;
 mod schema;
 mod tools;

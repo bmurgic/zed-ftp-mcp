@@ -6,6 +6,7 @@
 
 use crate::branch_deploy::{BranchRemote, RemoteComparison, RemoteFailure, RemoteFailureKind};
 use crate::config::{self, Profile};
+use crate::drift::DriftRemote;
 use anyhow::{Context, Result};
 use std::io::{Cursor, Read};
 use suppaftp::types::FileType;
@@ -259,6 +260,16 @@ impl BranchRemote for FtpClient {
     }
 }
 
+impl DriftRemote for FtpClient {
+    fn set_binary_mode(&mut self) -> Result<(), RemoteFailure> {
+        self.branch_set_binary_mode().map_err(map_branch_ftp_error)
+    }
+
+    fn download_bytes(&mut self, path: &str) -> Result<Option<Vec<u8>>, RemoteFailure> {
+        self.download_or_missing(path).map_err(map_branch_ftp_error)
+    }
+}
+
 fn is_file_unavailable(error: &FtpError) -> bool {
     matches!(
         error,
@@ -384,6 +395,8 @@ mod tests {
         BranchDeployPlan, DeletePathResult, DeletePathStatus, DeployMode, MergeStatus,
         PlannedUpload, UploadStatus,
     };
+    use crate::drift::tests::TestRepo;
+    use crate::drift::{check_drift, resolve_expect_ref, DriftReason, DriftTarget, DriftedFile};
     use std::io::{self, BufRead, BufReader, Read, Write};
     use std::net::AddrParseError;
     use std::net::{TcpListener, TcpStream};
@@ -772,6 +785,46 @@ mod tests {
                 "{remote_path} should list with {expected_listing_command}: {commands:?}"
             );
         }
+    }
+
+    // `DriftRemote` is called by full path: `BranchRemote` has the same method names, so
+    // importing both makes a bare call ambiguous.
+    #[test]
+    fn drift_adapter_download_follows_the_550_plus_listing_rule() {
+        let (mut client, server) = branch_client_for_download(
+            FakeAnswer::Line("550 Failed to open file."),
+            FakeAnswer::Data(b"other.txt\r\n".to_vec()),
+        );
+        let missing = crate::drift::DriftRemote::download_bytes(&mut client, "/site/dir/a.txt")
+            .expect("an absent file is not a failure");
+        assert_eq!(missing, None);
+        client.quit();
+        server.join().expect("download server should complete");
+
+        let (mut client, server) = branch_client_for_download(
+            FakeAnswer::Line("550 Failed to open file."),
+            FakeAnswer::Data(b"a.txt\r\n".to_vec()),
+        );
+        let failure = crate::drift::DriftRemote::download_bytes(&mut client, "/site/dir/a.txt")
+            .expect_err("a listed file that cannot be read is a failure");
+        assert_eq!(failure.kind, RemoteFailureKind::Operation);
+        client.quit();
+        server.join().expect("download server should complete");
+    }
+
+    #[test]
+    fn drift_adapter_reports_a_lost_connection_and_selects_binary_mode() {
+        let (mut client, server) =
+            branch_client_for_download(FakeAnswer::Drop, FakeAnswer::Line("500 unused"));
+
+        crate::drift::DriftRemote::set_binary_mode(&mut client).expect("the server accepts TYPE I");
+        let failure = crate::drift::DriftRemote::download_bytes(&mut client, "/site/dir/a.txt")
+            .expect_err("a dropped connection is a failure");
+
+        assert_eq!(failure.kind, RemoteFailureKind::ConnectionLost);
+        client.quit();
+        let commands = server.join().expect("download server should complete");
+        assert_eq!(commands.first().map(String::as_str), Some("TYPE I"));
     }
 
     enum FakeAnswer {
@@ -1245,6 +1298,107 @@ mod tests {
                 .get_bytes("preview-b.txt")
                 .expect("the conflicting file must remain"),
             conflicting_server.to_vec()
+        );
+        client.quit();
+    }
+
+    #[test]
+    #[ignore]
+    fn disposable_drift_check_classifies_server_copies_and_writes_nothing() {
+        assert_eq!(
+            std::env::var("ZED_FTP_RUN_FTP_INTEGRATION").as_deref(),
+            Ok("1"),
+            "set ZED_FTP_RUN_FTP_INTEGRATION=1 to run the disposable FTP test"
+        );
+
+        let repo = TestRepo::new();
+        for name in ["clean.bin", "upload-match.bin", "edited.bin", "gone.bin"] {
+            repo.write(name, &[b'e', 0, b'\r', b'\n', 0xff]);
+        }
+        repo.commit_all("base");
+        let resolved = resolve_expect_ref(repo.path(), "HEAD").expect("HEAD should resolve");
+        let (_container, mut client, commands) = disposable_branch_client("drift");
+        client
+            .set_binary_mode()
+            .expect("adapter should select binary mode");
+        // The pinned image fails MKD on an existing directory, so the files sit in the home directory.
+        for (name, bytes) in [
+            ("clean.bin", &[b'e', 0, b'\r', b'\n', 0xff][..]),
+            ("upload-match.bin", &[b'u', 0, 0x80][..]),
+            ("edited.bin", &[b's', 0, 0x80][..]),
+        ] {
+            client
+                .upload_bytes(name, bytes)
+                .expect("adapter should seed the server copy");
+        }
+        let targets: Vec<DriftTarget> = [
+            ("clean.bin", "clean.bin", &[b'n', 1][..]),
+            ("upload-match.bin", "upload-match.bin", &[b'u', 0, 0x80][..]),
+            ("edited.bin", "edited.bin", &[b'n', 2][..]),
+            ("gone.bin", "gone.bin", &[b'n', 3][..]),
+            ("brand-new.bin", "brand-new.bin", &[b'n', 4][..]),
+        ]
+        .into_iter()
+        .map(|(remote_path, repo_path, upload)| DriftTarget {
+            remote_path: remote_path.to_string(),
+            repo_path: repo_path.to_string(),
+            upload_bytes: upload.to_vec(),
+        })
+        .collect();
+        commands
+            .lock()
+            .expect("command log should not be poisoned")
+            .clear();
+
+        let check = check_drift(&mut client, &targets, &resolved)
+            .expect("the drift check should complete against the real adapter");
+
+        assert_eq!(check.checked, 5);
+        assert!(check.refused);
+        assert_eq!(
+            check.drifted,
+            vec![
+                DriftedFile {
+                    remote_path: "edited.bin".to_string(),
+                    reason: DriftReason::ContentDiffers,
+                },
+                DriftedFile {
+                    remote_path: "gone.bin".to_string(),
+                    reason: DriftReason::MissingOnServer,
+                },
+            ]
+        );
+        {
+            let commands = commands.lock().expect("command log should not be poisoned");
+            let type_index = commands
+                .iter()
+                .position(|command| command.starts_with("TYPE I"))
+                .expect("the drift check should select binary mode");
+            let first_retr_index = commands
+                .iter()
+                .position(|command| command.starts_with("RETR "))
+                .expect("the drift check should download server copies");
+            assert!(type_index < first_retr_index);
+            let writes: Vec<&String> = commands
+                .iter()
+                .filter(|command| {
+                    [
+                        "STOR ", "STOU", "APPE ", "MKD ", "DELE ", "RMD ", "RNFR ", "RNTO ",
+                    ]
+                    .iter()
+                    .any(|write| command.starts_with(write))
+                })
+                .collect();
+            assert!(
+                writes.is_empty(),
+                "a drift check must not write: {writes:?}"
+            );
+        }
+        assert_eq!(
+            client
+                .get_bytes("edited.bin")
+                .expect("the edited file must remain"),
+            vec![b's', 0, 0x80]
         );
         client.quit();
     }
