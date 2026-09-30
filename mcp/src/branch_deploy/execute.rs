@@ -73,10 +73,7 @@ pub fn execute_deploy<R: BranchRemote, B: BlobSource>(
 ) -> BranchDeployManifest {
     let mut failures = plan.failures.clone();
     if let Err(error) = remote.set_binary_mode() {
-        failures.push(remote_failure("binary_mode", None, &error));
-        let uploads = not_attempted_results(&plan, verify);
-        let is_blocked = plan.mode == DeployMode::Merge;
-        return manifest_from_execution(plan, verify, uploads, failures, is_blocked);
+        return binary_mode_failure_manifest(plan, verify, failures, &error, false);
     }
 
     let (mut uploads, sources) = match plan.mode {
@@ -90,10 +87,10 @@ pub fn execute_deploy<R: BranchRemote, B: BlobSource>(
         ),
         DeployMode::Merge => {
             let phase = decide_merge(&plan, blobs, remote);
-            let uploads = merge_results(&plan, &phase, verify);
+            let uploads = merge_results(&plan, &phase, verify, blocked_report(phase.is_blocked));
             failures.extend(phase.failures);
             if phase.is_blocked {
-                return manifest_from_execution(plan, verify, uploads, failures, true);
+                return manifest_from_execution(plan, verify, uploads, failures, true, false);
             }
             let sources = phase
                 .outcomes
@@ -113,7 +110,42 @@ pub fn execute_deploy<R: BranchRemote, B: BlobSource>(
         &mut uploads,
         &mut failures,
     );
-    manifest_from_execution(plan, verify, uploads, failures, false)
+    manifest_from_execution(plan, verify, uploads, failures, false, false)
+}
+
+/// A merge preview: binary mode, then phase 1 through the real connector, and nothing else. It
+/// returns before phase 2, so it never uploads, creates a directory, verifies, or deletes. A
+/// file that would upload reports `planned`, even when a blocking cause stops the real run.
+/// Call it with a merge-mode plan only.
+pub fn preview_merge<R: BranchRemote, B: BlobSource>(
+    plan: BranchDeployPlan,
+    verify: bool,
+    blobs: &mut B,
+    remote: &mut R,
+) -> BranchDeployManifest {
+    let mut failures = plan.failures.clone();
+    if let Err(error) = remote.set_binary_mode() {
+        return binary_mode_failure_manifest(plan, verify, failures, &error, true);
+    }
+
+    let phase = decide_merge(&plan, blobs, remote);
+    let uploads = merge_results(&plan, &phase, verify, SourceReport::Planned);
+    failures.extend(phase.failures);
+    manifest_from_execution(plan, verify, uploads, failures, phase.is_blocked, true)
+}
+
+/// The manifest for a run that transferred nothing because binary mode could not be selected.
+fn binary_mode_failure_manifest(
+    plan: BranchDeployPlan,
+    verify: bool,
+    mut failures: Vec<FailureRecord>,
+    error: &RemoteFailure,
+    is_dry_run: bool,
+) -> BranchDeployManifest {
+    failures.push(remote_failure("binary_mode", None, error));
+    let uploads = not_attempted_results(&plan, verify);
+    let is_blocked = plan.mode == DeployMode::Merge;
+    manifest_from_execution(plan, verify, uploads, failures, is_blocked, is_dry_run)
 }
 
 /// Results for a run that transferred nothing because the connection or binary mode failed.
@@ -131,7 +163,7 @@ pub(super) fn not_attempted_results(plan: &BranchDeployPlan, verify: bool) -> Ve
             .iter()
             .map(|upload| {
                 let outcome = FileOutcome::without_upload(status_before_download(upload));
-                merge_result(upload, &outcome, verify, true)
+                merge_result(upload, &outcome, verify, SourceReport::NotAttempted)
             })
             .collect(),
     }
@@ -532,24 +564,46 @@ fn outcome_for_decision(upload: &PlannedUpload, decision: MergeDecision) -> File
     }
 }
 
+/// How a merge-mode result reports a file that has an upload source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceReport {
+    /// The file will upload, or a preview says it would.
+    Planned,
+    /// A blocked run uploads nothing.
+    NotAttempted,
+}
+
+fn blocked_report(is_blocked: bool) -> SourceReport {
+    if is_blocked {
+        SourceReport::NotAttempted
+    } else {
+        SourceReport::Planned
+    }
+}
+
 /// The manifest results after phase 1, one per planned file.
-fn merge_results(plan: &BranchDeployPlan, phase: &MergePhase, verify: bool) -> Vec<UploadResult> {
+fn merge_results(
+    plan: &BranchDeployPlan,
+    phase: &MergePhase,
+    verify: bool,
+    report: SourceReport,
+) -> Vec<UploadResult> {
     plan.uploads
         .iter()
         .zip(&phase.outcomes)
-        .map(|(upload, outcome)| merge_result(upload, outcome, verify, phase.is_blocked))
+        .map(|(upload, outcome)| merge_result(upload, outcome, verify, report))
         .collect()
 }
 
-/// One merge-mode result, filled from its phase 1 outcome. In a blocked run every file that
-/// would upload is reported as not attempted.
+/// One merge-mode result, filled from its phase 1 outcome. A file with no upload source that
+/// still needs settling, such as a conflict or an undecided file, is never `planned`.
 fn merge_result(
     upload: &PlannedUpload,
     outcome: &FileOutcome,
     verify: bool,
-    is_blocked: bool,
+    report: SourceReport,
 ) -> UploadResult {
-    let (upload_status, verification_status) = merge_statuses(outcome.status, verify, is_blocked);
+    let (upload_status, verification_status) = merge_statuses(outcome, verify, report);
     let mut result = UploadResult::new(upload, upload_status, verification_status);
     result.merge_status = Some(outcome.status);
     if let Some(source) = &outcome.source {
@@ -562,21 +616,21 @@ fn merge_result(
 }
 
 fn merge_statuses(
-    status: MergeStatus,
+    outcome: &FileOutcome,
     verify: bool,
-    is_blocked: bool,
+    report: SourceReport,
 ) -> (UploadStatus, VerificationStatus) {
-    match status {
+    match outcome.status {
         MergeStatus::UnchangedInRange | MergeStatus::AlreadyDeployed => {
             (UploadStatus::NotNeeded, VerificationStatus::NotNeeded)
         }
-        _ if is_blocked => (
-            UploadStatus::NotAttempted,
-            VerificationStatus::not_attempted_for(verify),
-        ),
-        _ => (
+        _ if report == SourceReport::Planned && outcome.source.is_some() => (
             UploadStatus::Planned,
             VerificationStatus::planned_for(verify),
+        ),
+        _ => (
+            UploadStatus::NotAttempted,
+            VerificationStatus::not_attempted_for(verify),
         ),
     }
 }
@@ -708,6 +762,7 @@ fn manifest_from_execution(
     uploads: Vec<UploadResult>,
     failures: Vec<FailureRecord>,
     blocked_by_conflicts: bool,
+    is_dry_run: bool,
 ) -> BranchDeployManifest {
     let counts = ManifestCounts {
         commits: plan.commits.len(),
@@ -732,7 +787,7 @@ fn manifest_from_execution(
         merge_rule: "first_parent".to_string(),
         mode: plan.mode,
         blocked_by_conflicts,
-        dry_run: false,
+        dry_run: is_dry_run,
         verify,
         counts,
         uploads,

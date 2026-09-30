@@ -5,11 +5,11 @@ use super::merge::{self, ConflictReason, MergeDecision};
 use super::{
     delete_branch_files_with_connector, deletion_dry_run_manifest, deploy_branch,
     deploy_branch_with_connector, deploy_branch_with_dependencies, dry_run_manifest,
-    execute_deletion, execute_deploy, map_remote_path, plan_branch, plan_deletion, BlobSource,
-    BranchDeletePlan, BranchDeployError, BranchDeployPlan, BranchRemote, DeleteBranchFilesRequest,
-    DeletePathResult, DeletePathStatus, DeletedPathResult, DeletedPathStatus, DeployBranchRequest,
-    DeployMode, MergeStatus, PlannedUpload, RemoteComparison, RemoteFailure, UploadStatus,
-    UploadedFrom, VerificationStatus,
+    execute_deletion, execute_deploy, map_remote_path, plan_branch, plan_deletion, preview_merge,
+    BlobSource, BranchDeletePlan, BranchDeployError, BranchDeployPlan, BranchRemote,
+    DeleteBranchFilesRequest, DeletePathResult, DeletePathStatus, DeletedPathResult,
+    DeletedPathStatus, DeployBranchRequest, DeployMode, MergeStatus, PlannedUpload,
+    RemoteComparison, RemoteFailure, UploadStatus, UploadedFrom, VerificationStatus,
 };
 use crate::config::Profile;
 use serde_json::json;
@@ -3052,6 +3052,212 @@ fn deployment_succeeds() {
         assert_eq!(manifest.counts.uploaded, 1);
         assert_eq!(manifest.counts.verified, 1);
     }
+}
+
+#[test]
+fn dry_run_02_merge_preview_writes_nothing_remotely() {
+    let head = merge_head();
+    let server_other_line = merge_lines(&[(5, "line 5 server")]);
+    let merged = merge_lines(&[(2, "line 2 head"), (5, "line 5 server")]);
+    let one_file = vec![merge_file(
+        "a.txt",
+        Some(MERGE_BASE),
+        &head,
+        Some(MERGE_BASE),
+    )];
+    let three_files = vec![
+        merge_file("a.txt", Some(MERGE_BASE), &head, Some(MERGE_BASE)),
+        merge_file("b.txt", Some(MERGE_BASE), &head, Some(&server_other_line)),
+        merge_file("c.txt", None, &head, None),
+    ];
+
+    for files in [one_file, three_files] {
+        let planned_files = files.len();
+        let (plan, mut blobs, mut remote) = merge_setup(files);
+
+        let manifest = preview_merge(plan, true, &mut blobs, &mut remote);
+
+        assert_eq!(manifest.uploads.len(), planned_files);
+        for result in &manifest.uploads {
+            let status = result
+                .merge_status
+                .expect("every file in a merge preview reports a merge status");
+            assert_ne!(status, MergeStatus::NotDecided, "{}", result.git_path);
+            assert_eq!(result.upload_status, UploadStatus::Planned);
+            assert_eq!(result.verification_status, VerificationStatus::Planned);
+        }
+        assert_eq!(
+            remote.calls.first(),
+            Some(&RemoteCall::Binary),
+            "binary mode comes before any download"
+        );
+        assert_eq!(downloads_from_server(&remote).len(), planned_files);
+        assert_eq!(
+            writes_to_server(&remote),
+            Vec::<&RemoteCall>::new(),
+            "a preview never uploads, creates a directory, verifies, or deletes"
+        );
+        assert!(manifest.dry_run);
+        assert_eq!(manifest.mode, DeployMode::Merge);
+        assert!(manifest.success);
+        assert!(!manifest.blocked_by_conflicts);
+        assert_eq!(manifest.counts.uploaded, 0);
+        assert_eq!(manifest.counts.verified, 0);
+        assert_eq!(manifest.counts.planned_uploads, planned_files);
+        if planned_files == 3 {
+            assert_eq!(result_for(&manifest, "b.txt").bytes, merged.len() as u64);
+        }
+    }
+}
+
+#[test]
+fn dry_run_03_merge_preview_reports_a_conflict_without_uploading() {
+    let head = merge_head();
+    let conflicting_server = merge_lines(&[(2, "line 2 server")]);
+    let (plan, mut blobs, mut remote) = merge_setup(vec![
+        merge_file(
+            "Mails.php",
+            Some(MERGE_BASE),
+            &head,
+            Some(&conflicting_server),
+        ),
+        merge_file("a.txt", Some(MERGE_BASE), &head, Some(MERGE_BASE)),
+        merge_file("b.txt", Some(MERGE_BASE), &head, Some(MERGE_BASE)),
+    ]);
+
+    let manifest = preview_merge(plan, true, &mut blobs, &mut remote);
+
+    let conflict = result_for(&manifest, "Mails.php");
+    assert_eq!(conflict.merge_status, Some(MergeStatus::Conflict));
+    assert_eq!(conflict.conflict_reason, Some(ConflictReason::TextConflict));
+    assert_eq!(
+        conflict.upload_status,
+        UploadStatus::NotAttempted,
+        "a conflicting file would not upload"
+    );
+    for git_path in ["a.txt", "b.txt"] {
+        let clean = result_for(&manifest, git_path);
+        assert_eq!(clean.merge_status, Some(MergeStatus::FastForward));
+        assert_eq!(
+            clean.upload_status,
+            UploadStatus::Planned,
+            "{git_path} would upload if the conflict were resolved"
+        );
+    }
+    assert!(manifest.dry_run);
+    assert!(manifest.blocked_by_conflicts);
+    assert!(!manifest.success);
+    assert!(manifest.failures.iter().any(
+        |failure| failure.stage == "merge" && failure.git_path.as_deref() == Some("Mails.php")
+    ));
+    assert_eq!(writes_to_server(&remote), Vec::<&RemoteCall>::new());
+}
+
+#[test]
+fn merge_preview_binary_mode_failure_blocks_before_any_download() {
+    let head = merge_head();
+    let (plan, mut blobs, mut remote) = merge_setup(vec![
+        merge_file("a.txt", Some(&head), &head, Some(&head)),
+        merge_file("b.txt", Some(MERGE_BASE), &head, Some(MERGE_BASE)),
+    ]);
+    remote
+        .failures
+        .insert(1, RemoteFailure::operation("530 binary mode refused"));
+
+    let manifest = preview_merge(plan, true, &mut blobs, &mut remote);
+
+    assert_eq!(remote.calls, vec![RemoteCall::Binary]);
+    assert!(manifest.dry_run);
+    assert!(manifest.blocked_by_conflicts);
+    assert!(!manifest.success);
+    assert_eq!(manifest.failures[0].stage, "binary_mode");
+    let settled = result_for(&manifest, "a.txt");
+    assert_eq!(settled.merge_status, Some(MergeStatus::UnchangedInRange));
+    assert_eq!(settled.upload_status, UploadStatus::NotNeeded);
+    let undecided = result_for(&manifest, "b.txt");
+    assert_eq!(undecided.merge_status, Some(MergeStatus::NotDecided));
+    assert_eq!(undecided.upload_status, UploadStatus::NotAttempted);
+}
+
+#[test]
+fn merge_preview_connection_lost_while_downloading_leaves_later_files_undecided() {
+    let head = merge_head();
+    let (plan, mut blobs, mut remote) = merge_setup(vec![
+        merge_file("a.txt", Some(MERGE_BASE), &head, Some(MERGE_BASE)),
+        merge_file("b.txt", Some(MERGE_BASE), &head, Some(MERGE_BASE)),
+        merge_file("c.txt", Some(MERGE_BASE), &head, Some(MERGE_BASE)),
+    ]);
+    // Call 1 is binary mode, call 2 downloads a.txt, and call 3 downloads b.txt.
+    remote
+        .failures
+        .insert(3, RemoteFailure::connection_lost("connection reset"));
+
+    let manifest = preview_merge(plan, true, &mut blobs, &mut remote);
+
+    assert_eq!(
+        downloads_from_server(&remote),
+        vec!["/remote/a.txt", "/remote/b.txt"],
+        "no reconnection and no download after the loss"
+    );
+    assert_eq!(
+        result_for(&manifest, "a.txt").upload_status,
+        UploadStatus::Planned
+    );
+    for git_path in ["b.txt", "c.txt"] {
+        let result = result_for(&manifest, git_path);
+        assert_eq!(result.merge_status, Some(MergeStatus::NotDecided));
+        assert_eq!(result.upload_status, UploadStatus::NotAttempted);
+    }
+    assert!(manifest.dry_run);
+    assert!(manifest.blocked_by_conflicts);
+    assert!(!manifest.success);
+    assert_eq!(writes_to_server(&remote), Vec::<&RemoteCall>::new());
+}
+
+#[test]
+fn merge_dry_run_connects_and_reads_blobs_through_the_real_dependencies() {
+    let repository = TestRepo::new();
+    repository.write("tracked.txt", b"base");
+    repository.commit("base");
+    let base = repository.rev_parse("HEAD");
+    repository.write("tracked.txt", b"head");
+    repository.commit("head");
+    let mut request = request(
+        repository.path().to_str().expect("utf-8 path"),
+        &base,
+        "HEAD",
+    );
+    request.mode = DeployMode::Merge;
+    let blob_source_factory_calls = Cell::new(0);
+    let connector_calls = Cell::new(0);
+
+    let manifest = deploy_branch_with_dependencies(
+        &request,
+        &test_profile("/remote/root"),
+        |_| {
+            blob_source_factory_calls.set(blob_source_factory_calls.get() + 1);
+            Ok(CountingBlobSource {
+                reads: Rc::new(Cell::new(0)),
+            })
+        },
+        |profile_name, _| {
+            connector_calls.set(connector_calls.get() + 1);
+            assert_eq!(profile_name, "staging");
+            Err(anyhow::anyhow!("test connection failure"))
+        },
+    )
+    .expect("a merge preview that cannot connect still returns a manifest");
+
+    assert_eq!(blob_source_factory_calls.get(), 1);
+    assert_eq!(connector_calls.get(), 1);
+    assert!(manifest.dry_run, "a failed preview is still a dry run");
+    assert_eq!(manifest.mode, DeployMode::Merge);
+    assert!(manifest.blocked_by_conflicts);
+    assert!(!manifest.success);
+    assert_eq!(manifest.failures[0].stage, "connect");
+    let tracked = result_for(&manifest, "tracked.txt");
+    assert_eq!(tracked.merge_status, Some(MergeStatus::NotDecided));
+    assert_eq!(tracked.upload_status, UploadStatus::NotAttempted);
 }
 
 #[test]

@@ -7,8 +7,8 @@ mod git;
 mod merge;
 
 pub use execute::{
-    execute_deletion, execute_deploy, BlobSource, BranchRemote, RemoteComparison, RemoteFailure,
-    RemoteFailureKind,
+    execute_deletion, execute_deploy, preview_merge, BlobSource, BranchRemote, RemoteComparison,
+    RemoteFailure, RemoteFailureKind,
 };
 use git::BatchBlobReader;
 pub use merge::ConflictReason;
@@ -428,16 +428,27 @@ where
     F: FnOnce(&str, &Profile) -> anyhow::Result<crate::ftp::FtpClient>,
 {
     let plan = plan_branch(request, profile)?;
-    if request.dry_run {
+    if request.dry_run && plan.mode == DeployMode::Overwrite {
         return Ok(dry_run_manifest(plan, request.verify));
     }
 
     let mut blobs = create_blob_source(std::path::Path::new(&plan.repository.root))?;
     let mut remote = match connect(&request.profile, profile) {
         Ok(remote) => remote,
-        Err(error) => return Ok(connection_failure_manifest(plan, request.verify, error)),
+        Err(error) => {
+            return Ok(connection_failure_manifest(
+                plan,
+                request.verify,
+                error,
+                request.dry_run,
+            ))
+        }
     };
-    let manifest = execute_deploy(plan, request.verify, &mut blobs, &mut remote);
+    let manifest = if request.dry_run {
+        preview_merge(plan, request.verify, &mut blobs, &mut remote)
+    } else {
+        execute_deploy(plan, request.verify, &mut blobs, &mut remote)
+    };
     remote.quit();
     Ok(manifest)
 }
@@ -585,6 +596,7 @@ fn connection_failure_manifest(
     plan: BranchDeployPlan,
     verify: bool,
     error: anyhow::Error,
+    is_dry_run: bool,
 ) -> BranchDeployManifest {
     let uploads = execute::not_attempted_results(&plan, verify);
     let mut failures = plan.failures;
@@ -601,7 +613,7 @@ fn connection_failure_manifest(
         merge_rule: "first_parent".to_string(),
         mode: plan.mode,
         blocked_by_conflicts: plan.mode == DeployMode::Merge,
-        dry_run: false,
+        dry_run: is_dry_run,
         verify,
         counts: ManifestCounts {
             commits: plan.commits.len(),
