@@ -217,6 +217,56 @@ The files that would have uploaded still show `planned`, so you can see what a
 real run would send once the conflict is resolved. The conflicting file shows
 `not_attempted`. Run the same command without `--dry-run` to deploy.
 
+### Refuse to overwrite server edits
+
+`ftp_upload_file`, `ftp_deploy`, and `ftp_deploy_commits` overwrite by default.
+To stop them from replacing a file someone edited on the server, pass
+`expect_ref`. Use the branch or commit the server was last deployed from, for
+example `expect_ref="origin/main"`.
+
+For each file the tool would upload, zed-ftp downloads the server copy and
+compares it with two versions: the file at `expect_ref` and the bytes it is
+about to upload. The file is clean when the server copy equals either one. It is
+also clean when the file is missing on the server and absent at `expect_ref`.
+Otherwise the file has drifted, for one of two reasons.
+
+- `content_differs`: the server copy exists and equals neither version.
+- `missing_on_server`: the file is missing on the server but present at `expect_ref`.
+
+One drifted file refuses the whole run. The tool creates no directories and
+uploads nothing. The response carries a `drift_check` object.
+
+| Field | Meaning |
+| --- | --- |
+| `expect_ref` | The ref you passed. |
+| `resolved_commit` | The full commit ID the ref resolved to. |
+| `checked` | How many files were compared. |
+| `refused` | `true` when at least one file drifted. |
+| `drifted` | One entry per drifted file, with the full server `remote_path` (including `remote_root`) and the `reason`. |
+
+To resolve a refusal, look at each drifted file on the server, bring the edit
+into your branch, and run the tool again. To overwrite on purpose, run it again
+without `expect_ref`.
+
+Without `expect_ref` nothing changes. The tools make the same requests, upload
+the same files, and return the same fields as before, and a dry run stays
+offline. With `expect_ref`, a dry run connects and downloads to run the check,
+and still writes nothing.
+
+Some problems stop the tool before it connects. It returns an invalid-arguments
+error when `expect_ref` is empty or is not a commit, when the source directory
+is not a Git repository, when a file to upload cannot be read, or when a file's
+path at `expect_ref` is a symlink, directory, or submodule instead of a regular
+file. If a download fails for any reason other than a missing file, the tool
+returns an error that names the file and uploads nothing.
+
+The check compares raw Git blob bytes with the bytes in your working tree. A
+`core.autocrlf` setting or a clean or smudge filter (Git LFS, for example)
+makes those bytes differ even when the content is the same. The guard then
+reports `content_differs` for a file nobody edited. It fails safe. It refuses
+and never overwrites. If you hit this, upload from a checkout without the
+conversion, or deploy without `expect_ref`.
+
 ### Delete a reported branch path explicitly
 
 `deploy-branch` never deletes remote files. To delete a reported path, call the
@@ -257,9 +307,9 @@ exit nonzero.
 | `ftp_test` | Connect, log in, return PWD, disconnect |
 | `ftp_list` | List a remote directory (relative to `remote_root`) |
 | `ftp_download_file` | Download a remote file; returns UTF-8 text or base64 for binary |
-| `ftp_upload_file` | Upload one local file; `before_changes=true` uploads the last-committed (git HEAD) version instead of the working tree |
-| `ftp_deploy` | Recursive upload of the full local project, gitignore-aware, optional `dry_run` |
-| `ftp_deploy_commits` | Upload only the files changed by specific commit SHAs, optional `dry_run` |
+| `ftp_upload_file` | Upload one local file; `before_changes=true` uploads the last-committed (git HEAD) version instead of the working tree. Optional `expect_ref` refuses the upload when the server copy has drifted |
+| `ftp_deploy` | Recursive upload of the full local project, gitignore-aware, optional `dry_run`. Optional `expect_ref` refuses the whole run when a server file has drifted |
+| `ftp_deploy_commits` | Upload only the files changed by specific commit SHAs, optional `dry_run`. Optional `expect_ref` refuses the whole run when a server file has drifted |
 | `ftp_deploy_branch` | Plan a committed range from an explicit Git worktree, optional `dry_run`. `mode="merge"` merges into server-side edits, and a merge `dry_run` connects to preview without writing |
 | `ftp_delete_branch_files` | Delete exact files from a pinned branch range after explicit approval |
 | `ftp_mkdir` | Create a directory and any missing parents |

@@ -343,7 +343,10 @@ impl FtpServer {
     #[tool(description = "Upload a single local file to the FTP server. \
             Parent directories are created if missing. \
             Set before_changes=true to upload the last-committed (git HEAD) \
-            version instead of the current working-tree content.")]
+            version instead of the current working-tree content. \
+            Set expect_ref (e.g. the branch or commit the server was last \
+            deployed from) when the user asks to deploy without clobbering \
+            server-side changes.")]
     async fn ftp_upload_file(
         &self,
         Parameters(args): Parameters<UploadFileArgs>,
@@ -389,7 +392,10 @@ impl FtpServer {
 
     #[tool(description = "Recursively deploy a local directory to the FTP \
             server. Respects .gitignore and per-profile ignore patterns. \
-            Set dry_run=true to preview the file list without uploading.")]
+            Set dry_run=true to preview the file list without uploading. \
+            Set expect_ref (e.g. the branch or commit the server was last \
+            deployed from) when the user asks to deploy without clobbering \
+            server-side changes.")]
     async fn ftp_deploy(
         &self,
         Parameters(DeployArgs {
@@ -415,7 +421,10 @@ impl FtpServer {
     #[tool(description = "Upload only the files changed by the given commits. \
             Each commit SHA is resolved via `git diff-tree` against its \
             parent. Files deleted in those commits are skipped. Set \
-            dry_run=true to preview.")]
+            dry_run=true to preview. \
+            Set expect_ref (e.g. the branch or commit the server was last \
+            deployed from) when the user asks to deploy without clobbering \
+            server-side changes.")]
     async fn ftp_deploy_commits(
         &self,
         Parameters(args): Parameters<DeployCommitsArgs>,
@@ -812,12 +821,55 @@ mod tests {
     };
     use rmcp::model::ErrorCode;
 
-    fn deploy_branch_tool() -> rmcp::model::Tool {
+    fn listed_tool(name: &str) -> rmcp::model::Tool {
         super::FtpServer::tool_router()
             .list_all()
             .into_iter()
-            .find(|tool| tool.name == "ftp_deploy_branch")
-            .expect("ftp_deploy_branch should be listed")
+            .find(|tool| tool.name == name)
+            .unwrap_or_else(|| panic!("{name} should be listed"))
+    }
+
+    fn deploy_branch_tool() -> rmcp::model::Tool {
+        listed_tool("ftp_deploy_branch")
+    }
+
+    #[test]
+    fn upload_tool_descriptions_tell_the_agent_when_to_set_expect_ref() {
+        const EXPECT_REF_WORDING: &str =
+            "Set expect_ref (e.g. the branch or commit the server was \
+             last deployed from) when the user asks to deploy without clobbering server-side \
+             changes.";
+
+        for name in ["ftp_upload_file", "ftp_deploy", "ftp_deploy_commits"] {
+            let tool = listed_tool(name);
+            let description = tool.description.as_deref().unwrap_or_default();
+            let expect_ref_doc = tool
+                .input_schema
+                .get("properties")
+                .and_then(|properties| properties.get("expect_ref"))
+                .and_then(|expect_ref| expect_ref.get("description"))
+                .and_then(|description| description.as_str());
+
+            assert!(
+                description.contains(EXPECT_REF_WORDING),
+                "{name}: {description}"
+            );
+            assert!(
+                expect_ref_doc.is_some(),
+                "{name} should document expect_ref"
+            );
+        }
+        for name in ["ftp_deploy_branch", "ftp_delete_file"] {
+            let tool = listed_tool(name);
+            assert!(
+                !tool
+                    .description
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("expect_ref"),
+                "{name} has no drift guard"
+            );
+        }
     }
 
     #[test]
