@@ -35,7 +35,7 @@ Independent test criteria: `deploy-branch --mode merge --dry-run` reports every 
 - [x] 2.V **Slice verification gate**
 
 ## 3. Refuse to clobber drifted server files
-**Slice state:** [ ] QUEUED
+**Slice state:** [~] VERIFYING: REVIEW
 **Depends on:** 1
 **Files:** mcp/src/drift.rs, mcp/src/deploy.rs, mcp/src/tools.rs, mcp/src/ftp.rs, mcp/src/schema.rs, README.md
 **Interfaces:** Consumes: `FtpClient::download_or_missing(&mut self, path: &str) -> Result<Option<Vec<u8>>, FtpError>` / Produces: `drift::resolve_expect_ref(repo_dir: &Path, expect_ref: &str) -> Result<ResolvedRef, DriftError>`, `drift::check_drift<R: DriftRemote>(remote: &mut R, targets: &[DriftTarget], resolved: &ResolvedRef) -> Result<DriftCheck, DriftError>`
@@ -45,8 +45,8 @@ Independent test criteria: `deploy-branch --mode merge --dry-run` reports every 
 
 Independent test criteria: with `expect_ref` set, `ftp_deploy`, `ftp_deploy_commits`, and `ftp_upload_file` refuse the whole run and name the drifted files, while creating no directory. Without `expect_ref`, all three behave exactly as before.
 
-- [ ] 3.1 Add `drift.rs`: `resolve_expect_ref` (peeled `^{commit}`), expected-copy lookup through `ls-tree` and `cat-file`, `DriftRemote` (binary mode plus `download_bytes` through `download_or_missing`), `check_drift`, and the `DriftCheck` result shape, all tested with a fake remote and temp repositories.
-- [ ] 3.2 Wire `expect_ref` into `ftp_deploy` and `ftp_deploy_commits`: target files, a routable invalid-args error, the check before mkdir, the refused counts, and the online dry run. Add `drift_check` to `DeployPlan`.
-- [ ] 3.3 Wire `expect_ref` into `ftp_upload_file`, including `before_changes` upload bytes, and add `drift_check` to `UploadResponse`.
-- [ ] 3.4 Update the three tool descriptions per D9, and add the `expect_ref` subsection and the autocrlf caveat to the README.
+- [x] 3.1 Add `drift.rs`: `resolve_expect_ref` (peeled `^{commit}`), expected-copy lookup through `ls-tree` and `cat-file`, `DriftRemote` (binary mode plus `download_bytes` through `download_or_missing`), `check_drift`, and the `DriftCheck` result shape, all tested with a fake remote and temp repositories.
+- [x] 3.2 Wire `expect_ref` into `ftp_deploy` and `ftp_deploy_commits`: target files, a routable invalid-args error, the check before mkdir, the refused counts, and the online dry run. Add `drift_check` to `DeployPlan`.
+- [x] 3.3 Wire `expect_ref` into `ftp_upload_file`, including `before_changes` upload bytes, and add `drift_check` to `UploadResponse`.
+- [x] 3.4 Update the three tool descriptions per D9, and add the `expect_ref` subsection and the autocrlf caveat to the README.
 - [ ] 3.V **Slice verification gate**
