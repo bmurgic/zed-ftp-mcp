@@ -3633,7 +3633,12 @@ impl TestRepo {
         let mut command = Command::new("git");
         command.arg("-C").arg(self.path());
         if arguments.first() == Some(&"commit") {
-            command.args(["-c", "core.hooksPath=/dev/null"]);
+            command.args([
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "commit.gpgsign=false",
+            ]);
         }
         command
             .args(arguments)

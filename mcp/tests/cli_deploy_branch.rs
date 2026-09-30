@@ -13,6 +13,8 @@ fn git(repo: &Path, arguments: &[&str]) {
             "user.name=cli",
             "-c",
             "user.email=cli@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
         ])
         .args(arguments)
         .status()
