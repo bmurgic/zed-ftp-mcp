@@ -1,7 +1,7 @@
 Every slice obeys design.md `## Global constraints`. Every scenario runs with in-memory fakes of `BranchRemote`, `BlobSource`, or `DriftRemote` wherever the scenario does not need a real server. Each FTP-adapter behavior (550 plus listing, binary mode) also gets a disposable Docker FTP test, following the existing ignored `ftp::tests::disposable_*` pattern.
 
 ## 1. Merge a branch into a server
-**Slice state:** [~] VERIFYING: REFINER
+**Slice state:** [x] VERIFIED
 **Depends on:** none
 **Files:** mcp/src/branch_deploy/mod.rs, mcp/src/branch_deploy/merge.rs, mcp/src/branch_deploy/execute.rs, mcp/src/branch_deploy/git.rs, mcp/src/branch_deploy/tests.rs, mcp/src/ftp.rs, mcp/src/tools.rs, mcp/src/main.rs, mcp/src/schema.rs, README.md
 **Interfaces:** Consumes: none / Produces: `DeployMode` (enum `Overwrite` | `Merge`, serde `overwrite` | `merge`, default `Overwrite`), `DeployBranchRequest.mode: DeployMode`, `PlannedUpload.base_object_id: Option<String>`, `merge::decide(base: Option<&[u8]>, head: &[u8], server: Option<&[u8]>) -> Result<MergeDecision, BranchDeployError>`, `BranchRemote::download_bytes(&mut self, path: &str) -> Result<Option<Vec<u8>>, RemoteFailure>`, `FtpClient::download_or_missing(&mut self, path: &str) -> Result<Option<Vec<u8>>, FtpError>`, `execute::decide_merge<R: BranchRemote, B: BlobSource>(plan: &BranchDeployPlan, blobs: &mut B, remote: &mut R) -> MergePhase`
@@ -17,7 +17,7 @@ Independent test criteria: against a disposable FTP server, `deploy-branch --mod
 - [x] 1.4 Add `FtpClient::download_or_missing` (550 plus `NLST` parent check) and `BranchRemote::download_bytes`. Cover both with adapter tests and a disposable FTP test.
 - [x] 1.5 Add `execute::decide_merge` (phase 1), plus the all-or-nothing blocking, failure records, `not_decided`, and `not_needed` statuses. Then run phase 2, which uploads the chosen bytes, verifies them against the chosen bytes, and fills the manifest fields (`merge_status`, `uploaded_from`, `conflict_reason`, lossy and truncated `marked_text`).
 - [x] 1.6 Update the `ftp_deploy_branch` and CLI help text and descriptions per D9, and add the README section "Merging into a server".
-- [ ] 1.V **Slice verification gate**
+- [x] 1.V **Slice verification gate**
 
 ## 2. Preview a merge without changing the server
 **Slice state:** [ ] QUEUED
