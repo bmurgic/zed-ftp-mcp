@@ -3,8 +3,10 @@
 //! Strategy:
 //!   1. Build a file list (full walk, or `git diff-tree` for commit-scoped).
 //!   2. For each file, compute its remote path: `remote_root / rel`.
-//!   3. Pre-create the unique set of parent directories on the server.
-//!   4. Upload each file via `STOR`.
+//!   3. With `expect_ref`, download each file's server copy and refuse the whole run when any
+//!      file drifted (see `drift`).
+//!   4. Pre-create the unique set of parent directories on the server.
+//!   5. Upload each file via `STOR`.
 //!
 //! Returns a structured summary so the agent can show what happened (or
 //! what would have happened, in `dry_run` mode).
@@ -219,48 +221,49 @@ pub(crate) fn upload_file_with<R: DeployRemote>(
     connect: impl FnOnce() -> Result<R>,
 ) -> std::result::Result<UploadFileOutcome, DeployError> {
     let Some(expect_ref) = request.expect_ref else {
-        let content = if request.before_changes {
-            committed_content(request.local_path)?
-        } else {
-            std::fs::read(request.local_path)
-                .map_err(|e| anyhow::anyhow!("read {}: {e}", request.local_path))?
-        };
-        let mut client = connect()?;
-        let written = client.put_bytes(request.remote_path, &content)?;
-        client.quit();
-        return Ok(UploadFileOutcome {
-            bytes: written,
-            drift_check: None,
-        });
+        return upload_unguarded(request, connect);
     };
+    let guard = DriftGuard::for_single_file(request, expect_ref)?;
+    upload_guarded(request, &guard, connect)
+}
 
-    let local = Path::new(request.local_path).canonicalize().map_err(|e| {
-        DeployError::InvalidArgs(format!("cannot read {}: {e}", request.local_path))
-    })?;
-    let repo_dir = local
-        .parent()
-        .ok_or_else(|| DeployError::InvalidArgs(format!("{} has no directory", local.display())))?;
-    let resolved = drift::resolve_expect_ref(repo_dir, expect_ref)?;
-    let upload_bytes = if request.before_changes {
-        committed_content(request.local_path)?
-    } else {
-        std::fs::read(&local).map_err(|e| {
-            DeployError::InvalidArgs(format!("cannot read {}: {e}", request.local_path))
-        })?
-    };
-    let targets = [DriftTarget {
-        remote_path: request.remote_path.to_string(),
-        repo_path: drift::repo_relative_path(&resolved, &local)?,
-        upload_bytes,
-    }];
-    drift::validate_expected_paths(&resolved, &targets)?;
-
+/// The upload as it ran before `expect_ref` existed: no download, and every failure is internal.
+fn upload_unguarded<R: DeployRemote>(
+    request: &UploadFileRequest,
+    connect: impl FnOnce() -> Result<R>,
+) -> std::result::Result<UploadFileOutcome, DeployError> {
+    let content = unguarded_upload_bytes(request)?;
     let mut client = connect()?;
-    let check = drift::check_drift(&mut client, &targets, &resolved)?;
+    let written = client.put_bytes(request.remote_path, &content)?;
+    client.quit();
+    Ok(UploadFileOutcome {
+        bytes: written,
+        drift_check: None,
+    })
+}
+
+fn unguarded_upload_bytes(request: &UploadFileRequest) -> Result<Vec<u8>> {
+    if request.before_changes {
+        committed_content(request.local_path)
+    } else {
+        std::fs::read(request.local_path)
+            .map_err(|e| anyhow::anyhow!("read {}: {e}", request.local_path))
+    }
+}
+
+/// Checks the one target on the run's connection, and uploads the compared bytes only when the
+/// server copy has not drifted.
+fn upload_guarded<R: DeployRemote>(
+    request: &UploadFileRequest,
+    guard: &DriftGuard,
+    connect: impl FnOnce() -> Result<R>,
+) -> std::result::Result<UploadFileOutcome, DeployError> {
+    let mut client = connect()?;
+    let check = guard.check_on(&mut client)?;
     let written = if check.refused {
         0
     } else {
-        client.put_bytes(request.remote_path, &targets[0].upload_bytes)?
+        client.put_bytes(request.remote_path, &guard.targets[0].upload_bytes)?
     };
     client.quit();
     Ok(UploadFileOutcome {
@@ -272,10 +275,20 @@ pub(crate) fn upload_file_with<R: DeployRemote>(
 /// The file's content at git HEAD, found through the repository that contains it.
 fn committed_content(local_path: &str) -> Result<Vec<u8>> {
     let local = Path::new(local_path);
-    let parent = local.parent().unwrap_or(Path::new("."));
+    let git_root = git_toplevel(local.parent().unwrap_or(Path::new(".")))?;
+    let abs = local
+        .canonicalize()
+        .map_err(|e| anyhow::anyhow!("canonicalize {local_path}: {e}"))?;
+    let rel = abs
+        .strip_prefix(&git_root)
+        .map_err(|_| anyhow::anyhow!("file not under git root {}", git_root.display()))?;
+    head_version(&git_root, &rel.to_string_lossy())
+}
+
+fn git_toplevel(directory: &Path) -> Result<PathBuf> {
     let root_out = Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
-        .current_dir(parent)
+        .current_dir(directory)
         .output()
         .map_err(|e| anyhow::anyhow!("git rev-parse: {e}"))?;
     if !root_out.status.success() {
@@ -284,17 +297,16 @@ fn committed_content(local_path: &str) -> Result<Vec<u8>> {
             String::from_utf8_lossy(&root_out.stderr).trim()
         ));
     }
-    let git_root = PathBuf::from(String::from_utf8_lossy(&root_out.stdout).trim());
-    let abs = local
-        .canonicalize()
-        .map_err(|e| anyhow::anyhow!("canonicalize {local_path}: {e}"))?;
-    let rel = abs
-        .strip_prefix(&git_root)
-        .map_err(|_| anyhow::anyhow!("file not under git root {}", git_root.display()))?;
-    let rel_str = rel.to_string_lossy();
+    Ok(PathBuf::from(
+        String::from_utf8_lossy(&root_out.stdout).trim(),
+    ))
+}
+
+/// The content of `rel_str` at HEAD in the repository at `git_root`.
+fn head_version(git_root: &Path, rel_str: &str) -> Result<Vec<u8>> {
     let show_out = Command::new("git")
         .args(["show", &format!("HEAD:{rel_str}")])
-        .current_dir(&git_root)
+        .current_dir(git_root)
         .output()
         .map_err(|e| anyhow::anyhow!("git show: {e}"))?;
     if !show_out.status.success() {
@@ -379,41 +391,13 @@ pub(crate) fn upload_files<R: DeployRemote>(
     expect_ref: Option<&str>,
 ) -> std::result::Result<DeployPlan, DeployError> {
     let remote_root = profile.remote_root.trim_end_matches('/').to_string();
-    let mut parents: BTreeSet<String> = BTreeSet::new();
-    let mut planned: Vec<(PathBuf, String, u64)> = Vec::with_capacity(files.len());
-
-    for path in &files {
-        let rel = path.strip_prefix(local_root).with_context(|| {
-            format!(
-                "file {} is not under local_root {}",
-                path.display(),
-                local_root.display()
-            )
-        })?;
-        let rel_str = path_to_posix(rel);
-        let remote = if remote_root.is_empty() {
-            format!("/{rel_str}")
-        } else {
-            format!("{remote_root}/{rel_str}")
-        };
-        if let Some(idx) = remote.rfind('/') {
-            let parent = &remote[..idx];
-            if !parent.is_empty() {
-                parents.insert(parent.to_string());
-            }
-        }
-        let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-        planned.push((path.clone(), remote, bytes));
-    }
-
-    let guard = expect_ref
-        .map(|expect_ref| DriftGuard::prepare(local_root, expect_ref, &planned))
-        .transpose()?;
+    let (planned, parents) = plan_uploads(local_root, &remote_root, &files)?;
+    let guard = DriftGuard::for_planned_files_if_requested(local_root, expect_ref, &planned)?;
 
     let mut plan = DeployPlan {
         profile: profile_name.to_string(),
         local_root: local_root.display().to_string(),
-        remote_root: remote_root.clone(),
+        remote_root,
         dry_run,
         files_uploaded: 0,
         bytes_uploaded: 0,
@@ -423,126 +407,337 @@ pub(crate) fn upload_files<R: DeployRemote>(
         drift_check: None,
     };
 
-    if dry_run {
-        if let Some(guard) = &guard {
-            plan.drift_check = Some(guard.check_in_a_new_session(connect)?);
-        }
-        plan.uploaded = planned
-            .into_iter()
-            .map(|(local, remote, bytes)| UploadedFile {
-                local: local.display().to_string(),
-                remote,
-                bytes,
-            })
-            .collect();
-        plan.files_uploaded = plan.uploaded.len();
-        plan.bytes_uploaded = plan.uploaded.iter().map(|f| f.bytes).sum();
-        return Ok(plan);
-    }
-
     // No files survived filtering — skip the network round trip entirely.
     if planned.is_empty() {
-        plan.drift_check = guard.map(|guard| DriftCheck::without_targets(&guard.resolved));
+        plan.drift_check = guard.as_ref().map(DriftGuard::without_targets);
         return Ok(plan);
     }
 
-    let mut client = connect()?;
+    if dry_run {
+        return list_dry_run(plan, planned, guard.as_ref(), connect);
+    }
+    upload_planned(plan, planned, &parents, guard.as_ref(), connect)
+}
 
-    if let Some(guard) = &guard {
-        let check = drift::check_drift(&mut client, &guard.targets, &guard.resolved)?;
-        let is_refused = check.refused;
-        plan.drift_check = Some(check);
-        if is_refused {
-            // A refused run uploads nothing and creates nothing, so no directory counts.
-            plan.directories_created = 0;
-            client.quit();
-            return Ok(plan);
+/// One file the run would upload.
+struct PlannedFile {
+    local: PathBuf,
+    /// The full server path, including the profile's remote root.
+    remote: String,
+    /// The file's size on disk when the run was planned.
+    bytes: u64,
+}
+
+/// Maps each file to its server path and collects the server directories the run must create.
+fn plan_uploads(
+    local_root: &Path,
+    remote_root: &str,
+    files: &[PathBuf],
+) -> Result<(Vec<PlannedFile>, BTreeSet<String>)> {
+    let mut parents: BTreeSet<String> = BTreeSet::new();
+    let mut planned = Vec::with_capacity(files.len());
+    for path in files {
+        let rel = path.strip_prefix(local_root).with_context(|| {
+            format!(
+                "file {} is not under local_root {}",
+                path.display(),
+                local_root.display()
+            )
+        })?;
+        let remote = remote_path_under(remote_root, &path_to_posix(rel));
+        if let Some(parent) = remote_parent(&remote) {
+            parents.insert(parent.to_string());
         }
-    }
-
-    // Create the deepest parents — mkdir_p handles intermediates and ignores
-    // "already exists" so duplicates are cheap.
-    for parent in &parents {
-        client.mkdir_p(parent)?;
-    }
-
-    for (index, (local, remote, _expected_bytes)) in planned.into_iter().enumerate() {
-        // With a drift check, the bytes were read once for the check, and the upload reuses them.
-        let written = match &guard {
-            Some(guard) => {
-                let mut source = Cursor::new(guard.targets[index].upload_bytes.as_slice());
-                client
-                    .put_reader(&remote, &mut source)
-                    .with_context(|| format!("uploading {} -> {}", local.display(), remote))?
-            }
-            None => match File::open(&local) {
-                Ok(mut f) => client
-                    .put_reader(&remote, &mut f)
-                    .with_context(|| format!("uploading {} -> {}", local.display(), remote))?,
-                Err(e) => {
-                    plan.skipped.push(format!("{}: {e}", local.display()));
-                    continue;
-                }
-            },
-        };
-        plan.uploaded.push(UploadedFile {
-            local: local.display().to_string(),
+        let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        planned.push(PlannedFile {
+            local: path.clone(),
             remote,
-            bytes: written,
+            bytes,
         });
-        plan.files_uploaded += 1;
-        plan.bytes_uploaded += written;
     }
+    Ok((planned, parents))
+}
 
+fn remote_path_under(remote_root: &str, relative: &str) -> String {
+    if remote_root.is_empty() {
+        format!("/{relative}")
+    } else {
+        format!("{remote_root}/{relative}")
+    }
+}
+
+/// The directory that holds `remote`, or `None` for a file directly under `/`.
+fn remote_parent(remote: &str) -> Option<&str> {
+    let index = remote.rfind('/')?;
+    let parent = &remote[..index];
+    if parent.is_empty() {
+        None
+    } else {
+        Some(parent)
+    }
+}
+
+/// A dry run lists every planned file and never writes. With a guard, it connects only to check
+/// drift.
+fn list_dry_run<R: DeployRemote>(
+    mut plan: DeployPlan,
+    planned: Vec<PlannedFile>,
+    guard: Option<&DriftGuard>,
+    connect: impl FnOnce() -> Result<R>,
+) -> std::result::Result<DeployPlan, DeployError> {
+    if let Some(guard) = guard {
+        plan.drift_check = Some(guard.check_in_a_new_session(connect)?);
+    }
+    plan.uploaded = planned
+        .into_iter()
+        .map(|file| UploadedFile {
+            local: file.local.display().to_string(),
+            remote: file.remote,
+            bytes: file.bytes,
+        })
+        .collect();
+    plan.files_uploaded = plan.uploaded.len();
+    plan.bytes_uploaded = plan.uploaded.iter().map(|f| f.bytes).sum();
+    Ok(plan)
+}
+
+/// An actual run on one connection: the drift check first, then the directories, then the files.
+fn upload_planned<R: DeployRemote>(
+    mut plan: DeployPlan,
+    planned: Vec<PlannedFile>,
+    parents: &BTreeSet<String>,
+    guard: Option<&DriftGuard>,
+    connect: impl FnOnce() -> Result<R>,
+) -> std::result::Result<DeployPlan, DeployError> {
+    let mut client = connect()?;
+    if is_refused_by_drift(&mut client, guard, &mut plan)? {
+        // A refused run uploads nothing and creates nothing, so no directory counts.
+        plan.directories_created = 0;
+        client.quit();
+        return Ok(plan);
+    }
+    create_directories(&mut client, parents)?;
+    upload_each(&mut client, &mut plan, planned, guard)?;
     client.quit();
     Ok(plan)
 }
 
+/// Runs the guard's check on the run's connection and records its result in `plan`. Without a
+/// guard, nothing is checked and the run is not refused.
+fn is_refused_by_drift<R: DriftRemote>(
+    client: &mut R,
+    guard: Option<&DriftGuard>,
+    plan: &mut DeployPlan,
+) -> std::result::Result<bool, DeployError> {
+    let Some(guard) = guard else {
+        return Ok(false);
+    };
+    let check = guard.check_on(client)?;
+    let is_refused = check.refused;
+    plan.drift_check = Some(check);
+    Ok(is_refused)
+}
+
+/// Creates the deepest parents. `mkdir_p` handles intermediates and ignores "already exists", so
+/// duplicates are cheap.
+fn create_directories<R: DeployRemote>(client: &mut R, parents: &BTreeSet<String>) -> Result<()> {
+    for parent in parents {
+        client.mkdir_p(parent)?;
+    }
+    Ok(())
+}
+
+fn upload_each<R: DeployRemote>(
+    client: &mut R,
+    plan: &mut DeployPlan,
+    planned: Vec<PlannedFile>,
+    guard: Option<&DriftGuard>,
+) -> Result<()> {
+    match guard {
+        Some(guard) => upload_checked_bytes(client, plan, planned, &guard.targets),
+        None => upload_from_disk(client, plan, planned),
+    }
+}
+
+/// The drift check read each file once, and the upload sends exactly the bytes it compared.
+fn upload_checked_bytes<R: DeployRemote>(
+    client: &mut R,
+    plan: &mut DeployPlan,
+    planned: Vec<PlannedFile>,
+    targets: &[DriftTarget],
+) -> Result<()> {
+    for (file, target) in planned.into_iter().zip(targets) {
+        let mut source = Cursor::new(target.upload_bytes.as_slice());
+        let written = put_planned_file(client, &file, &mut source)?;
+        record_upload(plan, file, written);
+    }
+    Ok(())
+}
+
+/// Streams each file from disk. A file that cannot be opened is skipped.
+fn upload_from_disk<R: DeployRemote>(
+    client: &mut R,
+    plan: &mut DeployPlan,
+    planned: Vec<PlannedFile>,
+) -> Result<()> {
+    for file in planned {
+        match File::open(&file.local) {
+            Ok(mut source) => {
+                let written = put_planned_file(client, &file, &mut source)?;
+                record_upload(plan, file, written);
+            }
+            Err(e) => plan.skipped.push(format!("{}: {e}", file.local.display())),
+        }
+    }
+    Ok(())
+}
+
+fn put_planned_file<R: DeployRemote, S: Read>(
+    client: &mut R,
+    file: &PlannedFile,
+    source: &mut S,
+) -> Result<u64> {
+    client
+        .put_reader(&file.remote, source)
+        .with_context(|| format!("uploading {} -> {}", file.local.display(), file.remote))
+}
+
+fn record_upload(plan: &mut DeployPlan, file: PlannedFile, written: u64) {
+    plan.uploaded.push(UploadedFile {
+        local: file.local.display().to_string(),
+        remote: file.remote,
+        bytes: written,
+    });
+    plan.files_uploaded += 1;
+    plan.bytes_uploaded += written;
+}
+
 /// What `expect_ref` needs before the run may connect: the resolved commit, and every target with
-/// its upload bytes read once.
+/// its upload bytes read once. Building one raises every failure the caller can fix as
+/// `InvalidArgs`, and none of them opens a connection.
 struct DriftGuard {
     resolved: ResolvedRef,
     targets: Vec<DriftTarget>,
 }
 
 impl DriftGuard {
-    /// Resolves the ref, reads every target's local bytes, and rejects a target whose path at
-    /// the ref is not a regular file. Every failure is `InvalidArgs`, and none opens a connection.
-    fn prepare(
+    fn for_planned_files_if_requested(
+        local_root: &Path,
+        expect_ref: Option<&str>,
+        planned: &[PlannedFile],
+    ) -> std::result::Result<Option<Self>, DeployError> {
+        expect_ref
+            .map(|expect_ref| Self::for_planned_files(local_root, expect_ref, planned))
+            .transpose()
+    }
+
+    /// Resolves the ref from `local_root` and reads every planned file's local bytes.
+    fn for_planned_files(
         local_root: &Path,
         expect_ref: &str,
-        planned: &[(PathBuf, String, u64)],
+        planned: &[PlannedFile],
     ) -> std::result::Result<Self, DeployError> {
         let resolved = drift::resolve_expect_ref(local_root, expect_ref)?;
-        let mut targets = Vec::with_capacity(planned.len());
-        for (local, remote, _planned_bytes) in planned {
-            let upload_bytes = std::fs::read(local).map_err(|error| {
-                DeployError::InvalidArgs(format!("cannot read {}: {error}", local.display()))
-            })?;
-            targets.push(DriftTarget {
-                remote_path: remote.clone(),
-                repo_path: drift::repo_relative_path(&resolved, local)?,
-                upload_bytes,
-            });
-        }
+        let targets = planned
+            .iter()
+            .map(|file| planned_file_target(&resolved, file))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Self::validated(resolved, targets)
+    }
+
+    /// Resolves the ref from the file's directory and reads the bytes the upload would send.
+    fn for_single_file(
+        request: &UploadFileRequest,
+        expect_ref: &str,
+    ) -> std::result::Result<Self, DeployError> {
+        let local = Path::new(request.local_path)
+            .canonicalize()
+            .map_err(|e| cannot_read(request.local_path, e))?;
+        let repo_dir = containing_directory(&local)?;
+        let resolved = drift::resolve_expect_ref(repo_dir, expect_ref)?;
+        let target = single_file_target(request, &resolved, &local)?;
+        Self::validated(resolved, vec![target])
+    }
+
+    /// Rejects a target whose path at the ref is not a regular file.
+    fn validated(
+        resolved: ResolvedRef,
+        targets: Vec<DriftTarget>,
+    ) -> std::result::Result<Self, DeployError> {
         drift::validate_expected_paths(&resolved, &targets)?;
         Ok(Self { resolved, targets })
     }
 
+    fn check_on<R: DriftRemote>(
+        &self,
+        client: &mut R,
+    ) -> std::result::Result<DriftCheck, DeployError> {
+        Ok(drift::check_drift(client, &self.targets, &self.resolved)?)
+    }
+
     /// Runs the check for a dry run: it connects, downloads, and disconnects, and never writes.
-    /// With no targets there is nothing to download, so it does not connect.
     fn check_in_a_new_session<R: DeployRemote>(
         &self,
         connect: impl FnOnce() -> Result<R>,
     ) -> std::result::Result<DriftCheck, DeployError> {
-        if self.targets.is_empty() {
-            return Ok(DriftCheck::without_targets(&self.resolved));
-        }
         let mut client = connect()?;
-        let check = drift::check_drift(&mut client, &self.targets, &self.resolved)?;
+        let check = self.check_on(&mut client)?;
         client.quit();
         Ok(check)
     }
+
+    /// The result for a run with no target files, which has nothing to download.
+    fn without_targets(&self) -> DriftCheck {
+        DriftCheck::without_targets(&self.resolved)
+    }
+}
+
+fn planned_file_target(
+    resolved: &ResolvedRef,
+    file: &PlannedFile,
+) -> std::result::Result<DriftTarget, DeployError> {
+    let upload_bytes =
+        std::fs::read(&file.local).map_err(|e| cannot_read(file.local.display(), e))?;
+    Ok(DriftTarget {
+        remote_path: file.remote.clone(),
+        repo_path: drift::repo_relative_path(resolved, &file.local)?,
+        upload_bytes,
+    })
+}
+
+fn single_file_target(
+    request: &UploadFileRequest,
+    resolved: &ResolvedRef,
+    local: &Path,
+) -> std::result::Result<DriftTarget, DeployError> {
+    let upload_bytes = guarded_upload_bytes(request, local)?;
+    Ok(DriftTarget {
+        remote_path: request.remote_path.to_string(),
+        repo_path: drift::repo_relative_path(resolved, local)?,
+        upload_bytes,
+    })
+}
+
+/// With a guard, an unreadable working-tree file is a mistake the caller can fix.
+fn guarded_upload_bytes(
+    request: &UploadFileRequest,
+    local: &Path,
+) -> std::result::Result<Vec<u8>, DeployError> {
+    if request.before_changes {
+        Ok(committed_content(request.local_path)?)
+    } else {
+        std::fs::read(local).map_err(|e| cannot_read(request.local_path, e))
+    }
+}
+
+fn containing_directory(local: &Path) -> std::result::Result<&Path, DeployError> {
+    local
+        .parent()
+        .ok_or_else(|| DeployError::InvalidArgs(format!("{} has no directory", local.display())))
+}
+
+fn cannot_read(path: impl std::fmt::Display, error: std::io::Error) -> DeployError {
+    DeployError::InvalidArgs(format!("cannot read {path}: {error}"))
 }
 
 fn walk_files(root: &Path, extra_ignore: &[String]) -> Result<Vec<PathBuf>> {
@@ -727,16 +922,21 @@ mod tests {
             repo.write(name, &content("head", name));
         }
         let head = repo.commit_all("head");
-        let profile = profile_for(repo.path(), Vec::new());
-        Site {
-            repo,
-            profile,
-            base,
-            head,
-        }
+        Site::at_repository_root(repo, base, head)
     }
 
     impl Site {
+        /// A site whose `local_root` is the repository root.
+        fn at_repository_root(repo: TestRepo, base: String, head: String) -> Self {
+            let profile = profile_for(repo.path(), Vec::new());
+            Self {
+                repo,
+                profile,
+                base,
+                head,
+            }
+        }
+
         fn seed_base_copies(&self, state: &SharedState, names: &[&str]) {
             for name in names {
                 state
@@ -778,7 +978,9 @@ mod tests {
         Rc::new(RefCell::new(ServerState::default()))
     }
 
-    fn expect_invalid_args(result: std::result::Result<DeployPlan, DeployError>) -> String {
+    fn expect_invalid_args<T: std::fmt::Debug>(
+        result: std::result::Result<T, DeployError>,
+    ) -> String {
         match result {
             Err(DeployError::InvalidArgs(message)) => message,
             other => panic!("expected InvalidArgs, got {other:?}"),
@@ -911,12 +1113,7 @@ mod tests {
             std::fs::remove_dir_all(repo.path().join("x")).expect("directory should be removed");
             repo.write("x", b"now a file\n");
             let head = repo.commit_all("head");
-            let site = Site {
-                profile: profile_for(repo.path(), Vec::new()),
-                repo,
-                base: base.clone(),
-                head,
-            };
+            let site = Site::at_repository_root(repo, base.clone(), head);
             let state = new_state();
 
             let message = expect_invalid_args(run_tool(tool, &site, &state, false, Some(&base)));
@@ -1178,12 +1375,7 @@ mod tests {
         let base = repo.commit_all("base");
         std::fs::remove_file(repo.path().join("a.txt")).expect("file should be removed");
         let head = repo.commit_all("head");
-        let site = Site {
-            profile: profile_for(repo.path(), Vec::new()),
-            repo,
-            base: base.clone(),
-            head,
-        };
+        let site = Site::at_repository_root(repo, base.clone(), head);
         for dry_run in [false, true] {
             let state = new_state();
             let plan = run_tool(Tool::Commit, &site, &state, dry_run, Some(&base))
@@ -1229,15 +1421,6 @@ mod tests {
             },
             connector(state),
         )
-    }
-
-    fn expect_invalid_upload(
-        result: std::result::Result<UploadFileOutcome, DeployError>,
-    ) -> String {
-        match result {
-            Err(DeployError::InvalidArgs(message)) => message,
-            other => panic!("expected InvalidArgs, got {other:?}"),
-        }
     }
 
     #[test]
@@ -1288,7 +1471,7 @@ mod tests {
         let site = single_file_site();
         let state = new_state();
 
-        expect_invalid_upload(upload_single(&site, &state, false, Some("no-such-branch")));
+        expect_invalid_args(upload_single(&site, &state, false, Some("no-such-branch")));
 
         assert_eq!(state.borrow().connections, 0);
         assert!(state.borrow().remote.calls.is_empty());
@@ -1302,7 +1485,7 @@ mod tests {
         let state = new_state();
 
         for before_changes in [false, true] {
-            let message = expect_invalid_upload(upload_file_with(
+            let message = expect_invalid_args(upload_file_with(
                 &UploadFileRequest {
                     local_path: &loose.display().to_string(),
                     remote_path: "/home/test/loose.txt",
@@ -1326,15 +1509,10 @@ mod tests {
             .expect("directory should be removed");
         repo.write("Mails.php", b"now a file\n");
         let head = repo.commit_all("head");
-        let site = Site {
-            profile: profile_for(repo.path(), Vec::new()),
-            repo,
-            base: base.clone(),
-            head,
-        };
+        let site = Site::at_repository_root(repo, base.clone(), head);
         let state = new_state();
 
-        let message = expect_invalid_upload(upload_single(&site, &state, false, Some(&base)));
+        let message = expect_invalid_args(upload_single(&site, &state, false, Some(&base)));
 
         assert!(message.contains("Mails.php"), "{message}");
         assert_eq!(state.borrow().connections, 0);
@@ -1348,7 +1526,7 @@ mod tests {
         std::fs::create_dir(&directory).expect("directory should be created");
 
         for local_path in [directory, site.repo.path().join("missing.php")] {
-            let message = expect_invalid_upload(upload_file_with(
+            let message = expect_invalid_args(upload_file_with(
                 &UploadFileRequest {
                     local_path: &local_path.display().to_string(),
                     remote_path: "/home/test/x",
@@ -1489,5 +1667,147 @@ mod tests {
 
         assert!(!outcome.drift_check.expect("check present").refused);
         assert_eq!(outcome.bytes, b"edited\n".len() as u64);
+    }
+
+    #[test]
+    fn a_target_file_that_cannot_be_opened_without_expect_ref_is_skipped() {
+        let site = site(&["a.txt"]);
+        let state = new_state();
+        let root = site.repo.path().canonicalize().expect("root exists");
+
+        let plan = upload_files(
+            connector(&state),
+            "qa",
+            &site.profile,
+            &root,
+            vec![root.join("a.txt"), root.join("vanished.txt")],
+            false,
+            None,
+        )
+        .expect("an unopenable file is skipped, not an error");
+
+        assert_eq!(plan.files_uploaded, 1);
+        assert_eq!(plan.skipped.len(), 1);
+        assert!(
+            plan.skipped[0].contains("vanished.txt"),
+            "{:?}",
+            plan.skipped
+        );
+        assert_eq!(
+            state.borrow().stored.keys().collect::<Vec<_>>(),
+            vec![&remote_path("a.txt")]
+        );
+    }
+
+    #[test]
+    fn a_failed_binary_mode_fails_the_guarded_run_before_any_write() {
+        for tool in BOTH_TOOLS {
+            let site = site(&["a.txt"]);
+            let state = new_state();
+            state.borrow_mut().remote.binary_mode_failure =
+                Some(RemoteFailure::operation("500 no TYPE"));
+
+            let error = run_tool(tool, &site, &state, false, Some(&site.base))
+                .expect_err("a failed binary mode fails the run");
+
+            assert!(
+                matches!(error, DeployError::Other(_)),
+                "{tool:?}: {error:?}"
+            );
+            assert!(state.borrow().writes().is_empty(), "{tool:?}");
+            assert!(state.borrow().downloads().is_empty(), "{tool:?}");
+        }
+    }
+
+    #[test]
+    fn a_commit_that_does_not_resolve_is_invalid_arguments_before_connecting() {
+        let site = site(&["a.txt"]);
+        let state = new_state();
+
+        let message = expect_invalid_args(deploy_commits_with(
+            "qa",
+            &site.profile,
+            &["no-such-commit".to_string()],
+            false,
+            None,
+            connector(&state),
+        ));
+
+        assert!(message.contains("no-such-commit"), "{message}");
+        assert_eq!(state.borrow().connections, 0);
+    }
+
+    #[test]
+    fn before_changes_without_expect_ref_fails_outside_a_repository_or_for_an_untracked_file() {
+        let outside = tempfile::TempDir::new().expect("temp directory should be created");
+        let loose = outside.path().join("loose.txt");
+        std::fs::write(&loose, b"loose\n").expect("fixture should be written");
+        let site = single_file_site();
+        site.repo.write("untracked.php", b"new\n");
+        let untracked = site.repo.path().join("untracked.php");
+        let state = new_state();
+
+        for (local_path, expected_message) in [
+            (loose, "not a git repo"),
+            (untracked, "git show HEAD:untracked.php failed"),
+        ] {
+            let result = upload_file_with(
+                &UploadFileRequest {
+                    local_path: &local_path.display().to_string(),
+                    remote_path: "/home/test/x",
+                    before_changes: true,
+                    expect_ref: None,
+                },
+                connector(&state),
+            );
+
+            match result {
+                Err(DeployError::Other(error)) => {
+                    assert!(error.to_string().contains(expected_message), "{error}");
+                }
+                other => panic!("expected an internal error, got {other:?}"),
+            }
+        }
+        assert_eq!(state.borrow().connections, 0);
+    }
+
+    #[test]
+    fn remote_paths_join_the_remote_root_and_name_their_parent_directory() {
+        assert_eq!(remote_path_under("", "a.txt"), "/a.txt");
+        assert_eq!(
+            remote_path_under("/home/test", "sub/a.txt"),
+            "/home/test/sub/a.txt"
+        );
+        assert_eq!(
+            remote_parent("/home/test/sub/a.txt"),
+            Some("/home/test/sub")
+        );
+        assert_eq!(remote_parent("/a.txt"), None);
+        assert_eq!(remote_parent("a.txt"), None);
+    }
+
+    #[test]
+    fn a_file_outside_the_local_root_is_an_internal_error_before_connecting() {
+        let site = site(&["a.txt"]);
+        let outside = tempfile::TempDir::new().expect("temp directory should be created");
+        let state = new_state();
+
+        let error = upload_files(
+            connector(&state),
+            "qa",
+            &site.profile,
+            &site.repo.path().canonicalize().expect("root exists"),
+            vec![outside.path().join("loose.txt")],
+            false,
+            None,
+        )
+        .expect_err("a file outside local_root cannot be planned");
+
+        assert!(matches!(error, DeployError::Other(_)), "{error:?}");
+        assert!(
+            error.to_string().contains("is not under local_root"),
+            "{error}"
+        );
+        assert_eq!(state.borrow().connections, 0);
     }
 }

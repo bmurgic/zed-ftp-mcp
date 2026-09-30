@@ -703,26 +703,27 @@ fn upload_response_from_result(
     remote_path: String,
     result: Result<deploy::UploadFileOutcome, deploy::DeployError>,
 ) -> Result<UploadResponse, ErrorData> {
-    match result {
-        Ok(outcome) => Ok(UploadResponse {
-            profile,
-            local_path,
-            remote_path,
-            bytes: outcome.bytes,
-            drift_check: outcome.drift_check,
-        }),
-        Err(deploy::DeployError::InvalidArgs(message)) => Err(invalid(message)),
-        Err(deploy::DeployError::Other(error)) => Err(internal(error)),
-    }
+    let outcome = result.map_err(deploy_error)?;
+    Ok(UploadResponse {
+        profile,
+        local_path,
+        remote_path,
+        bytes: outcome.bytes,
+        drift_check: outcome.drift_check,
+    })
 }
 
 fn deploy_plan_from_result(
     result: Result<deploy::DeployPlan, deploy::DeployError>,
 ) -> Result<Json<deploy::DeployPlan>, ErrorData> {
-    match result {
-        Ok(plan) => Ok(Json(plan)),
-        Err(deploy::DeployError::InvalidArgs(message)) => Err(invalid(message)),
-        Err(deploy::DeployError::Other(error)) => Err(internal(error)),
+    result.map(Json).map_err(deploy_error)
+}
+
+/// A mistake the caller can fix is `invalid_params`. Everything else is `internal_error`.
+fn deploy_error(error: deploy::DeployError) -> ErrorData {
+    match error {
+        deploy::DeployError::InvalidArgs(message) => invalid(message),
+        deploy::DeployError::Other(error) => internal(error),
     }
 }
 

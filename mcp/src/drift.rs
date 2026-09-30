@@ -102,7 +102,16 @@ pub fn resolve_expect_ref(repo_dir: &Path, expect_ref: &str) -> Result<ResolvedR
             "expect_ref '{expect_ref}' is not a Git ref"
         )));
     }
+    let repo_root = worktree_root(repo_dir)?;
+    let commit = peel_to_commit(&repo_root, expect_ref)?;
+    Ok(ResolvedRef {
+        repo_root,
+        expect_ref: expect_ref.to_string(),
+        commit,
+    })
+}
 
+fn worktree_root(repo_dir: &Path) -> Result<PathBuf, DriftError> {
     let top_level = run_git(repo_dir, &["rev-parse", "--show-toplevel"])?;
     if !top_level.status.success() {
         return Err(DriftError::InvalidArgs(format!(
@@ -111,14 +120,17 @@ pub fn resolve_expect_ref(repo_dir: &Path, expect_ref: &str) -> Result<ResolvedR
             stderr_text(&top_level)
         )));
     }
-    let repo_root = PathBuf::from(stdout_text(&top_level))
+    PathBuf::from(stdout_text(&top_level))
         .canonicalize()
         .map_err(|error| {
             DriftError::InvalidArgs(format!("Git worktree root cannot be resolved: {error}"))
-        })?;
+        })
+}
 
+/// The full commit identifier `expect_ref` names, with tags peeled.
+fn peel_to_commit(repo_root: &Path, expect_ref: &str) -> Result<String, DriftError> {
     let peeled = format!("{expect_ref}^{{commit}}");
-    let commit_output = run_git(&repo_root, &["rev-parse", "--verify", peeled.as_str()])?;
+    let commit_output = run_git(repo_root, &["rev-parse", "--verify", peeled.as_str()])?;
     if !commit_output.status.success() {
         return Err(DriftError::InvalidArgs(format!(
             "expect_ref '{expect_ref}' does not resolve to a commit: {}",
@@ -126,17 +138,17 @@ pub fn resolve_expect_ref(repo_dir: &Path, expect_ref: &str) -> Result<ResolvedR
         )));
     }
     let commit = stdout_text(&commit_output);
-    if !matches!(commit.len(), 40 | 64) || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if !is_full_commit_id(&commit) {
         return Err(DriftError::Other(anyhow::anyhow!(
             "git returned an invalid commit identifier '{commit}'"
         )));
     }
+    Ok(commit)
+}
 
-    Ok(ResolvedRef {
-        repo_root,
-        expect_ref: expect_ref.to_string(),
-        commit,
-    })
+/// A full SHA-1 or SHA-256 object name in hexadecimal.
+fn is_full_commit_id(text: &str) -> bool {
+    matches!(text.len(), 40 | 64) && text.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 /// A file's path relative to the repository root, with `/` separators.
@@ -177,31 +189,13 @@ pub fn check_drift<R: DriftRemote>(
     targets: &[DriftTarget],
     resolved: &ResolvedRef,
 ) -> Result<DriftCheck, DriftError> {
-    remote.set_binary_mode().map_err(|failure| {
-        DriftError::Other(anyhow::anyhow!(
-            "selecting binary mode for the drift check failed: {}",
-            failure.error
-        ))
-    })?;
-
+    select_binary_mode(remote)?;
     let mut drifted = Vec::new();
     for target in targets {
-        let expected = expected_copy(resolved, &target.repo_path)?;
-        let server = remote
-            .download_bytes(&target.remote_path)
-            .map_err(|failure| DriftError::Download {
-                remote_path: target.remote_path.clone(),
-                error: failure.error,
-            })?;
-        if let Some(reason) = classify(server.as_deref(), expected.as_deref(), &target.upload_bytes)
-        {
-            drifted.push(DriftedFile {
-                remote_path: target.remote_path.clone(),
-                reason,
-            });
+        if let Some(drifted_file) = check_target(remote, target, resolved)? {
+            drifted.push(drifted_file);
         }
     }
-
     Ok(DriftCheck {
         expect_ref: resolved.expect_ref.clone(),
         resolved_commit: resolved.commit.clone(),
@@ -209,6 +203,42 @@ pub fn check_drift<R: DriftRemote>(
         refused: !drifted.is_empty(),
         drifted,
     })
+}
+
+fn select_binary_mode<R: DriftRemote>(remote: &mut R) -> Result<(), DriftError> {
+    remote.set_binary_mode().map_err(|failure| {
+        DriftError::Other(anyhow::anyhow!(
+            "selecting binary mode for the drift check failed: {}",
+            failure.error
+        ))
+    })
+}
+
+/// `None` means the target is clean.
+fn check_target<R: DriftRemote>(
+    remote: &mut R,
+    target: &DriftTarget,
+    resolved: &ResolvedRef,
+) -> Result<Option<DriftedFile>, DriftError> {
+    let expected = expected_copy(resolved, &target.repo_path)?;
+    let server = download_server_copy(remote, target)?;
+    let reason = classify(server.as_deref(), expected.as_deref(), &target.upload_bytes);
+    Ok(reason.map(|reason| DriftedFile {
+        remote_path: target.remote_path.clone(),
+        reason,
+    }))
+}
+
+fn download_server_copy<R: DriftRemote>(
+    remote: &mut R,
+    target: &DriftTarget,
+) -> Result<Option<Vec<u8>>, DriftError> {
+    remote
+        .download_bytes(&target.remote_path)
+        .map_err(|failure| DriftError::Download {
+            remote_path: target.remote_path.clone(),
+            error: failure.error,
+        })
 }
 
 /// `None` means the file is clean.
@@ -253,16 +283,26 @@ fn expected_blob_id(resolved: &ResolvedRef, repo_path: &str) -> Result<Option<St
             stderr_text(&output)
         )));
     }
+    let Some(record) = first_ls_tree_record(&output.stdout) else {
+        return Ok(None);
+    };
+    regular_file_blob_id(resolved, repo_path, record).map(Some)
+}
 
-    // `ls-tree` matches whole path components, so a path prints at most its own entry.
-    let Some(record) = output
-        .stdout
+/// `ls-tree` matches whole path components, so a path prints at most its own entry.
+fn first_ls_tree_record(stdout: &[u8]) -> Option<&[u8]> {
+    stdout
         .split(|byte| *byte == b'\0')
         .next()
         .filter(|record| !record.is_empty())
-    else {
-        return Ok(None);
-    };
+}
+
+/// Reads `<mode> <type> <object>\t<path>` and accepts only a regular or executable file blob.
+fn regular_file_blob_id(
+    resolved: &ResolvedRef,
+    repo_path: &str,
+    record: &[u8],
+) -> Result<String, DriftError> {
     let metadata = record
         .split(|byte| *byte == b'\t')
         .next()
@@ -281,7 +321,7 @@ fn expected_blob_id(resolved: &ResolvedRef, repo_path: &str) -> Result<Option<St
             resolved.expect_ref
         )));
     }
-    Ok(Some((*object_id).to_string()))
+    Ok((*object_id).to_string())
 }
 
 fn run_git(directory: &Path, arguments: &[&str]) -> Result<Output, DriftError> {
@@ -688,12 +728,19 @@ pub(crate) mod tests {
         );
     }
 
-    #[test]
-    fn drift_check_selects_binary_mode_before_the_first_download() {
+    /// A repository whose one commit holds `a.txt`, resolved at HEAD. Keep the repository alive
+    /// while the resolved ref is in use.
+    fn repository_with_a_txt() -> (TestRepo, ResolvedRef) {
         let repo = TestRepo::new();
         repo.write("a.txt", b"a\n");
         repo.commit_all("base");
         let resolved = resolve_expect_ref(repo.path(), "HEAD").expect("ref should resolve");
+        (repo, resolved)
+    }
+
+    #[test]
+    fn drift_check_selects_binary_mode_before_the_first_download() {
+        let (_repo, resolved) = repository_with_a_txt();
         let mut remote = FakeRemote::default();
 
         check_drift(
@@ -708,10 +755,7 @@ pub(crate) mod tests {
 
     #[test]
     fn drift_check_downloads_nothing_when_binary_mode_fails() {
-        let repo = TestRepo::new();
-        repo.write("a.txt", b"a\n");
-        repo.commit_all("base");
-        let resolved = resolve_expect_ref(repo.path(), "HEAD").expect("ref should resolve");
+        let (_repo, resolved) = repository_with_a_txt();
         let mut remote = FakeRemote {
             binary_mode_failure: Some(RemoteFailure::operation("500 no TYPE")),
             ..FakeRemote::default()
@@ -781,6 +825,47 @@ pub(crate) mod tests {
                 "{name}: nothing is downloaded after the failure"
             );
         }
+    }
+
+    #[test]
+    fn a_full_commit_id_is_40_or_64_hexadecimal_digits() {
+        assert!(is_full_commit_id(&"a".repeat(40)));
+        assert!(is_full_commit_id(&"0123456789abcdef".repeat(4)));
+        for not_an_id in [
+            String::new(),
+            "abc".to_string(),
+            "g".repeat(40),
+            "a".repeat(41),
+        ] {
+            assert!(!is_full_commit_id(&not_an_id), "{not_an_id}");
+        }
+    }
+
+    #[test]
+    fn a_malformed_ls_tree_record_is_an_internal_error() {
+        let resolved = ResolvedRef {
+            repo_root: PathBuf::from("/unused"),
+            expect_ref: "HEAD".to_string(),
+            commit: "a".repeat(40),
+        };
+
+        for record in [
+            &b""[..],
+            &b"100644 blob\tpath"[..],
+            &b"100644 blob abc extra\tpath"[..],
+        ] {
+            match regular_file_blob_id(&resolved, "path", record) {
+                Err(DriftError::Other(error)) => {
+                    assert!(error.to_string().contains("malformed"), "{error}");
+                }
+                other => panic!("expected an internal error, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            regular_file_blob_id(&resolved, "path", b"100755 blob abc123\tpath")
+                .expect("an executable file is a regular file"),
+            "abc123"
+        );
     }
 
     #[test]

@@ -1365,10 +1365,7 @@ mod tests {
             upload_bytes: upload.to_vec(),
         })
         .collect();
-        commands
-            .lock()
-            .expect("command log should not be poisoned")
-            .clear();
+        clear_commands(&commands);
 
         let check = check_drift(&mut client, &targets, &resolved)
             .expect("the drift check should complete against the real adapter");
@@ -1388,32 +1385,12 @@ mod tests {
                 },
             ]
         );
-        {
-            let commands = commands.lock().expect("command log should not be poisoned");
-            let type_index = commands
-                .iter()
-                .position(|command| command.starts_with("TYPE I"))
-                .expect("the drift check should select binary mode");
-            let first_retr_index = commands
-                .iter()
-                .position(|command| command.starts_with("RETR "))
-                .expect("the drift check should download server copies");
-            assert!(type_index < first_retr_index);
-            let writes: Vec<&String> = commands
-                .iter()
-                .filter(|command| {
-                    [
-                        "STOR ", "STOU", "APPE ", "MKD ", "DELE ", "RMD ", "RNFR ", "RNTO ",
-                    ]
-                    .iter()
-                    .any(|write| command.starts_with(write))
-                })
-                .collect();
-            assert!(
-                writes.is_empty(),
-                "a drift check must not write: {writes:?}"
-            );
-        }
+        assert_binary_mode_before_first_download(&commands);
+        assert_eq!(
+            write_commands(&commands),
+            Vec::<String>::new(),
+            "a drift check must not write"
+        );
         assert_eq!(
             client
                 .get_bytes("edited.bin")
@@ -1454,6 +1431,26 @@ mod tests {
         }
 
         fn quit(self) {}
+    }
+
+    fn clear_commands(commands: &Arc<Mutex<Vec<String>>>) {
+        commands
+            .lock()
+            .expect("command log should not be poisoned")
+            .clear();
+    }
+
+    fn assert_binary_mode_before_first_download(commands: &Arc<Mutex<Vec<String>>>) {
+        let commands = commands.lock().expect("command log should not be poisoned");
+        let type_index = commands
+            .iter()
+            .position(|command| command.starts_with("TYPE I"))
+            .expect("the drift check should select binary mode");
+        let first_retr_index = commands
+            .iter()
+            .position(|command| command.starts_with("RETR "))
+            .expect("the drift check should download server copies");
+        assert!(type_index < first_retr_index);
     }
 
     fn write_commands(commands: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
@@ -1519,10 +1516,7 @@ mod tests {
                 .upload_bytes(name, &bytes)
                 .expect("adapter should seed the server copy");
         }
-        commands
-            .lock()
-            .expect("command log should not be poisoned")
-            .clear();
+        clear_commands(&commands);
 
         let dry = deploy_with("disposable", &profile, true, Some(&base), || {
             Ok(BorrowedClient(&mut client))
@@ -1563,10 +1557,7 @@ mod tests {
         client
             .upload_bytes("c.bin", &base_bytes("c.bin"))
             .expect("adapter should restore the base copy");
-        commands
-            .lock()
-            .expect("command log should not be poisoned")
-            .clear();
+        clear_commands(&commands);
         let uploaded = deploy_with("disposable", &profile, false, Some(&base), || {
             Ok(BorrowedClient(&mut client))
         })
@@ -1580,20 +1571,12 @@ mod tests {
                 "{name}"
             );
         }
+        assert_binary_mode_before_first_download(&commands);
         let commands = commands.lock().expect("command log should not be poisoned");
-        let type_index = commands
-            .iter()
-            .position(|command| command.starts_with("TYPE I"))
-            .expect("the check should select binary mode");
-        let first_retr_index = commands
-            .iter()
-            .position(|command| command.starts_with("RETR "))
-            .expect("the check should download server copies");
         let first_stor_index = commands
             .iter()
             .position(|command| command.starts_with("STOR "))
             .expect("the run should upload");
-        assert!(type_index < first_retr_index);
         let last_check_retr = commands[..first_stor_index]
             .iter()
             .rposition(|command| command.starts_with("RETR "))
@@ -1628,10 +1611,7 @@ mod tests {
         client
             .upload_bytes("Mails.php", &committed)
             .expect("adapter should seed the committed copy");
-        commands
-            .lock()
-            .expect("command log should not be poisoned")
-            .clear();
+        clear_commands(&commands);
 
         let uploaded = upload_file_with(
             &UploadFileRequest {
@@ -1653,10 +1633,7 @@ mod tests {
         client
             .upload_bytes("Mails.php", b"server-only edit")
             .expect("adapter should seed the server-only edit");
-        commands
-            .lock()
-            .expect("command log should not be poisoned")
-            .clear();
+        clear_commands(&commands);
         let refused = upload_file_with(
             &UploadFileRequest {
                 local_path: &local,
