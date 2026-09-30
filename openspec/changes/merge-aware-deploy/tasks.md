@@ -20,7 +20,7 @@ Independent test criteria: against a disposable FTP server, `deploy-branch --mod
 - [x] 1.V **Slice verification gate**
 
 ## 2. Preview a merge without changing the server
-**Slice state:** [~] VERIFYING: REVIEW
+**Slice state:** [~] VERIFYING: QA
 **Depends on:** 1
 **Files:** mcp/src/branch_deploy/mod.rs, mcp/src/branch_deploy/execute.rs, mcp/src/branch_deploy/tests.rs, mcp/src/tools.rs, mcp/src/main.rs, README.md
 **Interfaces:** Consumes: `DeployMode` (enum `Overwrite` | `Merge`, serde `overwrite` | `merge`, default `Overwrite`), `execute::decide_merge<R: BranchRemote, B: BlobSource>(plan: &BranchDeployPlan, blobs: &mut B, remote: &mut R) -> MergePhase` / Produces: none
