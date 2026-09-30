@@ -108,7 +108,8 @@ def proc_deploy():
         check("1 no error", e is None, e); r = r or {}
         dc = r.get("drift_check", {})
         print("   dry-run response:", json.dumps(r)[:600])
-        check("1 dry_run planned files listed", r.get("dry_run") is True and len(json.dumps(r.get("files", r.get("planned", "")))) > 5 or "a.txt" in json.dumps(r), r)
+        planned = sorted(u.get("remote") for u in r.get("uploaded", []))
+        check("1 dry_run planned files listed", r.get("dry_run") is True and planned == sorted(names), (r.get("dry_run"), planned))
         check("1 refused true", dc.get("refused") is True, dc)
         check("1 one drifted /c.txt content_differs", dc.get("drifted") == [{"remote_path": ROOT + "/c.txt", "reason": "content_differs"}], dc)
         check("1 checked 4", dc.get("checked") == 4, dc)
@@ -142,7 +143,8 @@ def proc_deploy():
     mcp = Mcp()
     try:
         r, e = mcp.call("ftp_deploy", dry_run=True)
-        check("5 offline dry run lists planned files, no connection error", e is None and r and "a.txt" in json.dumps(r) and "drift_check" not in r, (r, e))
+        planned = sorted(u.get("remote") for u in (r or {}).get("uploaded", []))
+        check("5 offline dry run lists planned files, no connection error", e is None and r.get("dry_run") is True and planned == sorted(names) and "drift_check" not in r, (r, e))
     finally:
         mcp.close()
 
