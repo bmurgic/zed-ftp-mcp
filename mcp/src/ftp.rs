@@ -6,6 +6,7 @@
 
 use crate::branch_deploy::{BranchRemote, RemoteComparison, RemoteFailure, RemoteFailureKind};
 use crate::config::{self, Profile};
+use crate::deploy::DeployRemote;
 use crate::drift::DriftRemote;
 use anyhow::{Context, Result};
 use std::io::{Cursor, Read};
@@ -260,6 +261,20 @@ impl BranchRemote for FtpClient {
     }
 }
 
+impl DeployRemote for FtpClient {
+    fn mkdir_p(&mut self, path: &str) -> Result<()> {
+        FtpClient::mkdir_p(self, path)
+    }
+
+    fn put_reader<R: Read>(&mut self, remote_path: &str, reader: &mut R) -> Result<u64> {
+        FtpClient::put_reader(self, remote_path, reader)
+    }
+
+    fn quit(self) {
+        FtpClient::quit(self)
+    }
+}
+
 impl DriftRemote for FtpClient {
     fn set_binary_mode(&mut self) -> Result<(), RemoteFailure> {
         self.branch_set_binary_mode().map_err(map_branch_ftp_error)
@@ -387,14 +402,15 @@ fn compare_reader_bytes(
 #[cfg(test)]
 mod tests {
     use super::{
-        compare_reader_bytes, map_branch_ftp_error, AnyFtpStream, BranchRemote, FtpClient,
-        RemoteFailureKind,
+        compare_reader_bytes, map_branch_ftp_error, AnyFtpStream, BranchRemote, DeployRemote,
+        FtpClient, RemoteFailure, RemoteFailureKind,
     };
     use crate::branch_deploy::{
         execute_deletion, preview_merge, BlobSource, BranchDeletePlan, BranchDeployError,
         BranchDeployPlan, DeletePathResult, DeletePathStatus, DeployMode, MergeStatus,
         PlannedUpload, UploadStatus,
     };
+    use crate::deploy::deploy_with;
     use crate::drift::tests::TestRepo;
     use crate::drift::{check_drift, resolve_expect_ref, DriftReason, DriftTarget, DriftedFile};
     use std::io::{self, BufRead, BufReader, Read, Write};
@@ -1400,6 +1416,182 @@ mod tests {
                 .expect("the edited file must remain"),
             vec![b's', 0, 0x80]
         );
+        client.quit();
+    }
+
+    /// Lends the test's one proxied connection to a deploy run, which would otherwise consume it.
+    struct BorrowedClient<'a>(&'a mut FtpClient);
+
+    impl crate::drift::DriftRemote for BorrowedClient<'_> {
+        fn set_binary_mode(&mut self) -> Result<(), RemoteFailure> {
+            crate::drift::DriftRemote::set_binary_mode(self.0)
+        }
+
+        fn download_bytes(&mut self, path: &str) -> Result<Option<Vec<u8>>, RemoteFailure> {
+            crate::drift::DriftRemote::download_bytes(self.0, path)
+        }
+    }
+
+    impl DeployRemote for BorrowedClient<'_> {
+        fn mkdir_p(&mut self, path: &str) -> anyhow::Result<()> {
+            FtpClient::mkdir_p(self.0, path)
+        }
+
+        fn put_reader<R: Read>(
+            &mut self,
+            remote_path: &str,
+            reader: &mut R,
+        ) -> anyhow::Result<u64> {
+            FtpClient::put_reader(self.0, remote_path, reader)
+        }
+
+        fn quit(self) {}
+    }
+
+    fn write_commands(commands: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+        commands
+            .lock()
+            .expect("command log should not be poisoned")
+            .iter()
+            .filter(|command| {
+                [
+                    "STOR ", "STOU", "APPE ", "MKD ", "DELE ", "RMD ", "RNFR ", "RNTO ",
+                ]
+                .iter()
+                .any(|write| command.starts_with(write))
+            })
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    #[ignore]
+    fn disposable_drift_deploy_refuses_a_drifted_server_then_uploads_once_it_matches() {
+        assert_eq!(
+            std::env::var("ZED_FTP_RUN_FTP_INTEGRATION").as_deref(),
+            Ok("1"),
+            "set ZED_FTP_RUN_FTP_INTEGRATION=1 to run the disposable FTP test"
+        );
+
+        let names = ["a.bin", "b.bin", "c.bin"];
+        let base_bytes = |name: &str| [name.as_bytes(), &[0, b'\r', b'\n', 0xff, b'b']].concat();
+        let head_bytes = |name: &str| [name.as_bytes(), &[0, b'\r', b'\n', 0x80, b'h']].concat();
+        let repo = TestRepo::new();
+        for name in names {
+            repo.write(name, &base_bytes(name));
+        }
+        let base = repo.commit_all("base");
+        for name in names {
+            repo.write(name, &head_bytes(name));
+        }
+        let profile = crate::config::Profile {
+            host: "unused.invalid".to_string(),
+            port: 21,
+            user: "unused".to_string(),
+            // The disposable server's FTP user lives in `/home/test`.
+            remote_root: "/home/test".to_string(),
+            local_root: repo.path().display().to_string(),
+            passive: true,
+            tls: false,
+            accept_invalid_certs: false,
+            ignore: vec![".git".to_string()],
+        };
+        let (_container, mut client, commands) = disposable_branch_client("drift-deploy");
+        client
+            .set_binary_mode()
+            .expect("adapter should select binary mode");
+        // The pinned image fails MKD on an existing directory, so the files sit in the home directory.
+        for name in names {
+            let bytes = if name == "c.bin" {
+                b"server-only edit".to_vec()
+            } else {
+                base_bytes(name)
+            };
+            client
+                .upload_bytes(name, &bytes)
+                .expect("adapter should seed the server copy");
+        }
+        commands
+            .lock()
+            .expect("command log should not be poisoned")
+            .clear();
+
+        let dry = deploy_with("disposable", &profile, true, Some(&base), || {
+            Ok(BorrowedClient(&mut client))
+        })
+        .expect("the drift dry run should complete");
+        let dry_check = dry
+            .drift_check
+            .expect("a dry run with expect_ref checks drift");
+        assert!(dry_check.refused);
+        assert_eq!(dry_check.drifted.len(), 1);
+        assert_eq!(dry_check.drifted[0].remote_path, "/home/test/c.bin");
+        assert_eq!(
+            dry.uploaded.len(),
+            3,
+            "the dry run still lists the planned files"
+        );
+        assert_eq!(write_commands(&commands), Vec::<String>::new());
+
+        let refused = deploy_with("disposable", &profile, false, Some(&base), || {
+            Ok(BorrowedClient(&mut client))
+        })
+        .expect("a refusal is a response");
+        assert!(refused.drift_check.expect("check present").refused);
+        assert_eq!(refused.files_uploaded, 0);
+        assert_eq!(refused.bytes_uploaded, 0);
+        assert_eq!(refused.directories_created, 0);
+        assert_eq!(write_commands(&commands), Vec::<String>::new());
+        assert_eq!(
+            client.get_bytes("a.bin").expect("a.bin should remain"),
+            base_bytes("a.bin"),
+            "a clean file stays at its old version when another file drifted"
+        );
+        assert_eq!(
+            client.get_bytes("c.bin").expect("c.bin should remain"),
+            b"server-only edit".to_vec()
+        );
+
+        client
+            .upload_bytes("c.bin", &base_bytes("c.bin"))
+            .expect("adapter should restore the base copy");
+        commands
+            .lock()
+            .expect("command log should not be poisoned")
+            .clear();
+        let uploaded = deploy_with("disposable", &profile, false, Some(&base), || {
+            Ok(BorrowedClient(&mut client))
+        })
+        .expect("the clean run should complete");
+        assert!(!uploaded.drift_check.expect("check present").refused);
+        assert_eq!(uploaded.files_uploaded, 3);
+        for name in names {
+            assert_eq!(
+                client.get_bytes(name).expect("uploaded file should exist"),
+                head_bytes(name),
+                "{name}"
+            );
+        }
+        let commands = commands.lock().expect("command log should not be poisoned");
+        let type_index = commands
+            .iter()
+            .position(|command| command.starts_with("TYPE I"))
+            .expect("the check should select binary mode");
+        let first_retr_index = commands
+            .iter()
+            .position(|command| command.starts_with("RETR "))
+            .expect("the check should download server copies");
+        let first_stor_index = commands
+            .iter()
+            .position(|command| command.starts_with("STOR "))
+            .expect("the run should upload");
+        assert!(type_index < first_retr_index);
+        let last_check_retr = commands[..first_stor_index]
+            .iter()
+            .rposition(|command| command.starts_with("RETR "))
+            .expect("downloads precede the first upload");
+        assert!(last_check_retr < first_stor_index);
+        drop(commands);
         client.quit();
     }
 

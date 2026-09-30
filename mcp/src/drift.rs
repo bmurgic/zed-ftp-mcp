@@ -5,9 +5,6 @@
 //! content that is neither the copy at `expect_ref` nor the copy the tool is about to upload. Any
 //! drifted file refuses the whole run.
 
-// Temporary: the deploy tools that call this module arrive in the next commit.
-#![allow(dead_code)]
-
 use crate::branch_deploy::RemoteFailure;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -27,13 +24,6 @@ pub struct ResolvedRef {
     repo_root: PathBuf,
     expect_ref: String,
     commit: String,
-}
-
-impl ResolvedRef {
-    /// The canonical root of the Git worktree the ref was resolved in.
-    pub fn repo_root(&self) -> &Path {
-        &self.repo_root
-    }
 }
 
 /// One file the tool would upload.
@@ -486,7 +476,7 @@ pub(crate) mod tests {
             .expect("a subdirectory of the worktree is inside the repository");
 
         assert_eq!(
-            resolved.repo_root(),
+            resolved.repo_root,
             repo.path().canonicalize().expect("repo path exists")
         );
         assert_eq!(

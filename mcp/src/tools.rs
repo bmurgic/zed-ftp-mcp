@@ -83,6 +83,12 @@ pub struct DeployArgs {
     /// If true, list what *would* be uploaded without sending anything.
     #[serde(default)]
     pub dry_run: bool,
+    /// Git ref (for example the branch or commit the server was last deployed from). When set,
+    /// each file's server copy is downloaded first, and the whole run is refused if any file
+    /// differs from both the copy at this ref and the copy being uploaded. A dry run with this
+    /// set connects to the server to check, and never writes.
+    #[serde(default)]
+    pub expect_ref: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -93,6 +99,12 @@ pub struct DeployCommitsArgs {
     /// If true, list what *would* be uploaded without sending anything.
     #[serde(default)]
     pub dry_run: bool,
+    /// Git ref (for example the branch or commit the server was last deployed from). When set,
+    /// each file's server copy is downloaded first, and the whole run is refused if any file
+    /// differs from both the copy at this ref and the copy being uploaded. A dry run with this
+    /// set connects to the server to check, and never writes.
+    #[serde(default)]
+    pub expect_ref: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -409,7 +421,11 @@ impl FtpServer {
             Set dry_run=true to preview the file list without uploading.")]
     async fn ftp_deploy(
         &self,
-        Parameters(DeployArgs { profile, dry_run }): Parameters<DeployArgs>,
+        Parameters(DeployArgs {
+            profile,
+            dry_run,
+            expect_ref,
+        }): Parameters<DeployArgs>,
     ) -> Result<Json<deploy::DeployPlan>, ErrorData> {
         let cfg = Config::load().map_err(internal)?;
         let p = cfg
@@ -417,11 +433,12 @@ impl FtpServer {
             .ok_or_else(|| invalid(format!("no profile '{profile}'")))?
             .clone();
         let pname = profile.clone();
-        let plan = tokio::task::spawn_blocking(move || deploy::deploy(&pname, &p, dry_run))
-            .await
-            .map_err(internal)?
-            .map_err(internal)?;
-        Ok(Json(plan))
+        let result = tokio::task::spawn_blocking(move || {
+            deploy::deploy(&pname, &p, dry_run, expect_ref.as_deref())
+        })
+        .await
+        .map_err(internal)?;
+        deploy_plan_from_result(result)
     }
 
     #[tool(description = "Upload only the files changed by the given commits. \
@@ -441,18 +458,14 @@ impl FtpServer {
             profile,
             commits,
             dry_run,
+            expect_ref,
         } = args;
         let result = tokio::task::spawn_blocking(move || {
-            deploy::deploy_commits(&profile, &p, &commits, dry_run)
+            deploy::deploy_commits(&profile, &p, &commits, dry_run, expect_ref.as_deref())
         })
         .await
         .map_err(internal)?;
-
-        match result {
-            Ok(plan) => Ok(Json(plan)),
-            Err(deploy::DeployCommitsError::InvalidArgs(m)) => Err(invalid(m)),
-            Err(deploy::DeployCommitsError::Other(e)) => Err(internal(e)),
-        }
+        deploy_plan_from_result(result)
     }
 
     #[tool(description = "Plan a committed Git range from an explicit worktree. \
@@ -704,6 +717,16 @@ fn invalid(msg: impl Into<String>) -> ErrorData {
     ErrorData::invalid_params(msg.into(), None)
 }
 
+fn deploy_plan_from_result(
+    result: Result<deploy::DeployPlan, deploy::DeployError>,
+) -> Result<Json<deploy::DeployPlan>, ErrorData> {
+    match result {
+        Ok(plan) => Ok(Json(plan)),
+        Err(deploy::DeployError::InvalidArgs(message)) => Err(invalid(message)),
+        Err(deploy::DeployError::Other(error)) => Err(internal(error)),
+    }
+}
+
 fn branch_deploy_error(error: branch_deploy::BranchDeployError) -> ErrorData {
     match error {
         branch_deploy::BranchDeployError::InvalidArgs(message) => invalid(message),
@@ -789,8 +812,8 @@ fn use_base64(bytes: &[u8]) -> String {
 mod tests {
     use super::{
         branch_deploy_error, branch_deploy_manifest_from_operation, branch_deploy_manifest_output,
-        deletion_manifest_from_operation, deletion_manifest_output, use_base64,
-        DeleteBranchFilesArgs, DeployBranchArgs,
+        deletion_manifest_from_operation, deletion_manifest_output, deploy_plan_from_result,
+        use_base64, DeleteBranchFilesArgs, DeployArgs, DeployBranchArgs, DeployCommitsArgs,
     };
     use crate::branch_deploy::{
         deletion_dry_run_manifest, dry_run_manifest, BranchDeletePlan, BranchDeployError,
@@ -840,6 +863,47 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    #[test]
+    fn deploy_tools_take_an_optional_expect_ref_that_defaults_to_none() {
+        let without: DeployArgs = serde_json::from_value(serde_json::json!({"profile": "qa"}))
+            .expect("ftp_deploy arguments without expect_ref should deserialize");
+        let with: DeployArgs = serde_json::from_value(
+            serde_json::json!({"profile": "qa", "dry_run": true, "expect_ref": "base"}),
+        )
+        .expect("ftp_deploy arguments with expect_ref should deserialize");
+        let commits_without: DeployCommitsArgs =
+            serde_json::from_value(serde_json::json!({"profile": "qa", "commits": ["abc"]}))
+                .expect("ftp_deploy_commits arguments without expect_ref should deserialize");
+        let commits_with: DeployCommitsArgs = serde_json::from_value(
+            serde_json::json!({"profile": "qa", "commits": ["abc"], "expect_ref": "base"}),
+        )
+        .expect("ftp_deploy_commits arguments with expect_ref should deserialize");
+
+        assert_eq!(without.expect_ref, None);
+        assert_eq!(with.expect_ref.as_deref(), Some("base"));
+        assert_eq!(commits_without.expect_ref, None);
+        assert_eq!(commits_with.expect_ref.as_deref(), Some("base"));
+    }
+
+    #[test]
+    fn deploy_errors_map_invalid_args_to_invalid_params_and_the_rest_to_internal() {
+        let invalid = deploy_plan_from_result(Err(crate::deploy::DeployError::InvalidArgs(
+            "expect_ref 'nope' does not resolve to a commit".to_string(),
+        )))
+        .err()
+        .expect("invalid arguments must be an error");
+        let internal = deploy_plan_from_result(Err(crate::deploy::DeployError::Other(
+            anyhow::anyhow!("downloading /site/a.txt for the drift check failed"),
+        )))
+        .err()
+        .expect("an internal failure must be an error");
+
+        assert_eq!(invalid.code, ErrorCode::INVALID_PARAMS);
+        assert!(invalid.message.contains("does not resolve"), "{invalid:?}");
+        assert_eq!(internal.code, ErrorCode::INTERNAL_ERROR);
+        assert!(internal.message.contains("/site/a.txt"), "{internal:?}");
     }
 
     #[test]

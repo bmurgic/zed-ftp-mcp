@@ -41,6 +41,7 @@ mod tests {
         assert_integer_schema(&deploy_schema, "/properties/bytes_uploaded", None);
         assert_integer_schema(&deploy_schema, "/properties/directories_created", None);
         assert_integer_schema(&deploy_schema, "/$defs/UploadedFile/properties/bytes", None);
+        assert_integer_schema(&deploy_schema, "/$defs/DriftCheck/properties/checked", None);
         assert_integer_schema(
             &profiles_schema,
             "/$defs/ProfileSummary/properties/port",
@@ -49,6 +50,13 @@ mod tests {
         assert_integer_schema(&upload_schema, "/properties/bytes", None);
         assert_integer_schema(&download_schema, "/properties/bytes", None);
 
+        assert!(
+            !deploy_schema
+                .pointer("/required")
+                .and_then(Value::as_array)
+                .is_some_and(|required| required.contains(&json!("drift_check"))),
+            "drift_check should remain optional"
+        );
         assert_eq!(
             deploy_schema.pointer("/properties/dry_run/type"),
             Some(&json!("boolean"))
