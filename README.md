@@ -93,7 +93,8 @@ worktree. The command requires the absolute path to the exact worktree root
 and a base ref. The head ref defaults to `HEAD`. Pass `--dry-run` to preview
 the manifest. In the default overwrite mode, a dry run does not access saved
 credentials, Git blob contents, or FTP. In merge mode, a dry run connects to
-the server to preview the merge and never writes (see "Merging into a server").
+the server to preview the merge and never writes. "Preview a merge" below
+covers what it reads and reports.
 
 ```sh
 zed-ftp-mcp deploy-branch staging \
