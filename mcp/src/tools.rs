@@ -374,14 +374,13 @@ impl FtpServer {
         let remote_for_blocking = full_remote.clone();
         let result = tokio::task::spawn_blocking(move || {
             deploy::upload_file(
-                &pname,
-                &p,
                 &deploy::UploadFileRequest {
                     local_path: &local_for_blocking,
                     remote_path: &remote_for_blocking,
                     before_changes,
                     expect_ref: expect_ref.as_deref(),
                 },
+                || crate::ftp::FtpClient::connect(&pname, &p),
             )
         })
         .await
@@ -411,7 +410,9 @@ impl FtpServer {
             .clone();
         let pname = profile.clone();
         let result = tokio::task::spawn_blocking(move || {
-            deploy::deploy(&pname, &p, dry_run, expect_ref.as_deref())
+            deploy::deploy(&pname, &p, dry_run, expect_ref.as_deref(), || {
+                crate::ftp::FtpClient::connect(&pname, &p)
+            })
         })
         .await
         .map_err(internal)?;
@@ -441,7 +442,14 @@ impl FtpServer {
             expect_ref,
         } = args;
         let result = tokio::task::spawn_blocking(move || {
-            deploy::deploy_commits(&profile, &p, &commits, dry_run, expect_ref.as_deref())
+            deploy::deploy_commits(
+                &profile,
+                &p,
+                &commits,
+                dry_run,
+                expect_ref.as_deref(),
+                || crate::ftp::FtpClient::connect(&profile, &p),
+            )
         })
         .await
         .map_err(internal)?;

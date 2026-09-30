@@ -414,7 +414,7 @@ mod tests {
         BranchDeployPlan, DeletePathResult, DeletePathStatus, DeployMode, MergeStatus,
         PlannedUpload, UploadStatus,
     };
-    use crate::deploy::{deploy_with, upload_file_with, UploadFileRequest};
+    use crate::deploy::{deploy, upload_file, UploadFileRequest};
     use crate::drift::tests::TestRepo;
     use crate::drift::{check_drift, resolve_expect_ref, DriftReason, DriftTarget, DriftedFile};
     use std::io::{self, BufRead, BufReader, Read, Write};
@@ -1518,7 +1518,7 @@ mod tests {
         }
         clear_commands(&commands);
 
-        let dry = deploy_with("disposable", &profile, true, Some(&base), || {
+        let dry = deploy("disposable", &profile, true, Some(&base), || {
             Ok(BorrowedClient(&mut client))
         })
         .expect("the drift dry run should complete");
@@ -1535,7 +1535,7 @@ mod tests {
         );
         assert_eq!(write_commands(&commands), Vec::<String>::new());
 
-        let refused = deploy_with("disposable", &profile, false, Some(&base), || {
+        let refused = deploy("disposable", &profile, false, Some(&base), || {
             Ok(BorrowedClient(&mut client))
         })
         .expect("a refusal is a response");
@@ -1558,7 +1558,7 @@ mod tests {
             .upload_bytes("c.bin", &base_bytes("c.bin"))
             .expect("adapter should restore the base copy");
         clear_commands(&commands);
-        let uploaded = deploy_with("disposable", &profile, false, Some(&base), || {
+        let uploaded = deploy("disposable", &profile, false, Some(&base), || {
             Ok(BorrowedClient(&mut client))
         })
         .expect("the clean run should complete");
@@ -1613,7 +1613,7 @@ mod tests {
             .expect("adapter should seed the committed copy");
         clear_commands(&commands);
 
-        let uploaded = upload_file_with(
+        let uploaded = upload_file(
             &UploadFileRequest {
                 local_path: &local,
                 remote_path: remote,
@@ -1634,7 +1634,7 @@ mod tests {
             .upload_bytes("Mails.php", b"server-only edit")
             .expect("adapter should seed the server-only edit");
         clear_commands(&commands);
-        let refused = upload_file_with(
+        let refused = upload_file(
             &UploadFileRequest {
                 local_path: &local,
                 remote_path: remote,

@@ -13,7 +13,6 @@
 
 use crate::config::Profile;
 use crate::drift::{self, DriftCheck, DriftError, DriftRemote, DriftTarget, ResolvedRef};
-use crate::ftp::FtpClient;
 use anyhow::{Context, Result};
 use ignore::overrides::OverrideBuilder;
 use ignore::WalkBuilder;
@@ -85,18 +84,8 @@ pub(crate) trait DeployRemote: DriftRemote {
 /// Full-tree deploy: walk `local_root` honoring .gitignore and per-profile
 /// ignore patterns, then upload everything that survives the filter.
 /// With `expect_ref`, the run first checks every target for server-side drift.
-pub fn deploy(
-    profile_name: &str,
-    profile: &Profile,
-    dry_run: bool,
-    expect_ref: Option<&str>,
-) -> std::result::Result<DeployPlan, DeployError> {
-    deploy_with(profile_name, profile, dry_run, expect_ref, || {
-        FtpClient::connect(profile_name, profile)
-    })
-}
-
-pub(crate) fn deploy_with<R: DeployRemote>(
+/// `connect` opens the run's one server connection.
+pub(crate) fn deploy<R: DeployRemote>(
     profile_name: &str,
     profile: &Profile,
     dry_run: bool,
@@ -119,19 +108,8 @@ pub(crate) fn deploy_with<R: DeployRemote>(
 /// Commit-scoped deploy: union the file lists from each commit's
 /// `git diff-tree` and upload only those files (current working-tree state).
 /// With `expect_ref`, the run first checks every target for server-side drift.
-pub fn deploy_commits(
-    profile_name: &str,
-    profile: &Profile,
-    commits: &[String],
-    dry_run: bool,
-    expect_ref: Option<&str>,
-) -> std::result::Result<DeployPlan, DeployError> {
-    deploy_commits_with(profile_name, profile, commits, dry_run, expect_ref, || {
-        FtpClient::connect(profile_name, profile)
-    })
-}
-
-fn deploy_commits_with<R: DeployRemote>(
+/// `connect` opens the run's one server connection.
+pub(crate) fn deploy_commits<R: DeployRemote>(
     profile_name: &str,
     profile: &Profile,
     commits: &[String],
@@ -207,16 +185,8 @@ pub struct UploadFileOutcome {
 }
 
 /// Uploads one file. With `expect_ref`, the file's server copy is checked for drift first, and a
-/// drifted file is left unchanged.
-pub fn upload_file(
-    profile_name: &str,
-    profile: &Profile,
-    request: &UploadFileRequest,
-) -> std::result::Result<UploadFileOutcome, DeployError> {
-    upload_file_with(request, || FtpClient::connect(profile_name, profile))
-}
-
-pub(crate) fn upload_file_with<R: DeployRemote>(
+/// drifted file is left unchanged. `connect` opens the run's one server connection.
+pub(crate) fn upload_file<R: DeployRemote>(
     request: &UploadFileRequest,
     connect: impl FnOnce() -> Result<R>,
 ) -> std::result::Result<UploadFileOutcome, DeployError> {
@@ -381,7 +351,7 @@ fn changed_paths_for_commit(
 /// `connect` opens the run's single FTP connection. Without `expect_ref`, a dry run never calls
 /// it. With `expect_ref`, every failure that the caller can fix is raised before it is called,
 /// and the drift check runs before any directory is created or file uploaded.
-pub(crate) fn upload_files<R: DeployRemote>(
+fn upload_files<R: DeployRemote>(
     connect: impl FnOnce() -> Result<R>,
     profile_name: &str,
     profile: &Profile,
@@ -960,10 +930,8 @@ mod tests {
         expect_ref: Option<&str>,
     ) -> std::result::Result<DeployPlan, DeployError> {
         match tool {
-            Tool::Directory => {
-                deploy_with("qa", &site.profile, dry_run, expect_ref, connector(state))
-            }
-            Tool::Commit => deploy_commits_with(
+            Tool::Directory => deploy("qa", &site.profile, dry_run, expect_ref, connector(state)),
+            Tool::Commit => deploy_commits(
                 "qa",
                 &site.profile,
                 std::slice::from_ref(&site.head),
@@ -1090,7 +1058,7 @@ mod tests {
         let profile = profile_for(outside.path(), Vec::new());
         let state = new_state();
 
-        let message = expect_invalid_args(deploy_with(
+        let message = expect_invalid_args(deploy(
             "qa",
             &profile,
             false,
@@ -1412,7 +1380,7 @@ mod tests {
     ) -> std::result::Result<UploadFileOutcome, DeployError> {
         let local = site.repo.path().join("Mails.php");
         let remote = remote_path("Mails.php");
-        upload_file_with(
+        upload_file(
             &UploadFileRequest {
                 local_path: &local.display().to_string(),
                 remote_path: &remote,
@@ -1485,7 +1453,7 @@ mod tests {
         let state = new_state();
 
         for before_changes in [false, true] {
-            let message = expect_invalid_args(upload_file_with(
+            let message = expect_invalid_args(upload_file(
                 &UploadFileRequest {
                     local_path: &loose.display().to_string(),
                     remote_path: "/home/test/loose.txt",
@@ -1526,7 +1494,7 @@ mod tests {
         std::fs::create_dir(&directory).expect("directory should be created");
 
         for local_path in [directory, site.repo.path().join("missing.php")] {
-            let message = expect_invalid_args(upload_file_with(
+            let message = expect_invalid_args(upload_file(
                 &UploadFileRequest {
                     local_path: &local_path.display().to_string(),
                     remote_path: "/home/test/x",
@@ -1654,7 +1622,7 @@ mod tests {
         let local = repo.path().join("app/models/Mails.php");
         let remote = remote_path("Mails.php");
 
-        let outcome = upload_file_with(
+        let outcome = upload_file(
             &UploadFileRequest {
                 local_path: &local.display().to_string(),
                 remote_path: &remote,
@@ -1724,7 +1692,7 @@ mod tests {
         let site = site(&["a.txt"]);
         let state = new_state();
 
-        let message = expect_invalid_args(deploy_commits_with(
+        let message = expect_invalid_args(deploy_commits(
             "qa",
             &site.profile,
             &["no-such-commit".to_string()],
@@ -1751,7 +1719,7 @@ mod tests {
             (loose, "not a git repo"),
             (untracked, "git show HEAD:untracked.php failed"),
         ] {
-            let result = upload_file_with(
+            let result = upload_file(
                 &UploadFileRequest {
                     local_path: &local_path.display().to_string(),
                     remote_path: "/home/test/x",
