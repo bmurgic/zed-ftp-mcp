@@ -315,15 +315,7 @@ fn changed_paths_for_commit(
         ])
         .arg(sha)
         .output()
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                DeployError::InvalidArgs(
-                    "`git` was not found on PATH; install git or add it to your PATH".to_string(),
-                )
-            } else {
-                DeployError::Other(anyhow::Error::from(e).context("spawning git diff-tree"))
-            }
-        })?;
+        .map_err(|e| DeployError::from(drift::git_spawn_error(e, "spawning git diff-tree")))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();

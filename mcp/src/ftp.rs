@@ -833,6 +833,42 @@ mod tests {
     }
 
     #[test]
+    fn deploy_adapter_creates_directories_uploads_and_quits_through_the_ftp_client() {
+        let (mut client, server) = branch_client_for_download(
+            FakeAnswer::Line("550 unused"),
+            FakeAnswer::Line("550 unused"),
+        );
+
+        DeployRemote::mkdir_p(&mut client, "/site/dir").expect("mkdir should succeed");
+        let sent = DeployRemote::put_bytes(&mut client, "/site/dir/a.bin", &[0, b'\r', b'\n'])
+            .expect("put_bytes should upload");
+        let mut reader = io::Cursor::new(b"hello".to_vec());
+        let streamed = DeployRemote::put_reader(&mut client, "/site/dir/b.txt", &mut reader)
+            .expect("put_reader should upload");
+        DeployRemote::quit(client);
+
+        assert_eq!(sent, 3);
+        assert_eq!(streamed, 5);
+        // put_bytes creates the parent directories again; put_reader does not.
+        assert_eq!(
+            server.join().expect("download server should complete"),
+            [
+                "MKD /site",
+                "MKD /site/dir",
+                "MKD /site",
+                "MKD /site/dir",
+                "PASV",
+                "STOR /site/dir/a.bin",
+                "received 3 bytes",
+                "PASV",
+                "STOR /site/dir/b.txt",
+                "received 5 bytes",
+                "QUIT",
+            ]
+        );
+    }
+
+    #[test]
     fn drift_adapter_reports_a_lost_connection_and_selects_binary_mode() {
         let (mut client, server) =
             branch_client_for_download(FakeAnswer::Drop, FakeAnswer::Line("500 unused"));
@@ -930,6 +966,23 @@ mod tests {
                             }
                             FakeAnswer::Drop => break,
                         }
+                    }
+                    "STOR" => {
+                        connection
+                            .write_all(b"150 Opening data connection\r\n")
+                            .expect("download server should open the upload");
+                        let (mut data, _) = data_listener
+                            .take()
+                            .expect("PASV should precede the upload")
+                            .accept()
+                            .expect("data connection should arrive");
+                        let mut received = Vec::new();
+                        data.read_to_end(&mut received)
+                            .expect("download server should receive the upload");
+                        commands.push(format!("received {} bytes", received.len()));
+                        connection
+                            .write_all(b"226 Transfer complete\r\n")
+                            .expect("download server should finish the upload");
                     }
                     "QUIT" => {
                         let _ = connection.write_all(b"221 bye\r\n");

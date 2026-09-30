@@ -758,6 +758,10 @@ fn executor_verification_mismatch_drains_and_fails_manifest() {
         VerificationStatus::Verified
     );
     assert_eq!(manifest.failures[0].stage, "verification");
+    assert_eq!(
+        manifest.failures[0].error,
+        "remote bytes do not match the committed blob"
+    );
     assert_eq!(manifest.counts.verified, 1);
 }
 
@@ -2432,11 +2436,15 @@ fn merge_rules_02_conflict_reason_is_reported() {
             "{expected_reason:?}"
         );
         assert_eq!(result.marked_text_truncated.is_some(), has_marked_text);
+        let reason_name = serde_json::to_value(expected_reason).expect("reason serializes");
+        let reason_name = reason_name.as_str().expect("reason is a string");
         assert!(
             manifest.failures.iter().any(|failure| {
-                failure.stage == "merge" && failure.git_path.as_deref() == Some("file.txt")
+                failure.stage == "merge"
+                    && failure.git_path.as_deref() == Some("file.txt")
+                    && failure.error.starts_with(&format!("{reason_name}: "))
             }),
-            "{expected_reason:?} must add a merge failure record"
+            "{expected_reason:?} must add a merge failure record that names the reason"
         );
         assert!(!manifest.success);
     }
@@ -3029,10 +3037,10 @@ fn uploaded_bytes_differ_for_merged_bytes() {
         result_for(&manifest, "f.txt").verification_status,
         VerificationStatus::Mismatch
     );
-    assert!(manifest
-        .failures
-        .iter()
-        .any(|failure| failure.stage == "verification"));
+    assert!(manifest.failures.iter().any(|failure| {
+        failure.stage == "verification"
+            && failure.error == "remote bytes do not match the merged bytes"
+    }));
     assert!(!manifest.success);
 }
 

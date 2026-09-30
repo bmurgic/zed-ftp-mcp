@@ -330,15 +330,18 @@ fn run_git(directory: &Path, arguments: &[&str]) -> Result<Output, DriftError> {
         .arg(directory)
         .args(arguments)
         .output()
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                DriftError::InvalidArgs(
-                    "`git` was not found on PATH; install git or add it to your PATH".to_string(),
-                )
-            } else {
-                DriftError::Other(anyhow::Error::from(error).context("spawning git"))
-            }
-        })
+        .map_err(|error| git_spawn_error(error, "spawning git"))
+}
+
+/// A missing `git` executable is the caller's setup problem. Any other spawn error is internal.
+pub(crate) fn git_spawn_error(error: std::io::Error, action: &'static str) -> DriftError {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        DriftError::InvalidArgs(
+            "`git` was not found on PATH; install git or add it to your PATH".to_string(),
+        )
+    } else {
+        DriftError::Other(anyhow::Error::from(error).context(action))
+    }
 }
 
 fn stdout_text(output: &Output) -> String {
@@ -474,11 +477,17 @@ pub(crate) mod tests {
             "no-such-branch",
             "0000000000000000000000000000000000000000",
             "HEAD:a.txt",
-            "",
-            "--all",
         ] {
             let message = expect_invalid_args(resolve_expect_ref(repo.path(), bad_ref));
-            assert!(!message.is_empty(), "{bad_ref}");
+            assert!(
+                message.contains("does not resolve to a commit"),
+                "{message}"
+            );
+        }
+        // An empty ref or one git would read as an option never reaches git.
+        for bad_ref in ["", "--all"] {
+            let message = expect_invalid_args(resolve_expect_ref(repo.path(), bad_ref));
+            assert_eq!(message, format!("expect_ref '{bad_ref}' is not a Git ref"));
         }
     }
 
@@ -504,6 +513,36 @@ pub(crate) mod tests {
         let message = expect_invalid_args(resolve_expect_ref(outside.path(), "HEAD"));
 
         assert!(message.contains("Git worktree"), "{message}");
+        let git = Command::new("git")
+            .arg("-C")
+            .arg(outside.path())
+            .args(["rev-parse", "--show-toplevel"])
+            .output()
+            .expect("git should run");
+        let git_error = String::from_utf8_lossy(&git.stderr).trim().to_string();
+        assert!(!git_error.is_empty());
+        assert!(
+            message.ends_with(&format!(": {git_error}")),
+            "the message should end with git's own error: {message}"
+        );
+    }
+
+    #[test]
+    fn git_spawn_error_reports_a_missing_git_as_invalid_arguments() {
+        let missing = git_spawn_error(
+            std::io::Error::from(std::io::ErrorKind::NotFound),
+            "spawning git",
+        );
+        let denied = git_spawn_error(
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            "spawning git",
+        );
+
+        assert_eq!(
+            expect_invalid_args::<()>(Err(missing)),
+            "`git` was not found on PATH; install git or add it to your PATH"
+        );
+        assert!(matches!(denied, DriftError::Other(error) if error.to_string() == "spawning git"));
     }
 
     #[test]
