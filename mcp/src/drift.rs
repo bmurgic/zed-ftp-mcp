@@ -8,6 +8,7 @@
 use crate::branch_deploy::RemoteFailure;
 use crate::git_process::{is_regular_file, run_git, GitSpawnError};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
@@ -34,8 +35,35 @@ pub struct DriftTarget {
     pub remote_path: String,
     /// The file's path relative to the repository root, with `/` separators.
     pub repo_path: String,
-    /// The exact bytes the tool would upload.
-    pub upload_bytes: Vec<u8>,
+    /// The size and digest of the exact bytes the tool would upload.
+    pub upload: UploadFingerprint,
+}
+
+/// The size and SHA-256 digest of an upload copy. A target keeps this instead of the bytes, so a
+/// guarded run holds at most one file in memory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadFingerprint {
+    len: u64,
+    digest: [u8; 32],
+}
+
+impl UploadFingerprint {
+    pub fn of(bytes: &[u8]) -> Self {
+        Self {
+            len: bytes.len() as u64,
+            digest: Sha256::digest(bytes).into(),
+        }
+    }
+
+    /// Reads the file in chunks, so computing the fingerprint does not load the whole file.
+    pub fn of_file(path: &Path) -> std::io::Result<Self> {
+        let mut hasher = Sha256::new();
+        let len = std::io::copy(&mut std::fs::File::open(path)?, &mut hasher)?;
+        Ok(Self {
+            len,
+            digest: hasher.finalize().into(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
@@ -256,7 +284,7 @@ fn check_target<R: DriftRemote>(
         .map(|blob_id| read_expected_blob(resolved, &target.repo_path, blob_id))
         .transpose()?;
     let server = download_server_copy(remote, target)?;
-    let reason = classify(server.as_deref(), expected.as_deref(), &target.upload_bytes);
+    let reason = classify(server.as_deref(), expected.as_deref(), &target.upload);
     Ok(reason.map(|reason| DriftedFile {
         remote_path: target.remote_path.clone(),
         reason,
@@ -276,12 +304,17 @@ fn download_server_copy<R: DriftRemote>(
 }
 
 /// `None` means the file is clean.
-fn classify(server: Option<&[u8]>, expected: Option<&[u8]>, upload: &[u8]) -> Option<DriftReason> {
+fn classify(
+    server: Option<&[u8]>,
+    expected: Option<&[u8]>,
+    upload: &UploadFingerprint,
+) -> Option<DriftReason> {
+    let is_upload_copy = |server: &[u8]| UploadFingerprint::of(server) == *upload;
     match (server, expected) {
         (Some(server), Some(expected)) => {
-            (server != expected && server != upload).then_some(DriftReason::ContentDiffers)
+            (server != expected && !is_upload_copy(server)).then_some(DriftReason::ContentDiffers)
         }
-        (Some(server), None) => (server != upload).then_some(DriftReason::ContentDiffers),
+        (Some(server), None) => (!is_upload_copy(server)).then_some(DriftReason::ContentDiffers),
         (None, Some(_)) => Some(DriftReason::MissingOnServer),
         (None, None) => None,
     }
@@ -471,7 +504,7 @@ pub(crate) mod tests {
         DriftTarget {
             remote_path: remote_path.to_string(),
             repo_path: repo_path.to_string(),
-            upload_bytes: upload.to_vec(),
+            upload: UploadFingerprint::of(upload),
         }
     }
 

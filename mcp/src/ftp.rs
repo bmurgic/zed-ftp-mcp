@@ -1530,7 +1530,7 @@ mod tests {
         .map(|(remote_path, repo_path, upload)| DriftTarget {
             remote_path: remote_path.to_string(),
             repo_path: repo_path.to_string(),
-            upload_bytes: upload.to_vec(),
+            upload: crate::drift::UploadFingerprint::of(upload),
         })
         .collect();
         let targets =

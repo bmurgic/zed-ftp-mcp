@@ -13,7 +13,8 @@
 
 use crate::config::Profile;
 use crate::drift::{
-    self, DriftCheck, DriftError, DriftRemote, DriftTarget, ResolvedRef, ValidatedTargets,
+    self, DriftCheck, DriftError, DriftRemote, DriftTarget, ResolvedRef, UploadFingerprint,
+    ValidatedTargets,
 };
 use crate::git_process::run_git;
 use crate::remote_path::{parent_to_create, validate_relative_path};
@@ -233,8 +234,8 @@ pub(crate) fn upload_file<R: DeployRemote>(
     let Some(expect_ref) = request.expect_ref else {
         return upload_unguarded(request, connect);
     };
-    let guard = DriftGuard::for_single_file(request, expect_ref)?;
-    upload_guarded(request, &guard, connect)
+    let (guard, content) = DriftGuard::for_single_file(request, expect_ref)?;
+    upload_guarded(request, &guard, &content, connect)
 }
 
 /// The upload as it ran before `expect_ref` existed: no download, and every failure is internal.
@@ -266,6 +267,7 @@ fn unguarded_upload_bytes(request: &UploadFileRequest) -> Result<Vec<u8>> {
 fn upload_guarded<R: DeployRemote>(
     request: &UploadFileRequest,
     guard: &DriftGuard,
+    content: &[u8],
     connect: impl FnOnce() -> Result<R>,
 ) -> std::result::Result<UploadFileOutcome, DeployError> {
     let mut client = connect()?;
@@ -273,10 +275,7 @@ fn upload_guarded<R: DeployRemote>(
     let written = if check.refused {
         0
     } else {
-        client.put_bytes(
-            request.remote_path,
-            &guard.targets.targets()[0].upload_bytes,
-        )?
+        client.put_bytes(request.remote_path, content)?
     };
     client.quit();
     Ok(UploadFileOutcome {
@@ -548,20 +547,29 @@ fn upload_each<R: DeployRemote>(
     guard: Option<&DriftGuard>,
 ) -> Result<()> {
     match guard {
-        Some(guard) => upload_checked_bytes(client, plan, planned, guard.targets.targets()),
+        Some(guard) => upload_rechecked_files(client, plan, planned, guard.targets.targets()),
         None => upload_from_disk(client, plan, planned),
     }
 }
 
-/// The drift check read each file once, and the upload sends exactly the bytes it compared.
-fn upload_checked_bytes<R: DeployRemote>(
+/// Rereads each file and uploads it only when it still matches the fingerprint the drift check
+/// compared, so the run holds one file in memory at a time. A file that changed stops the run.
+fn upload_rechecked_files<R: DeployRemote>(
     client: &mut R,
     plan: &mut DeployPlan,
     planned: Vec<PlannedFile>,
     targets: &[DriftTarget],
 ) -> Result<()> {
     for (file, target) in planned.into_iter().zip(targets) {
-        let mut source = Cursor::new(target.upload_bytes.as_slice());
+        let bytes = std::fs::read(&file.local)
+            .with_context(|| format!("rereading {}", file.local.display()))?;
+        if UploadFingerprint::of(&bytes) != target.upload {
+            anyhow::bail!(
+                "{} changed after the drift check; rerun the deploy",
+                file.local.display()
+            );
+        }
+        let mut source = Cursor::new(bytes.as_slice());
         let written = put_planned_file(client, &file, &mut source)?;
         record_upload(plan, file, written);
     }
@@ -607,7 +615,7 @@ fn record_upload(plan: &mut DeployPlan, file: PlannedFile, written: u64) {
 }
 
 /// What `expect_ref` needs before the run may connect: the resolved commit, and every target with
-/// its upload bytes read once. Building one raises every failure the caller can fix as
+/// the fingerprint of its upload bytes. Building one raises every failure the caller can fix as
 /// `InvalidArgs`, and none of them opens a connection.
 struct DriftGuard {
     resolved: ResolvedRef,
@@ -625,7 +633,7 @@ impl DriftGuard {
             .transpose()
     }
 
-    /// Resolves the ref from `local_root` and reads every planned file's local bytes.
+    /// Resolves the ref from `local_root` and fingerprints every planned file's local bytes.
     fn for_planned_files(
         local_root: &Path,
         expect_ref: &str,
@@ -639,18 +647,24 @@ impl DriftGuard {
         Self::validated(resolved, targets)
     }
 
-    /// Resolves the ref from the file's directory and reads the bytes the upload would send.
+    /// Resolves the ref from the file's directory, and returns the guard with the bytes the upload
+    /// would send.
     fn for_single_file(
         request: &UploadFileRequest,
         expect_ref: &str,
-    ) -> std::result::Result<Self, DeployError> {
+    ) -> std::result::Result<(Self, Vec<u8>), DeployError> {
         let local = Path::new(request.local_path)
             .canonicalize()
             .map_err(|e| cannot_read(request.local_path, e))?;
         let repo_dir = containing_directory(&local)?;
         let resolved = drift::resolve_expect_ref(repo_dir, expect_ref)?;
-        let target = single_file_target(request, &resolved, &local)?;
-        Self::validated(resolved, vec![target])
+        let content = guarded_upload_bytes(request, &local)?;
+        let target = DriftTarget {
+            remote_path: request.remote_path.to_string(),
+            repo_path: drift::repo_relative_path(&resolved, &local)?,
+            upload: UploadFingerprint::of(&content),
+        };
+        Ok((Self::validated(resolved, vec![target])?, content))
     }
 
     /// Rejects a target whose path at the ref is not a regular file.
@@ -690,25 +704,12 @@ fn planned_file_target(
     resolved: &ResolvedRef,
     file: &PlannedFile,
 ) -> std::result::Result<DriftTarget, DeployError> {
-    let upload_bytes =
-        std::fs::read(&file.local).map_err(|e| cannot_read(file.local.display(), e))?;
+    let upload = UploadFingerprint::of_file(&file.local)
+        .map_err(|e| cannot_read(file.local.display(), e))?;
     Ok(DriftTarget {
         remote_path: file.remote.clone(),
         repo_path: drift::repo_relative_path(resolved, &file.local)?,
-        upload_bytes,
-    })
-}
-
-fn single_file_target(
-    request: &UploadFileRequest,
-    resolved: &ResolvedRef,
-    local: &Path,
-) -> std::result::Result<DriftTarget, DeployError> {
-    let upload_bytes = guarded_upload_bytes(request, local)?;
-    Ok(DriftTarget {
-        remote_path: request.remote_path.to_string(),
-        repo_path: drift::repo_relative_path(resolved, local)?,
-        upload_bytes,
+        upload,
     })
 }
 
@@ -789,6 +790,8 @@ mod tests {
         remote: FakeRemote,
         stored: BTreeMap<String, Vec<u8>>,
         connections: usize,
+        /// Runs after every download, to change the working tree while the drift check runs.
+        after_download: Option<Box<dyn FnMut()>>,
     }
 
     impl ServerState {
@@ -833,7 +836,13 @@ mod tests {
             &mut self,
             path: &str,
         ) -> std::result::Result<Option<Vec<u8>>, RemoteFailure> {
-            self.0.borrow_mut().remote.download_bytes(path)
+            let downloaded = self.0.borrow_mut().remote.download_bytes(path);
+            let hook = self.0.borrow_mut().after_download.take();
+            if let Some(mut hook) = hook {
+                hook();
+                self.0.borrow_mut().after_download = Some(hook);
+            }
+            downloaded
         }
     }
 
@@ -1016,6 +1025,29 @@ mod tests {
                 state.stored[&remote_path("a.txt")],
                 content("head", "a.txt")
             );
+        }
+    }
+
+    #[test]
+    fn a_file_changed_after_the_drift_check_is_not_uploaded() {
+        for tool in BOTH_TOOLS {
+            let site = site(&["a.txt"]);
+            let state = new_state();
+            site.seed_base_copies(&state, &["a.txt"]);
+            let local = site.repo.path().join("a.txt");
+            state.borrow_mut().after_download = Some(Box::new(move || {
+                std::fs::write(&local, b"changed during the run\n")
+                    .expect("file should be written");
+            }));
+
+            let result = run_tool(tool, &site, &state, false, Some(&site.base));
+
+            let error = result.expect_err("a changed file must stop the run");
+            assert!(
+                error.to_string().contains("changed after the drift check"),
+                "{tool:?}: {error}"
+            );
+            assert!(state.borrow().stored.is_empty(), "{tool:?}");
         }
     }
 
