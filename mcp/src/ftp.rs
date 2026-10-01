@@ -8,6 +8,7 @@ use crate::branch_deploy::{BranchRemote, RemoteComparison, RemoteFailure, Remote
 use crate::config::{self, Profile};
 use crate::deploy::DeployRemote;
 use crate::drift::DriftRemote;
+use crate::remote_path::split_parent;
 use anyhow::{Context, Result};
 use std::io::{Cursor, Read};
 use suppaftp::types::FileType;
@@ -121,7 +122,8 @@ impl FtpClient {
 
     /// Lists the parent directory of `remote_path` and reports whether the listing names the file.
     fn is_listed_in_parent(&mut self, remote_path: &str) -> Result<bool, FtpError> {
-        let (parent, file_name) = split_remote_path(remote_path);
+        // A `None` parent lists the working directory, where a bare file name lives.
+        let (parent, file_name) = split_parent(remote_path);
         let listing = stream!(self, |s| s.nlst(parent))?;
         let is_listed = listing
             .iter()
@@ -294,16 +296,6 @@ fn is_file_unavailable(error: &FtpError) -> bool {
         error,
         FtpError::UnexpectedResponse(response) if response.status == Status::FileUnavailable
     )
-}
-
-/// Splits a remote path into the directory to list and the file name. `None` lists the
-/// working directory, which is where a relative path with no directory part lives.
-fn split_remote_path(remote_path: &str) -> (Option<&str>, &str) {
-    match remote_path.rsplit_once('/') {
-        Some(("", file_name)) => (Some("/"), file_name),
-        Some((parent, file_name)) => (Some(parent), file_name),
-        None => (None, remote_path),
-    }
 }
 
 /// `NLST` servers return bare names or full paths, so compare on the last component.

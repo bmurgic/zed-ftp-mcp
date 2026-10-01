@@ -6,9 +6,10 @@
 //! drifted file refuses the whole run.
 
 use crate::branch_deploy::RemoteFailure;
+use crate::git_process::{is_regular_file, run_git, GitSpawnError};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 
 /// The server side of a drift check. `FtpClient` implements it through `download_or_missing`.
 pub trait DriftRemote {
@@ -91,6 +92,15 @@ pub enum DriftError {
     Download { remote_path: String, error: String },
     #[error(transparent)]
     Other(#[from] anyhow::Error),
+}
+
+impl From<GitSpawnError> for DriftError {
+    fn from(error: GitSpawnError) -> Self {
+        match error {
+            GitSpawnError::NotFound => DriftError::InvalidArgs(error.to_string()),
+            GitSpawnError::Other(error) => DriftError::Other(error),
+        }
+    }
 }
 
 /// Resolves `expect_ref` to a commit in the Git worktree that contains `repo_dir`.
@@ -314,34 +324,13 @@ fn regular_file_blob_id(
             "malformed git ls-tree record for {repo_path}"
         )));
     };
-    let is_regular_file = *object_type == "blob" && matches!(*mode, "100644" | "100755");
-    if !is_regular_file {
+    if !is_regular_file(object_type, mode) {
         return Err(DriftError::InvalidArgs(format!(
             "{repo_path} is not a regular file at expect_ref '{}' (it is a {object_type} with mode {mode})",
             resolved.expect_ref
         )));
     }
     Ok((*object_id).to_string())
-}
-
-fn run_git(directory: &Path, arguments: &[&str]) -> Result<Output, DriftError> {
-    Command::new("git")
-        .arg("-C")
-        .arg(directory)
-        .args(arguments)
-        .output()
-        .map_err(|error| git_spawn_error(error, "spawning git"))
-}
-
-/// A missing `git` executable is the caller's setup problem. Any other spawn error is internal.
-pub(crate) fn git_spawn_error(error: std::io::Error, action: &'static str) -> DriftError {
-    if error.kind() == std::io::ErrorKind::NotFound {
-        DriftError::InvalidArgs(
-            "`git` was not found on PATH; install git or add it to your PATH".to_string(),
-        )
-    } else {
-        DriftError::Other(anyhow::Error::from(error).context(action))
-    }
 }
 
 fn stdout_text(output: &Output) -> String {
@@ -356,6 +345,7 @@ fn stderr_text(output: &Output) -> String {
 pub(crate) mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    use std::process::Command;
     use tempfile::TempDir;
 
     /// A scripted server. A path with a scripted failure fails, a path in `files` downloads, and
@@ -528,21 +518,10 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn git_spawn_error_reports_a_missing_git_as_invalid_arguments() {
-        let missing = git_spawn_error(
-            std::io::Error::from(std::io::ErrorKind::NotFound),
-            "spawning git",
-        );
-        let denied = git_spawn_error(
-            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
-            "spawning git",
-        );
+    fn a_missing_git_is_invalid_arguments() {
+        let message = expect_invalid_args::<()>(Err(DriftError::from(GitSpawnError::NotFound)));
 
-        assert_eq!(
-            expect_invalid_args::<()>(Err(missing)),
-            "`git` was not found on PATH; install git or add it to your PATH"
-        );
-        assert!(matches!(denied, DriftError::Other(error) if error.to_string() == "spawning git"));
+        assert_eq!(message, GitSpawnError::NotFound.to_string());
     }
 
     #[test]

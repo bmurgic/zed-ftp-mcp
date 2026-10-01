@@ -1,4 +1,6 @@
 use crate::config::Profile;
+use crate::git_process::GitSpawnError;
+use crate::remote_path::map_remote_path;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -56,6 +58,15 @@ pub enum BranchDeployError {
     InvalidArgs(String),
     #[error(transparent)]
     Other(#[from] anyhow::Error),
+}
+
+impl From<GitSpawnError> for BranchDeployError {
+    fn from(error: GitSpawnError) -> Self {
+        match error {
+            GitSpawnError::NotFound => BranchDeployError::InvalidArgs(error.to_string()),
+            GitSpawnError::Other(error) => BranchDeployError::Other(error),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
@@ -381,10 +392,6 @@ pub struct BranchDeployManifest {
     pub failures: Vec<FailureRecord>,
 }
 
-#[derive(thiserror::Error, Debug, PartialEq, Eq)]
-#[error("{0}")]
-pub struct PathFailure(String);
-
 pub fn plan_branch(
     request: &DeployBranchRequest,
     profile: &Profile,
@@ -622,63 +629,6 @@ fn deletion_connection_failure_manifest(
         error: error.to_string(),
     });
     deletion_manifest(plan, paths, false, false)
-}
-
-pub(crate) fn map_remote_path(
-    remote_root: &str,
-    git_path: &[u8],
-) -> Result<(String, String), PathFailure> {
-    let git_path = std::str::from_utf8(git_path)
-        .map_err(|_| PathFailure("Git path is not valid UTF-8".to_string()))?;
-    validate_relative_path(git_path, "Git path")?;
-    let root = normalize_remote_root(remote_root)?;
-    let remote_path = if root == "/" {
-        format!("/{git_path}")
-    } else {
-        format!("{root}/{git_path}")
-    };
-
-    if remote_path == root || !remote_path.starts_with(&(root.clone() + "/")) && root != "/" {
-        return Err(PathFailure(
-            "mapped remote path is not below the configured remote root".to_string(),
-        ));
-    }
-
-    Ok((git_path.to_string(), remote_path))
-}
-
-fn normalize_remote_root(remote_root: &str) -> Result<String, PathFailure> {
-    let trimmed = remote_root.trim();
-    if trimmed.is_empty() || trimmed == "/" {
-        return Ok("/".to_string());
-    }
-    if !trimmed.starts_with('/') {
-        return Err(PathFailure(
-            "configured remote root must be absolute".to_string(),
-        ));
-    }
-
-    let components = trimmed.trim_matches('/');
-    validate_relative_path(components, "configured remote root")?;
-    Ok(format!("/{components}"))
-}
-
-fn validate_relative_path(path: &str, label: &str) -> Result<(), PathFailure> {
-    if path.is_empty() || path.starts_with('/') {
-        return Err(PathFailure(format!(
-            "{label} must be a non-empty relative path"
-        )));
-    }
-
-    for component in path.split('/') {
-        if component.is_empty() || matches!(component, "." | "..") {
-            return Err(PathFailure(format!("{label} has an unsafe component")));
-        }
-        if component.contains('\\') || component.chars().any(char::is_control) {
-            return Err(PathFailure(format!("{label} has an unsafe component")));
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

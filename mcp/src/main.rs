@@ -10,6 +10,8 @@ mod config;
 mod deploy;
 mod drift;
 mod ftp;
+mod git_process;
+mod remote_path;
 mod schema;
 mod tools;
 

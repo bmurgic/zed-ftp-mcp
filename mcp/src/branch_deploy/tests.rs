@@ -1,15 +1,14 @@
 use super::execute::{decide_merge_with, marked_text_for_manifest, RunKind};
 use super::git::BatchBlobReader;
-use super::git::{git_spawn_error, null_device_for_platform};
 use super::merge::{self, ConflictReason, MergeDecision};
 use super::{
     delete_branch_files_with_connector, deletion_dry_run_manifest, deploy_branch,
     deploy_branch_with_connector, deploy_branch_with_dependencies, deploy_or_preview,
-    dry_run_manifest, execute_deletion, execute_deploy, map_remote_path, plan_branch,
-    plan_deletion, preview_merge, BlobSource, BranchDeletePlan, BranchDeployError,
-    BranchDeployPlan, BranchRemote, DeleteBranchFilesRequest, DeletePathResult, DeletePathStatus,
-    DeletedPathResult, DeletedPathStatus, DeployBranchRequest, DeployMode, MergeStatus,
-    PlannedUpload, RemoteComparison, RemoteFailure, UploadStatus, UploadedFrom, VerificationStatus,
+    dry_run_manifest, execute_deletion, execute_deploy, plan_branch, plan_deletion, preview_merge,
+    BlobSource, BranchDeletePlan, BranchDeployError, BranchDeployPlan, BranchRemote,
+    DeleteBranchFilesRequest, DeletePathResult, DeletePathStatus, DeletedPathResult,
+    DeletedPathStatus, DeployBranchRequest, DeployMode, MergeStatus, PlannedUpload,
+    RemoteComparison, RemoteFailure, UploadStatus, UploadedFrom, VerificationStatus,
 };
 use crate::config::Profile;
 use serde_json::json;
@@ -1011,41 +1010,12 @@ fn deletion_manifest_reports_only_the_repository_root() {
 }
 
 #[test]
-fn planner_path_maps_under_remote_root() {
-    let (git_path, remote_path) = map_remote_path("/remote/root/", b"assets/app.js")
-        .expect("path should map under remote root");
+fn a_missing_git_is_invalid_arguments() {
+    let error = BranchDeployError::from(crate::git_process::GitSpawnError::NotFound);
 
-    assert_eq!(git_path, "assets/app.js");
-    assert_eq!(remote_path, "/remote/root/assets/app.js");
-}
-
-#[test]
-fn planner_path_rejects_absolute_dot_backslash_and_control_components() {
-    for path in [
-        b"/absolute".as_slice(),
-        b"./dot",
-        b"dir/../escape",
-        b"dir\\file",
-        b"dir/\x01file",
-        b"dir//file",
-    ] {
-        assert!(
-            map_remote_path("/remote/root", path).is_err(),
-            "{path:?} should fail"
-        );
-    }
-}
-
-#[cfg(unix)]
-#[test]
-fn planner_path_rejects_non_utf8() {
-    assert!(map_remote_path("/remote/root", b"invalid-\xff").is_err());
-}
-
-#[test]
-fn planner_config_uses_platform_null_devices() {
-    assert_eq!(null_device_for_platform(true), "NUL");
-    assert_eq!(null_device_for_platform(false), "/dev/null");
+    assert!(
+        matches!(error, BranchDeployError::InvalidArgs(message) if message.starts_with("`git` was not found on PATH"))
+    );
 }
 
 #[test]
@@ -2025,25 +1995,6 @@ fn merge_decide_reports_a_workspace_failure_as_an_error() {
     );
 
     assert!(matches!(result, Err(BranchDeployError::Other(_))));
-}
-
-#[test]
-fn git_spawn_error_reports_a_missing_git_as_invalid_arguments() {
-    let missing = git_spawn_error(
-        std::io::Error::from(std::io::ErrorKind::NotFound),
-        "spawning git merge-file",
-    );
-    let denied = git_spawn_error(
-        std::io::Error::from(std::io::ErrorKind::PermissionDenied),
-        "spawning git merge-file",
-    );
-
-    assert!(
-        matches!(missing, BranchDeployError::InvalidArgs(message) if message == "`git` was not found on PATH")
-    );
-    assert!(
-        matches!(denied, BranchDeployError::Other(error) if error.to_string() == "spawning git merge-file")
-    );
 }
 
 #[test]

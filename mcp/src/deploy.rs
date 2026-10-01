@@ -13,6 +13,8 @@
 
 use crate::config::Profile;
 use crate::drift::{self, DriftCheck, DriftError, DriftRemote, DriftTarget, ResolvedRef};
+use crate::git_process::run_git;
+use crate::remote_path::parent_to_create;
 use anyhow::{Context, Result};
 use ignore::overrides::OverrideBuilder;
 use ignore::WalkBuilder;
@@ -21,7 +23,6 @@ use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct DeployPlan {
@@ -271,11 +272,7 @@ fn committed_content(local_path: &str) -> Result<Vec<u8>> {
 }
 
 fn git_toplevel(directory: &Path) -> Result<PathBuf> {
-    let root_out = Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .current_dir(directory)
-        .output()
-        .map_err(|e| anyhow::anyhow!("git rev-parse: {e}"))?;
+    let root_out = run_git(directory, &["rev-parse", "--show-toplevel"])?;
     if !root_out.status.success() {
         return Err(anyhow::anyhow!(
             "not a git repo: {}",
@@ -289,11 +286,7 @@ fn git_toplevel(directory: &Path) -> Result<PathBuf> {
 
 /// The content of `rel_str` at HEAD in the repository at `git_root`.
 fn head_version(git_root: &Path, rel_str: &str) -> Result<Vec<u8>> {
-    let show_out = Command::new("git")
-        .args(["show", &format!("HEAD:{rel_str}")])
-        .current_dir(git_root)
-        .output()
-        .map_err(|e| anyhow::anyhow!("git show: {e}"))?;
+    let show_out = run_git(git_root, &["show", &format!("HEAD:{rel_str}")])?;
     if !show_out.status.success() {
         return Err(anyhow::anyhow!(
             "git show HEAD:{rel_str} failed: {}",
@@ -317,10 +310,9 @@ fn changed_paths_for_commit(
     local_root: &Path,
     sha: &str,
 ) -> std::result::Result<Vec<PathBuf>, DeployError> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(local_root)
-        .args([
+    let output = run_git(
+        local_root,
+        &[
             "diff-tree",
             "--no-commit-id",
             "-r",
@@ -330,11 +322,11 @@ fn changed_paths_for_commit(
             // `--end-of-options` makes git read the commit as a revision even when it looks like
             // an option. The trailing `--` ends the revisions, so no path filter follows.
             "--end-of-options",
-        ])
-        .arg(sha)
-        .arg("--")
-        .output()
-        .map_err(|e| DeployError::from(drift::git_spawn_error(e, "spawning git diff-tree")))?;
+            sha,
+            "--",
+        ],
+    )
+    .map_err(DriftError::from)?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -426,7 +418,7 @@ fn plan_uploads(
             )
         })?;
         let remote = remote_path_under(remote_root, &path_to_posix(rel));
-        if let Some(parent) = remote_parent(&remote) {
+        if let Some(parent) = parent_to_create(&remote) {
             parents.insert(parent.to_string());
         }
         let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
@@ -444,17 +436,6 @@ fn remote_path_under(remote_root: &str, relative: &str) -> String {
         format!("/{relative}")
     } else {
         format!("{remote_root}/{relative}")
-    }
-}
-
-/// The directory that holds `remote`, or `None` for a file directly under `/`.
-fn remote_parent(remote: &str) -> Option<&str> {
-    let index = remote.rfind('/')?;
-    let parent = &remote[..index];
-    if parent.is_empty() {
-        None
-    } else {
-        Some(parent)
     }
 }
 
@@ -1797,18 +1778,12 @@ mod tests {
     }
 
     #[test]
-    fn remote_paths_join_the_remote_root_and_name_their_parent_directory() {
+    fn remote_paths_join_the_remote_root() {
         assert_eq!(remote_path_under("", "a.txt"), "/a.txt");
         assert_eq!(
             remote_path_under("/home/test", "sub/a.txt"),
             "/home/test/sub/a.txt"
         );
-        assert_eq!(
-            remote_parent("/home/test/sub/a.txt"),
-            Some("/home/test/sub")
-        );
-        assert_eq!(remote_parent("/a.txt"), None);
-        assert_eq!(remote_parent("a.txt"), None);
     }
 
     #[test]

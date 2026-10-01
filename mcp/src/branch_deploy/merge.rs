@@ -3,8 +3,8 @@
 //! `decide` applies spec rules 2 through 8 to the base, head, and server copies of one file.
 //! Rule 1 (`unchanged_in_range`) compares blob IDs, so the executor decides it before any download.
 
-use super::git::{configure_git_command, git_spawn_error};
 use super::BranchDeployError;
+use crate::git_process::{configure_git_command, git_spawn_error};
 use schemars::JsonSchema;
 use serde::Serialize;
 use std::fs;
@@ -152,7 +152,7 @@ fn run_merge_file(workspace: &Path) -> Result<Output, BranchDeployError> {
             "head",
         ])
         .output()
-        .map_err(|error| git_spawn_error(error, "spawning git merge-file"))
+        .map_err(|error| git_spawn_error(error, "spawning git merge-file").into())
 }
 
 pub(super) fn interpret_merge_file_output(

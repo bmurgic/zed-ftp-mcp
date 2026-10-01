@@ -6,6 +6,7 @@ use super::{
     DeployMode, FailureRecord, ManifestCounts, MergeStatus, PlannedUpload, UploadResult,
     UploadStatus, UploadedFrom, VerificationStatus,
 };
+use crate::remote_path::parent_to_create;
 use std::borrow::Cow;
 
 /// The longest `marked_text` a manifest carries.
@@ -327,7 +328,7 @@ fn send_file<R: BranchRemote>(
     bytes: &[u8],
     remote: &mut R,
 ) -> Result<(), (&'static str, RemoteFailure)> {
-    if let Some(parent) = parent_directory(remote_path) {
+    if let Some(parent) = parent_to_create(remote_path) {
         remote.mkdir_p(parent).map_err(|error| ("mkdir", error))?;
     }
     remote
@@ -756,11 +757,6 @@ fn mark_delete_not_attempted(paths: &mut [DeletePathResult], start: usize) {
     for path in &mut paths[start..] {
         path.status = DeletePathStatus::NotAttempted;
     }
-}
-
-fn parent_directory(path: &str) -> Option<&str> {
-    path.rsplit_once('/')
-        .and_then(|(parent, _)| (!parent.is_empty()).then_some(parent))
 }
 
 /// Marks the still-planned results from `start` on as not attempted. A `not_needed` result
