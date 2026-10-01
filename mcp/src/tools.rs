@@ -452,14 +452,16 @@ impl FtpServer {
         deploy_plan_from_result(result)
     }
 
-    #[tool(description = "Deploy a committed Git range from an explicit worktree. \
+    #[tool(
+        description = "Deploy a committed Git range from an explicit worktree. \
             The plan uses exact head-commit blobs and reports removed Git paths. \
             In overwrite mode, dry_run=true avoids credential and FTP access. \
             In merge mode, dry_run=true connects to the server to preview the merge \
             and never writes. \
             When the user asks to merge into a server or profile (for example \
             'merge into staging') or to preserve server-side changes, set \
-            mode=\"merge\"; run with dry_run=true first to preview conflicts.")]
+            mode=\"merge\"; run with dry_run=true first to preview conflicts."
+    )]
     async fn ftp_deploy_branch(
         &self,
         Parameters(args): Parameters<DeployBranchArgs>,
