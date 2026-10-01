@@ -123,6 +123,7 @@ pub(crate) fn deploy_commits<R: DeployRemote>(
         ));
     }
 
+    reject_option_shaped_commits(commits)?;
     let local_root = canon_local_root(profile).map_err(DeployError::Other)?;
 
     // Union of all changed paths across the requested commits.
@@ -164,6 +165,20 @@ pub(crate) fn deploy_commits<R: DeployRemote>(
         dry_run,
         expect_ref,
     )
+}
+
+/// A commit that is empty or starts with `-` would reach `git diff-tree` as an option, and
+/// `--output=<path>` truncates that file before git fails.
+fn reject_option_shaped_commits(commits: &[String]) -> std::result::Result<(), DeployError> {
+    match commits
+        .iter()
+        .find(|commit| commit.is_empty() || commit.starts_with('-'))
+    {
+        Some(commit) => Err(DeployError::InvalidArgs(format!(
+            "commit '{commit}' is not a commit"
+        ))),
+        None => Ok(()),
+    }
 }
 
 /// One `ftp_upload_file` call.
@@ -312,8 +327,12 @@ fn changed_paths_for_commit(
             "--name-only",
             "--diff-filter=ACMRT",
             "--first-parent",
+            // `--end-of-options` makes git read the commit as a revision even when it looks like
+            // an option. The trailing `--` ends the revisions, so no path filter follows.
+            "--end-of-options",
         ])
         .arg(sha)
+        .arg("--")
         .output()
         .map_err(|e| DeployError::from(drift::git_spawn_error(e, "spawning git diff-tree")))?;
 
@@ -1695,6 +1714,52 @@ mod tests {
 
         assert!(message.contains("no-such-commit"), "{message}");
         assert_eq!(state.borrow().connections, 0);
+    }
+
+    #[test]
+    fn an_option_shaped_commit_is_invalid_arguments_and_writes_no_file() {
+        let site = site(&["a.txt"]);
+        let state = new_state();
+        let outside = tempfile::TempDir::new().expect("temp directory should be created");
+        let victim = outside.path().join("victim");
+        std::fs::write(&victim, b"secret-content\n").expect("fixture should be written");
+
+        for commit in [format!("--output={}", victim.display()), String::new()] {
+            let message = expect_invalid_args(deploy_commits(
+                "qa",
+                &site.profile,
+                std::slice::from_ref(&commit),
+                false,
+                None,
+                connector(&state),
+            ));
+
+            assert!(message.contains("is not a commit"), "{message}");
+        }
+        assert_eq!(
+            std::fs::read(&victim).expect("victim should still exist"),
+            b"secret-content\n"
+        );
+        assert_eq!(state.borrow().connections, 0);
+    }
+
+    #[test]
+    fn diff_tree_reads_an_option_shaped_commit_as_a_revision() {
+        let site = site(&["a.txt"]);
+        let outside = tempfile::TempDir::new().expect("temp directory should be created");
+        let victim = outside.path().join("victim");
+        std::fs::write(&victim, b"secret-content\n").expect("fixture should be written");
+
+        let message = expect_invalid_args(changed_paths_for_commit(
+            site.repo.path(),
+            &format!("--output={}", victim.display()),
+        ));
+
+        assert!(message.contains("git diff-tree failed"), "{message}");
+        assert_eq!(
+            std::fs::read(&victim).expect("victim should still exist"),
+            b"secret-content\n"
+        );
     }
 
     #[test]
