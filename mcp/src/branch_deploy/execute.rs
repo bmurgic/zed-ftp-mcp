@@ -1,3 +1,11 @@
+//! Runs a planned branch deployment: overwrite uploads, the two merge phases, merge previews,
+//! and explicit deletions.
+//!
+//! The executor reaches the server only through `BranchRemote` and Git blobs only through
+//! `BlobSource`, so it names no FTP, Git, or process module. Every executor test runs against
+//! fakes of those two traits. `ftp::FtpClient` and `git::BatchBlobReader` are the real
+//! implementations.
+
 use super::merge::{self, MergeDecision};
 use super::uniform_results;
 use super::{

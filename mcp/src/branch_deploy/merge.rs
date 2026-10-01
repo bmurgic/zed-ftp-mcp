@@ -2,6 +2,10 @@
 //!
 //! `decide` applies spec rules 2 through 8 to the base, head, and server copies of one file.
 //! Rule 1 (`unchanged_in_range`) compares blob IDs, so the executor decides it before any download.
+//!
+//! `decide` takes the three versions as byte slices. It never opens an FTP connection or calls
+//! the executor, so the executor reads and downloads the bytes, and this module only decides.
+//! The `git merge-file` child process is the one outside call it makes.
 
 use super::BranchDeployError;
 use crate::git_process::{configure_git_command, git_spawn_error};
