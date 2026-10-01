@@ -14,7 +14,7 @@
 use crate::config::Profile;
 use crate::drift::{self, DriftCheck, DriftError, DriftRemote, DriftTarget, ResolvedRef};
 use crate::git_process::run_git;
-use crate::remote_path::parent_to_create;
+use crate::remote_path::{parent_to_create, validate_relative_path};
 use anyhow::{Context, Result};
 use ignore::overrides::OverrideBuilder;
 use ignore::WalkBuilder;
@@ -180,6 +180,28 @@ fn reject_option_shaped_commits(commits: &[String]) -> std::result::Result<(), D
         ))),
         None => Ok(()),
     }
+}
+
+/// The full server path for an `ftp_upload_file` call. `remote_path` is relative to the
+/// profile's remote root, and a leading `/` is ignored. With no remote root, `remote_path` is
+/// used as given. A path that could leave the remote root or inject an FTP command is
+/// `InvalidArgs`.
+pub(crate) fn upload_file_remote_path(
+    remote_root: &str,
+    remote_path: &str,
+) -> std::result::Result<String, DeployError> {
+    let relative = remote_path.trim_start_matches('/');
+    reject_unsafe_relative_path(relative, &format!("remote_path {relative:?}"))?;
+    let remote_root = remote_root.trim_end_matches('/');
+    if remote_root.is_empty() {
+        return Ok(remote_path.to_string());
+    }
+    Ok(format!("{remote_root}/{relative}"))
+}
+
+fn reject_unsafe_relative_path(path: &str, label: &str) -> std::result::Result<(), DeployError> {
+    validate_relative_path(path, label)
+        .map_err(|failure| DeployError::InvalidArgs(failure.to_string()))
 }
 
 /// One `ftp_upload_file` call.
@@ -402,11 +424,12 @@ struct PlannedFile {
 }
 
 /// Maps each file to its server path and collects the server directories the run must create.
+/// A file whose path could leave the remote root or inject an FTP command is `InvalidArgs`.
 fn plan_uploads(
     local_root: &Path,
     remote_root: &str,
     files: &[PathBuf],
-) -> Result<(Vec<PlannedFile>, BTreeSet<String>)> {
+) -> std::result::Result<(Vec<PlannedFile>, BTreeSet<String>), DeployError> {
     let mut parents: BTreeSet<String> = BTreeSet::new();
     let mut planned = Vec::with_capacity(files.len());
     for path in files {
@@ -417,7 +440,9 @@ fn plan_uploads(
                 local_root.display()
             )
         })?;
-        let remote = remote_path_under(remote_root, &path_to_posix(rel));
+        let relative = path_to_posix(rel);
+        reject_unsafe_relative_path(&relative, &format!("local file {relative:?}"))?;
+        let remote = remote_path_under(remote_root, &relative);
         if let Some(parent) = parent_to_create(&remote) {
             parents.insert(parent.to_string());
         }
@@ -1775,6 +1800,55 @@ mod tests {
             }
         }
         assert_eq!(state.borrow().connections, 0);
+    }
+
+    #[test]
+    fn an_upload_remote_path_joins_the_remote_root() {
+        assert_eq!(
+            upload_file_remote_path("/home/test/", "/sub/a.txt").expect("a safe path maps"),
+            "/home/test/sub/a.txt"
+        );
+        assert_eq!(
+            upload_file_remote_path("", "sub/a.txt").expect("a safe path maps"),
+            "sub/a.txt"
+        );
+    }
+
+    #[test]
+    fn an_upload_remote_path_that_escapes_or_injects_is_invalid_arguments() {
+        for remote_path in [
+            "../../etc/apache2/.htaccess",
+            "sub/../../x",
+            "ok.txt\r\nDELE /home/test/index.php",
+            "dir\\file",
+        ] {
+            let message = expect_invalid_args(upload_file_remote_path("/home/test", remote_path));
+
+            assert!(
+                message.contains("unsafe component"),
+                "{remote_path:?}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_local_file_name_that_escapes_or_injects_is_invalid_arguments_before_connecting() {
+        for file_name in ["ok.txt\r\nDELE index.php", "dir\\file"] {
+            let local = tempfile::TempDir::new().expect("temp directory should be created");
+            std::fs::write(local.path().join("index.php"), b"<?php\n").expect("fixture written");
+            std::fs::write(local.path().join(file_name), b"x\n").expect("fixture written");
+            let profile = profile_for(local.path(), Vec::new());
+            let state = new_state();
+
+            let message =
+                expect_invalid_args(deploy("qa", &profile, true, None, connector(&state)));
+
+            assert!(
+                message.contains("unsafe component"),
+                "{file_name:?}: {message}"
+            );
+            assert_eq!(state.borrow().connections, 0);
+        }
     }
 
     #[test]

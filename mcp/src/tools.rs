@@ -364,12 +364,8 @@ impl FtpServer {
             expect_ref,
         } = args;
         let pname = profile.clone();
-        let remote_root = p.remote_root.trim_end_matches('/').to_string();
-        let full_remote = if remote_root.is_empty() {
-            remote_path.clone()
-        } else {
-            format!("{remote_root}/{}", remote_path.trim_start_matches('/'))
-        };
+        let full_remote =
+            deploy::upload_file_remote_path(&p.remote_root, &remote_path).map_err(deploy_error)?;
         let local_for_blocking = local_path.clone();
         let remote_for_blocking = full_remote.clone();
         let result = tokio::task::spawn_blocking(move || {

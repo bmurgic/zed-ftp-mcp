@@ -316,6 +316,13 @@ exit nonzero.
 | `ftp_delete_file` | Delete a single remote file |
 | `ftp_delete_dir` | Delete an empty remote directory |
 
+`ftp_upload_file`, `ftp_deploy`, and `ftp_deploy_commits` refuse a server path
+that could leave `remote_root` or carry a second FTP command. Before they
+connect, they return an invalid-arguments error when the path has an empty,
+`.`, or `..` component, a backslash, or a control character such as a line
+break. `ftp_upload_file` checks its `remote_path` argument. `ftp_deploy` and
+`ftp_deploy_commits` check each file's path below `local_root`.
+
 ## Limitations / scope
 
 - **FTP only.** No FTPS or SFTP yet (suppaftp pulled in without TLS features).
