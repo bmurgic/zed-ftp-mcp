@@ -104,7 +104,8 @@ impl FtpClient {
     /// A 550 reply also covers a denied read and a non-file target, so only a 550 whose parent
     /// directory listing lacks the file name means missing. A 550 with the name listed returns
     /// the original 550 error. A failed listing returns the listing's error. Every other error
-    /// passes through unchanged.
+    /// passes through unchanged. Many servers, vsftpd among them, leave dotfiles out of a plain
+    /// listing, so a dotfile also needs a listing with hidden files before it counts as missing.
     pub fn download_or_missing(&mut self, remote_path: &str) -> Result<Option<Vec<u8>>, FtpError> {
         let retrieve_error = match stream!(self, |s| s.retr_as_buffer(remote_path)) {
             Ok(cursor) => return Ok(Some(cursor.into_inner())),
@@ -121,14 +122,24 @@ impl FtpClient {
     }
 
     /// Lists the parent directory of `remote_path` and reports whether the listing names the file.
+    /// A dotfile the plain listing omits gets a second listing, `NLST -a`, which includes hidden
+    /// files.
     fn is_listed_in_parent(&mut self, remote_path: &str) -> Result<bool, FtpError> {
         // A `None` parent lists the working directory, where a bare file name lives.
         let (parent, file_name) = split_parent(remote_path);
         let listing = stream!(self, |s| s.nlst(parent))?;
-        let is_listed = listing
-            .iter()
-            .any(|entry| listing_entry_name(entry) == file_name);
-        Ok(is_listed)
+        if is_named_in(&listing, file_name) {
+            return Ok(true);
+        }
+        if !file_name.starts_with('.') {
+            return Ok(false);
+        }
+        let hidden_files_argument = match parent {
+            Some(parent) => format!("-a {parent}"),
+            None => "-a".to_string(),
+        };
+        let listing = stream!(self, |s| s.nlst(Some(&hidden_files_argument)))?;
+        Ok(is_named_in(&listing, file_name))
     }
 
     /// Upload bytes to `remote_path`. Creates parent directories on demand.
@@ -298,9 +309,16 @@ fn is_file_unavailable(error: &FtpError) -> bool {
     )
 }
 
-/// `NLST` servers return bare names or full paths, so compare on the last component.
+fn is_named_in(listing: &[String], file_name: &str) -> bool {
+    listing
+        .iter()
+        .any(|entry| listing_entry_name(entry) == file_name)
+}
+
+/// `NLST` servers return bare names or full paths, so compare on the last component. Only line
+/// endings are stripped, because spaces at either end belong to the file name.
 fn listing_entry_name(entry: &str) -> &str {
-    let entry = entry.trim();
+    let entry = entry.trim_end_matches(['\r', '\n']);
     entry.rsplit_once('/').map_or(entry, |(_, name)| name)
 }
 
@@ -686,6 +704,12 @@ mod tests {
         client.quit();
         let commands = server.join().expect("download server should complete");
         assert!(commands.contains(&"NLST /site/dir".to_string()));
+        assert!(
+            commands
+                .iter()
+                .all(|command| !command.starts_with("NLST -a")),
+            "only a dotfile needs the hidden-file listing: {commands:?}"
+        );
     }
 
     #[test]
@@ -799,6 +823,74 @@ mod tests {
         }
     }
 
+    #[test]
+    fn branch_adapter_download_reports_a_550_dotfile_the_plain_listing_hides_as_operation_failure()
+    {
+        let (mut client, server) = scripted_download_client(
+            FakeAnswer::Line("550 Failed to open file."),
+            FakeAnswer::Data(b"index.php\r\n".to_vec()),
+            FakeAnswer::Data(b".\r\n..\r\n.htaccess\r\nindex.php\r\n".to_vec()),
+        );
+
+        let failure = BranchRemote::download_bytes(&mut client, "/site/dir/.htaccess")
+            .expect_err("an existing dotfile that cannot be read is a failure");
+
+        assert_eq!(failure.kind, RemoteFailureKind::Operation);
+        client.quit();
+        let commands = server.join().expect("download server should complete");
+        assert!(
+            commands.contains(&"NLST -a /site/dir".to_string()),
+            "{commands:?}"
+        );
+    }
+
+    #[test]
+    fn branch_adapter_download_treats_a_550_dotfile_absent_from_both_listings_as_missing() {
+        let (mut client, server) = scripted_download_client(
+            FakeAnswer::Line("550 Failed to open file."),
+            FakeAnswer::Data(b"index.php\r\n".to_vec()),
+            FakeAnswer::Data(b".\r\n..\r\nindex.php\r\n".to_vec()),
+        );
+
+        let downloaded = BranchRemote::download_bytes(&mut client, "/site/dir/.htaccess")
+            .expect("an absent dotfile is not a failure");
+
+        assert_eq!(downloaded, None);
+        client.quit();
+        server.join().expect("download server should complete");
+    }
+
+    #[test]
+    fn branch_adapter_download_reports_a_550_dotfile_with_a_failed_hidden_listing_as_failure() {
+        let (mut client, server) = scripted_download_client(
+            FakeAnswer::Line("550 Failed to open file."),
+            FakeAnswer::Data(b"index.php\r\n".to_vec()),
+            FakeAnswer::Line("501 Unknown option."),
+        );
+
+        let failure = BranchRemote::download_bytes(&mut client, "/site/dir/.htaccess")
+            .expect_err("an unverifiable dotfile 550 must not read as missing");
+
+        assert_eq!(failure.kind, RemoteFailureKind::Operation);
+        client.quit();
+        server.join().expect("download server should complete");
+    }
+
+    #[test]
+    fn branch_adapter_download_matches_a_listed_name_with_its_spaces() {
+        let (mut client, server) = branch_client_for_download(
+            FakeAnswer::Line("550 Failed to open file."),
+            FakeAnswer::Data(b" notes.txt\r\nreport.txt \r\n".to_vec()),
+        );
+
+        let failure = BranchRemote::download_bytes(&mut client, "/site/dir/ notes.txt")
+            .expect_err("a listed file that cannot be read is a failure");
+
+        assert_eq!(failure.kind, RemoteFailureKind::Operation);
+        client.quit();
+        server.join().expect("download server should complete");
+    }
+
     // `DriftRemote` is called by full path: `BranchRemote` has the same method names, so
     // importing both makes a bare call ambiguous.
     #[test]
@@ -819,6 +911,17 @@ mod tests {
         );
         let failure = crate::drift::DriftRemote::download_bytes(&mut client, "/site/dir/a.txt")
             .expect_err("a listed file that cannot be read is a failure");
+        assert_eq!(failure.kind, RemoteFailureKind::Operation);
+        client.quit();
+        server.join().expect("download server should complete");
+
+        let (mut client, server) = scripted_download_client(
+            FakeAnswer::Line("550 Failed to open file."),
+            FakeAnswer::Data(b"index.php\r\n".to_vec()),
+            FakeAnswer::Data(b".htaccess\r\n".to_vec()),
+        );
+        let failure = crate::drift::DriftRemote::download_bytes(&mut client, "/site/dir/.htaccess")
+            .expect_err("a dotfile only the hidden-file listing shows is a failure");
         assert_eq!(failure.kind, RemoteFailureKind::Operation);
         client.quit();
         server.join().expect("download server should complete");
@@ -882,10 +985,24 @@ mod tests {
     }
 
     /// A scripted FTP server that answers `RETR` and `NLST` with the given answers over a
-    /// passive data connection, and returns every control command it received.
+    /// passive data connection, and returns every control command it received. It refuses
+    /// `NLST -a`, which only a dotfile probe sends.
     fn branch_client_for_download(
         retr_answer: FakeAnswer,
         nlst_answer: FakeAnswer,
+    ) -> (FtpClient, thread::JoinHandle<Vec<String>>) {
+        scripted_download_client(
+            retr_answer,
+            nlst_answer,
+            FakeAnswer::Line("500 no hidden-file listing expected"),
+        )
+    }
+
+    /// Like `branch_client_for_download`, but `NLST -a` gets `hidden_nlst_answer`.
+    fn scripted_download_client(
+        retr_answer: FakeAnswer,
+        nlst_answer: FakeAnswer,
+        hidden_nlst_answer: FakeAnswer,
     ) -> (FtpClient, thread::JoinHandle<Vec<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("download server should bind");
         let address = listener
@@ -914,6 +1031,7 @@ mod tests {
                 }
                 let command = line.trim().to_string();
                 let verb = command.split(' ').next().unwrap_or_default().to_string();
+                let is_hidden_file_listing = command.starts_with("NLST -a");
                 commands.push(command);
                 match verb.as_str() {
                     "PASV" => {
@@ -932,6 +1050,8 @@ mod tests {
                     "RETR" | "NLST" => {
                         let answer = if verb == "RETR" {
                             &retr_answer
+                        } else if is_hidden_file_listing {
+                            &hidden_nlst_answer
                         } else {
                             &nlst_answer
                         };
