@@ -8,7 +8,10 @@
 mod branch_deploy;
 mod config;
 mod deploy;
+mod drift;
 mod ftp;
+mod git_process;
+mod remote_path;
 mod schema;
 mod tools;
 
@@ -35,7 +38,8 @@ enum Cmd {
     },
     /// List configured connection profiles.
     ListProfiles,
-    /// Plan a committed Git range from an explicit worktree.
+    /// Deploy a committed Git range from an explicit worktree. Use --mode merge to merge into
+    /// server-side changes instead of overwriting them.
     DeployBranch {
         /// Profile name as defined in connections.toml.
         profile: String,
@@ -55,9 +59,15 @@ enum Cmd {
             default_value_t = true
         )]
         verify: bool,
-        /// Return the deployment plan without accessing FTP or credentials.
+        /// Preview the deployment without uploading. In overwrite mode it accesses no FTP or
+        /// credentials. In merge mode it connects to the server to preview the merge, and
+        /// never writes.
         #[arg(long)]
         dry_run: bool,
+        /// Deployment mode. overwrite uploads head blobs as they are. merge three-way merges
+        /// each file with its server copy, and uploads nothing if any file conflicts.
+        #[arg(long, value_enum, default_value_t = branch_deploy::DeployMode::Overwrite)]
+        mode: branch_deploy::DeployMode,
     },
     /// Delete exact branch-removed files after explicit approval.
     DeleteBranchFiles {
@@ -106,6 +116,7 @@ async fn main() -> Result<()> {
             head_ref,
             verify,
             dry_run,
+            mode,
         } => deploy_branch_command(branch_deploy::DeployBranchRequest {
             profile,
             repo_root,
@@ -113,6 +124,7 @@ async fn main() -> Result<()> {
             head_ref,
             verify,
             dry_run,
+            mode,
         }),
         Cmd::DeleteBranchFiles {
             profile,
@@ -312,6 +324,20 @@ mod tests {
         }
     }
 
+    fn deploy_branch_request(
+        mode: crate::branch_deploy::DeployMode,
+    ) -> crate::branch_deploy::DeployBranchRequest {
+        crate::branch_deploy::DeployBranchRequest {
+            profile: "staging".to_string(),
+            repo_root: "/repo".to_string(),
+            base_ref: "origin/main".to_string(),
+            head_ref: "HEAD".to_string(),
+            verify: true,
+            dry_run: false,
+            mode,
+        }
+    }
+
     fn unsuccessful_deployment_manifest() -> crate::branch_deploy::BranchDeployManifest {
         let mut plan = BranchDeployPlan::empty("staging", "/repo");
         plan.failures.push(FailureRecord {
@@ -379,6 +405,7 @@ mod tests {
             head_ref,
             verify,
             dry_run,
+            mode,
         }) = cli.command
         else {
             panic!("expected deploy-branch command");
@@ -389,6 +416,52 @@ mod tests {
         assert_eq!(head_ref, "HEAD");
         assert!(verify);
         assert!(dry_run);
+        assert_eq!(mode, crate::branch_deploy::DeployMode::Overwrite);
+    }
+
+    #[test]
+    fn branch_range_04_cli_accepts_merge_mode() {
+        let cli = Cli::try_parse_from([
+            "zed-ftp-mcp",
+            "deploy-branch",
+            "staging",
+            "--repo-root",
+            "/repo",
+            "--base",
+            "origin/dev",
+            "--mode",
+            "merge",
+        ])
+        .expect("CLI arguments should parse");
+
+        let Some(Cmd::DeployBranch { mode, .. }) = cli.command else {
+            panic!("expected deploy-branch command");
+        };
+        assert_eq!(mode, crate::branch_deploy::DeployMode::Merge);
+    }
+
+    #[test]
+    fn branch_range_05_cli_rejects_an_unknown_mode() {
+        for bad_mode in ["rebase", "MERGE"] {
+            let error = match Cli::try_parse_from([
+                "zed-ftp-mcp",
+                "deploy-branch",
+                "staging",
+                "--repo-root",
+                "/repo",
+                "--base",
+                "origin/dev",
+                "--mode",
+                bad_mode,
+            ]) {
+                Ok(_) => panic!("mode {bad_mode} must not parse"),
+                Err(error) => error,
+            };
+
+            assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
+            let message = error.to_string();
+            assert!(message.contains("overwrite") && message.contains("merge"));
+        }
     }
 
     #[test]
@@ -399,14 +472,7 @@ mod tests {
 
     #[test]
     fn deploy_branch_command_writes_unsuccessful_manifest_before_returning_error() {
-        let request = crate::branch_deploy::DeployBranchRequest {
-            profile: "staging".to_string(),
-            repo_root: "/repo".to_string(),
-            base_ref: "origin/main".to_string(),
-            head_ref: "HEAD".to_string(),
-            verify: true,
-            dry_run: false,
-        };
+        let request = deploy_branch_request(crate::branch_deploy::DeployMode::Overwrite);
         let expected_manifest = unsuccessful_deployment_manifest();
         let mut output = Vec::new();
 
@@ -429,6 +495,8 @@ mod tests {
                     "head": { "requested": "HEAD", "commit": "head" }
                 },
                 "merge_rule": "first_parent",
+                "mode": "overwrite",
+                "blocked_by_conflicts": false,
                 "dry_run": true,
                 "verify": true,
                 "counts": {
@@ -449,6 +517,51 @@ mod tests {
                 }]
             })
         );
+    }
+
+    #[test]
+    fn deploy_branch_help_tells_the_reader_when_to_merge() {
+        use clap::CommandFactory;
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("deploy-branch")
+            .expect("deploy-branch subcommand")
+            .render_long_help()
+            .to_string();
+
+        assert!(help.contains("--mode <MODE>"));
+        assert!(help.contains("merge into"));
+        assert!(help.contains("uploads nothing if any file conflicts"));
+        assert!(
+            help.contains("In merge mode it connects to the server to preview the merge"),
+            "the --dry-run help must say a merge preview connects: {help}"
+        );
+        assert!(help.contains("never writes"));
+        assert!(
+            !help.contains("without accessing FTP or credentials"),
+            "the old dry-run wording is wrong for merge mode: {help}"
+        );
+    }
+
+    #[test]
+    fn manifest_04_blocked_merge_is_unsuccessful_through_the_cli() {
+        let request = deploy_branch_request(crate::branch_deploy::DeployMode::Merge);
+        let mut blocked_manifest = unsuccessful_deployment_manifest();
+        blocked_manifest.mode = crate::branch_deploy::DeployMode::Merge;
+        blocked_manifest.blocked_by_conflicts = true;
+        let mut output = Vec::new();
+
+        let result =
+            deploy_branch_command_with_operation(&request, &test_profile(), &mut output, |_, _| {
+                Ok(blocked_manifest)
+            });
+
+        assert!(result.is_err());
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&output).expect("CLI should write manifest JSON before error");
+        assert_eq!(manifest["mode"], "merge");
+        assert_eq!(manifest["blocked_by_conflicts"], true);
+        assert_eq!(manifest["success"], false);
     }
 
     #[test]
@@ -554,6 +667,7 @@ mod tests {
             remote_path: "/remote/app.bin".to_string(),
             object_id: "object".to_string(),
             bytes: 4,
+            base_object_id: None,
         });
         let manifest = dry_run_manifest(plan, true);
         let mut output = Vec::new();
@@ -573,6 +687,7 @@ mod tests {
             remote_path: "/remote/app.bin".to_string(),
             object_id: "object".to_string(),
             bytes: 4,
+            base_object_id: None,
         });
         let mut manifest = dry_run_manifest(plan, true);
         manifest.uploads[0].remote_bytes_read = Some(11);

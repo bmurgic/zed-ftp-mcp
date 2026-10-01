@@ -41,14 +41,23 @@ mod tests {
         assert_integer_schema(&deploy_schema, "/properties/bytes_uploaded", None);
         assert_integer_schema(&deploy_schema, "/properties/directories_created", None);
         assert_integer_schema(&deploy_schema, "/$defs/UploadedFile/properties/bytes", None);
+        assert_integer_schema(&deploy_schema, "/$defs/DriftCheck/properties/checked", None);
         assert_integer_schema(
             &profiles_schema,
             "/$defs/ProfileSummary/properties/port",
             Some(65_535),
         );
         assert_integer_schema(&upload_schema, "/properties/bytes", None);
+        assert_integer_schema(&upload_schema, "/$defs/DriftCheck/properties/checked", None);
         assert_integer_schema(&download_schema, "/properties/bytes", None);
 
+        assert!(
+            !deploy_schema
+                .pointer("/required")
+                .and_then(Value::as_array)
+                .is_some_and(|required| required.contains(&json!("drift_check"))),
+            "drift_check should remain optional"
+        );
         assert_eq!(
             deploy_schema.pointer("/properties/dry_run/type"),
             Some(&json!("boolean"))
@@ -78,6 +87,7 @@ mod tests {
             local_path: "index.html".to_string(),
             remote_path: "/public/index.html".to_string(),
             bytes: 42,
+            drift_check: None,
         };
 
         assert_eq!(
@@ -146,6 +156,14 @@ mod tests {
             );
         }
 
+        assert_eq!(
+            manifest_schema.pointer("/properties/blocked_by_conflicts/type"),
+            Some(&json!("boolean"))
+        );
+        assert_eq!(
+            manifest_schema.pointer("/$defs/DeployMode/enum"),
+            Some(&json!(["overwrite", "merge"]))
+        );
         assert_optional_integer_schema(
             &manifest_schema,
             "/$defs/UploadResult/properties/remote_bytes_read",

@@ -1,15 +1,34 @@
 use crate::config::Profile;
+use crate::git_process::GitSpawnError;
+use crate::remote_path::map_remote_path;
 use schemars::JsonSchema;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 mod execute;
 mod git;
+mod merge;
 
+use execute::RunKind;
 pub use execute::{
-    execute_deletion, execute_deploy, BlobSource, BranchRemote, RemoteComparison, RemoteFailure,
-    RemoteFailureKind,
+    execute_deletion, execute_deploy, preview_merge, BlobSource, BranchRemote, RemoteComparison,
+    RemoteFailure, RemoteFailureKind,
 };
 use git::BatchBlobReader;
+pub use merge::ConflictReason;
+
+/// How a branch deployment treats files that changed on the server.
+/// `overwrite` (the default) uploads head blobs as they are. `merge` three-way merges each file
+/// with its server copy and uploads nothing when any file conflicts. Use `merge` when the user
+/// asks to merge into a server or profile, or to preserve server-side changes.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, clap::ValueEnum,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum DeployMode {
+    #[default]
+    Overwrite,
+    Merge,
+}
 
 #[derive(Debug, Clone)]
 pub struct DeployBranchRequest {
@@ -19,6 +38,7 @@ pub struct DeployBranchRequest {
     pub head_ref: String,
     pub verify: bool,
     pub dry_run: bool,
+    pub mode: DeployMode,
 }
 
 #[derive(Debug, Clone)]
@@ -40,6 +60,15 @@ pub enum BranchDeployError {
     Other(#[from] anyhow::Error),
 }
 
+impl From<GitSpawnError> for BranchDeployError {
+    fn from(error: GitSpawnError) -> Self {
+        match error {
+            GitSpawnError::NotFound => BranchDeployError::InvalidArgs(error.to_string()),
+            GitSpawnError::Other(error) => BranchDeployError::Other(error),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum UploadStatus {
@@ -47,6 +76,8 @@ pub enum UploadStatus {
     Uploaded,
     Failed,
     NotAttempted,
+    /// Merge mode only: the file needs no upload.
+    NotNeeded,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
@@ -58,6 +89,48 @@ pub enum VerificationStatus {
     NotRequested,
     Failed,
     NotAttempted,
+    /// Only where the upload status is `not_needed`.
+    NotNeeded,
+}
+
+impl VerificationStatus {
+    fn planned_for(verify: bool) -> Self {
+        if verify {
+            Self::Planned
+        } else {
+            Self::NotRequested
+        }
+    }
+
+    fn not_attempted_for(verify: bool) -> Self {
+        if verify {
+            Self::NotAttempted
+        } else {
+            Self::NotRequested
+        }
+    }
+}
+
+/// The merge-mode decision for one file. `not_decided` marks a file the run never decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MergeStatus {
+    UnchangedInRange,
+    AlreadyDeployed,
+    FastForward,
+    Merged,
+    NewFile,
+    Conflict,
+    DownloadFailed,
+    NotDecided,
+}
+
+/// Where the uploaded bytes of a merge-mode file come from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum UploadedFrom {
+    HeadBlob,
+    Merged,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
@@ -110,6 +183,17 @@ pub struct PlannedUpload {
     pub object_id: String,
     #[schemars(transform = crate::schema::remove_unsigned_integer_format)]
     pub bytes: u64,
+    /// The base-commit blob for this path. It is set only in merge mode, and only when the
+    /// path is a regular blob at the base commit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_object_id: Option<String>,
+}
+
+impl PlannedUpload {
+    /// Rule 1 of the merge decision table: the range left this path's blob unchanged.
+    pub fn is_unchanged_in_range(&self) -> bool {
+        self.base_object_id.as_deref() == Some(self.object_id.as_str())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -124,6 +208,52 @@ pub struct UploadResult {
     pub remote_bytes_read: Option<u64>,
     pub upload_status: UploadStatus,
     pub verification_status: VerificationStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merge_status: Option<MergeStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uploaded_from: Option<UploadedFrom>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conflict_reason: Option<ConflictReason>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub marked_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub marked_text_truncated: Option<bool>,
+}
+
+impl UploadResult {
+    /// A result with no merge fields, as an overwrite-mode manifest reports it.
+    fn new(
+        upload: &PlannedUpload,
+        upload_status: UploadStatus,
+        verification_status: VerificationStatus,
+    ) -> Self {
+        Self {
+            git_path: upload.git_path.clone(),
+            remote_path: upload.remote_path.clone(),
+            object_id: upload.object_id.clone(),
+            bytes: upload.bytes,
+            remote_bytes_read: None,
+            upload_status,
+            verification_status,
+            merge_status: None,
+            uploaded_from: None,
+            conflict_reason: None,
+            marked_text: None,
+            marked_text_truncated: None,
+        }
+    }
+}
+
+/// One result per planned upload, each with the same statuses and no merge fields.
+fn uniform_results(
+    uploads: &[PlannedUpload],
+    upload_status: UploadStatus,
+    verification_status: VerificationStatus,
+) -> Vec<UploadResult> {
+    uploads
+        .iter()
+        .map(|upload| UploadResult::new(upload, upload_status, verification_status))
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -206,6 +336,7 @@ pub struct BranchDeleteManifest {
 #[derive(Debug, Clone)]
 pub struct BranchDeployPlan {
     pub profile: String,
+    pub mode: DeployMode,
     pub repository: RepositorySummary,
     pub refs: ResolvedRefs,
     pub commits: Vec<String>,
@@ -220,6 +351,7 @@ impl BranchDeployPlan {
     pub fn empty(profile: &str, root: &str) -> Self {
         Self {
             profile: profile.to_string(),
+            mode: DeployMode::Overwrite,
             repository: RepositorySummary {
                 root: root.to_string(),
                 dirty: false,
@@ -250,6 +382,8 @@ pub struct BranchDeployManifest {
     pub repository: RepositorySummary,
     pub refs: ResolvedRefs,
     pub merge_rule: String,
+    pub mode: DeployMode,
+    pub blocked_by_conflicts: bool,
     pub dry_run: bool,
     pub verify: bool,
     pub counts: ManifestCounts,
@@ -257,10 +391,6 @@ pub struct BranchDeployManifest {
     pub deleted: Vec<DeletedPathResult>,
     pub failures: Vec<FailureRecord>,
 }
-
-#[derive(thiserror::Error, Debug, PartialEq, Eq)]
-#[error("{0}")]
-pub struct PathFailure(String);
 
 pub fn plan_branch(
     request: &DeployBranchRequest,
@@ -306,18 +436,60 @@ where
     F: FnOnce(&str, &Profile) -> anyhow::Result<crate::ftp::FtpClient>,
 {
     let plan = plan_branch(request, profile)?;
-    if request.dry_run {
+    if stays_offline(request, &plan) {
         return Ok(dry_run_manifest(plan, request.verify));
     }
 
     let mut blobs = create_blob_source(std::path::Path::new(&plan.repository.root))?;
-    let mut remote = match connect(&request.profile, profile) {
-        Ok(remote) => remote,
-        Err(error) => return Ok(connection_failure_manifest(plan, request.verify, error)),
-    };
-    let manifest = execute_deploy(plan, request.verify, &mut blobs, &mut remote);
-    remote.quit();
-    Ok(manifest)
+    Ok(connect_and_run(plan, request, profile, &mut blobs, connect))
+}
+
+/// An overwrite dry run reads Git metadata only: no credentials, blob content, or FTP.
+fn stays_offline(request: &DeployBranchRequest, plan: &BranchDeployPlan) -> bool {
+    request.dry_run && plan.mode == DeployMode::Overwrite
+}
+
+/// Opens the run's one FTP connection, deploys or previews over it, and closes it.
+fn connect_and_run<S, F>(
+    plan: BranchDeployPlan,
+    request: &DeployBranchRequest,
+    profile: &Profile,
+    blobs: &mut S,
+    connect: F,
+) -> BranchDeployManifest
+where
+    S: BlobSource,
+    F: FnOnce(&str, &Profile) -> anyhow::Result<crate::ftp::FtpClient>,
+{
+    let run = RunKind::from_dry_run(request.dry_run);
+    match connect(&request.profile, profile) {
+        Ok(mut remote) => {
+            let manifest = deploy_or_preview(plan, request.verify, run, blobs, &mut remote);
+            remote.quit();
+            manifest
+        }
+        Err(error) => {
+            let failure = FailureRecord {
+                stage: "connect".to_string(),
+                git_path: None,
+                error: error.to_string(),
+            };
+            execute::nothing_transferred_manifest(plan, request.verify, failure, run)
+        }
+    }
+}
+
+fn deploy_or_preview<R: BranchRemote, B: BlobSource>(
+    plan: BranchDeployPlan,
+    verify: bool,
+    run: RunKind,
+    blobs: &mut B,
+    remote: &mut R,
+) -> BranchDeployManifest {
+    match run {
+        RunKind::Deploy => execute_deploy(plan, verify, blobs, remote),
+        RunKind::Preview => preview_merge(plan, verify, blobs, remote),
+    }
 }
 
 pub fn delete_branch_files(
@@ -350,23 +522,11 @@ where
 }
 
 pub fn dry_run_manifest(plan: BranchDeployPlan, verify: bool) -> BranchDeployManifest {
-    let uploads: Vec<UploadResult> = plan
-        .uploads
-        .into_iter()
-        .map(|upload| UploadResult {
-            git_path: upload.git_path,
-            remote_path: upload.remote_path,
-            object_id: upload.object_id,
-            bytes: upload.bytes,
-            remote_bytes_read: None,
-            upload_status: UploadStatus::Planned,
-            verification_status: if verify {
-                VerificationStatus::Planned
-            } else {
-                VerificationStatus::NotRequested
-            },
-        })
-        .collect();
+    let uploads = uniform_results(
+        &plan.uploads,
+        UploadStatus::Planned,
+        VerificationStatus::planned_for(verify),
+    );
     let counts = ManifestCounts {
         commits: plan.commits.len(),
         touched_paths: plan.touched_paths,
@@ -383,6 +543,8 @@ pub fn dry_run_manifest(plan: BranchDeployPlan, verify: bool) -> BranchDeployMan
         repository: plan.repository,
         refs: plan.refs,
         merge_rule: "first_parent".to_string(),
+        mode: plan.mode,
+        blocked_by_conflicts: false,
         dry_run: true,
         verify,
         counts,
@@ -467,114 +629,6 @@ fn deletion_connection_failure_manifest(
         error: error.to_string(),
     });
     deletion_manifest(plan, paths, false, false)
-}
-
-fn connection_failure_manifest(
-    plan: BranchDeployPlan,
-    verify: bool,
-    error: anyhow::Error,
-) -> BranchDeployManifest {
-    let uploads = plan
-        .uploads
-        .iter()
-        .map(|upload| UploadResult {
-            git_path: upload.git_path.clone(),
-            remote_path: upload.remote_path.clone(),
-            object_id: upload.object_id.clone(),
-            bytes: upload.bytes,
-            remote_bytes_read: None,
-            upload_status: UploadStatus::NotAttempted,
-            verification_status: if verify {
-                VerificationStatus::NotAttempted
-            } else {
-                VerificationStatus::NotRequested
-            },
-        })
-        .collect::<Vec<_>>();
-    let mut failures = plan.failures;
-    failures.push(FailureRecord {
-        stage: "connect".to_string(),
-        git_path: None,
-        error: error.to_string(),
-    });
-    BranchDeployManifest {
-        success: false,
-        profile: plan.profile,
-        repository: plan.repository,
-        refs: plan.refs,
-        merge_rule: "first_parent".to_string(),
-        dry_run: false,
-        verify,
-        counts: ManifestCounts {
-            commits: plan.commits.len(),
-            touched_paths: plan.touched_paths,
-            planned_uploads: uploads.len(),
-            uploaded: 0,
-            verified: 0,
-            deleted_reported: plan.deleted.len(),
-            failures: failures.len(),
-        },
-        uploads,
-        deleted: plan.deleted,
-        failures,
-    }
-}
-
-pub(crate) fn map_remote_path(
-    remote_root: &str,
-    git_path: &[u8],
-) -> Result<(String, String), PathFailure> {
-    let git_path = std::str::from_utf8(git_path)
-        .map_err(|_| PathFailure("Git path is not valid UTF-8".to_string()))?;
-    validate_relative_path(git_path, "Git path")?;
-    let root = normalize_remote_root(remote_root)?;
-    let remote_path = if root == "/" {
-        format!("/{git_path}")
-    } else {
-        format!("{root}/{git_path}")
-    };
-
-    if remote_path == root || !remote_path.starts_with(&(root.clone() + "/")) && root != "/" {
-        return Err(PathFailure(
-            "mapped remote path is not below the configured remote root".to_string(),
-        ));
-    }
-
-    Ok((git_path.to_string(), remote_path))
-}
-
-fn normalize_remote_root(remote_root: &str) -> Result<String, PathFailure> {
-    let trimmed = remote_root.trim();
-    if trimmed.is_empty() || trimmed == "/" {
-        return Ok("/".to_string());
-    }
-    if !trimmed.starts_with('/') {
-        return Err(PathFailure(
-            "configured remote root must be absolute".to_string(),
-        ));
-    }
-
-    let components = trimmed.trim_matches('/');
-    validate_relative_path(components, "configured remote root")?;
-    Ok(format!("/{components}"))
-}
-
-fn validate_relative_path(path: &str, label: &str) -> Result<(), PathFailure> {
-    if path.is_empty() || path.starts_with('/') {
-        return Err(PathFailure(format!(
-            "{label} must be a non-empty relative path"
-        )));
-    }
-
-    for component in path.split('/') {
-        if component.is_empty() || matches!(component, "." | "..") {
-            return Err(PathFailure(format!("{label} has an unsafe component")));
-        }
-        if component.contains('\\') || component.chars().any(char::is_control) {
-            return Err(PathFailure(format!("{label} has an unsafe component")));
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

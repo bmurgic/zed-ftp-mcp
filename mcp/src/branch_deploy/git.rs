@@ -1,26 +1,15 @@
 use super::{
     map_remote_path, BlobSource, BlockedPath, BranchDeletePlan, BranchDeployError,
     BranchDeployPlan, DeleteBranchFilesRequest, DeletePathResult, DeletePathStatus,
-    DeletedPathResult, DeletedPathStatus, DeployBranchRequest, FailureRecord, PlannedUpload,
-    RepositorySummary, RequestedAndResolvedRef, ResolvedRefs,
+    DeletedPathResult, DeletedPathStatus, DeployBranchRequest, DeployMode, FailureRecord,
+    PlannedUpload, RepositorySummary, RequestedAndResolvedRef, ResolvedRefs,
 };
 use crate::config::Profile;
+use crate::git_process::{configure_git_command, git_spawn_error, is_regular_file};
 use std::collections::{BTreeMap, BTreeSet};
-use std::env;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Output, Stdio};
-
-const GIT_OPTIONAL_LOCKS_DISABLED: &str = "0";
-const GIT_SAFE_PAGER: &str = "cat";
-
-pub(super) fn null_device_for_platform(is_windows: bool) -> &'static str {
-    if is_windows {
-        "NUL"
-    } else {
-        "/dev/null"
-    }
-}
 
 #[derive(Debug)]
 struct TreeEntry {
@@ -45,15 +34,7 @@ impl BatchBlobReader {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
-            .map_err(|error| {
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    BranchDeployError::InvalidArgs("`git` was not found on PATH".to_string())
-                } else {
-                    BranchDeployError::Other(
-                        anyhow::Error::from(error).context("spawning git cat-file"),
-                    )
-                }
-            })?;
+            .map_err(|error| git_spawn_error(error, "spawning git cat-file"))?;
         let stdin = child.stdin.take().ok_or_else(|| {
             BranchDeployError::Other(anyhow::anyhow!("git cat-file did not provide stdin"))
         })?;
@@ -143,7 +124,8 @@ pub(super) fn plan_branch(
     let head_commit = resolve_commit(&repository_root, &request.head_ref)?;
     let commits = range_commits(&repository_root, &base_commit, &head_commit)?;
     let touched_paths = touched_paths(&repository_root, &commits)?;
-    let head_tree = head_tree(&repository_root, &head_commit)?;
+    let head_tree = commit_tree(&repository_root, &head_commit)?;
+    let base_tree = base_tree_for_mode(&repository_root, request.mode, &base_commit)?;
     let dirty = !run_git(
         &repository_root,
         ["status", "--porcelain=v1", "-z", "--untracked-files=normal"],
@@ -168,6 +150,7 @@ pub(super) fn plan_branch(
                         remote_path,
                         object_id: entry.object_id.clone(),
                         bytes: entry.bytes,
+                        base_object_id: base_object_id(base_tree.as_ref(), path),
                     }),
                     Err(error) => failures.push(planning_failure(path, error.to_string())),
                 }
@@ -198,6 +181,7 @@ pub(super) fn plan_branch(
 
     Ok(BranchDeployPlan {
         profile: request.profile.clone(),
+        mode: request.mode,
         repository: RepositorySummary {
             root: repository_root.display().to_string(),
             dirty,
@@ -269,7 +253,7 @@ pub(super) fn plan_deletion(
 
     let commits = range_commits(&repository_root, &base_commit, &head_commit)?;
     let touched = touched_paths(&repository_root, &commits)?;
-    let head_tree = head_tree(&repository_root, &head_commit)?;
+    let head_tree = commit_tree(&repository_root, &head_commit)?;
     let deleted: BTreeSet<Vec<u8>> = touched
         .into_iter()
         .filter(|path| !head_tree.contains_key(path))
@@ -503,13 +487,13 @@ fn touched_paths(
     Ok(touched)
 }
 
-fn head_tree(
+fn commit_tree(
     repository_root: &Path,
-    head_commit: &str,
+    commit: &str,
 ) -> Result<BTreeMap<Vec<u8>, TreeEntry>, BranchDeployError> {
     let output = run_git(
         repository_root,
-        ["ls-tree", "-rz", "-l", "--full-tree", head_commit],
+        ["ls-tree", "-rz", "-l", "--full-tree", commit],
     )?;
     let mut tree = BTreeMap::new();
 
@@ -566,8 +550,28 @@ fn head_tree(
     Ok(tree)
 }
 
+/// Only merge mode reads the base tree, so an overwrite plan does no extra Git work.
+fn base_tree_for_mode(
+    repository_root: &Path,
+    mode: DeployMode,
+    base_commit: &str,
+) -> Result<Option<BTreeMap<Vec<u8>, TreeEntry>>, BranchDeployError> {
+    match mode {
+        DeployMode::Merge => Ok(Some(commit_tree(repository_root, base_commit)?)),
+        DeployMode::Overwrite => Ok(None),
+    }
+}
+
+/// A base entry that is not a regular blob, such as a symbolic link or submodule, counts as absent.
+fn base_object_id(base_tree: Option<&BTreeMap<Vec<u8>, TreeEntry>>, path: &[u8]) -> Option<String> {
+    base_tree?
+        .get(path)
+        .filter(|entry| is_regular_blob(entry))
+        .map(|entry| entry.object_id.clone())
+}
+
 fn is_regular_blob(entry: &TreeEntry) -> bool {
-    entry.object_type == "blob" && matches!(entry.mode.as_str(), "100644" | "100755")
+    is_regular_file(&entry.object_type, &entry.mode)
 }
 
 fn parse_name_status(output: &[u8]) -> Result<Vec<Vec<u8>>, BranchDeployError> {
@@ -677,13 +681,10 @@ where
 {
     let mut command = Command::new("git");
     configure_git_command(&mut command, repository_root);
-    let output = command.args(arguments).output().map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            BranchDeployError::InvalidArgs("`git` was not found on PATH".to_string())
-        } else {
-            BranchDeployError::Other(anyhow::Error::from(error).context("spawning git"))
-        }
-    })?;
+    let output = command
+        .args(arguments)
+        .output()
+        .map_err(|error| git_spawn_error(error, "spawning git"))?;
     if output.status.success() {
         return Ok(output);
     }
@@ -695,42 +696,6 @@ where
         stderr
     };
     Err(BranchDeployError::InvalidArgs(detail))
-}
-
-fn configure_git_command(command: &mut Command, repository_root: &Path) {
-    let null_device = null_device_for_platform(cfg!(windows));
-    let hooks_path = format!("core.hooksPath={null_device}");
-    // Planning must not inherit Git variables that can select another repository or inject config.
-    command.env_clear();
-    if let Some(path) = env::var_os("PATH") {
-        command.env("PATH", path);
-    }
-    // System and user configuration are outside the selected repository and cannot affect planning.
-    command
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", null_device)
-        // Replacement refs can make recorded commit IDs disagree with planned trees and blobs.
-        .env("GIT_NO_REPLACE_OBJECTS", "1")
-        // This is defense in depth only; partial and promisor repositories are rejected before object inspection.
-        .env("GIT_NO_LAZY_FETCH", "1")
-        // `git status` must not refresh the index or create an optional lock while inspecting dirty state.
-        .env("GIT_OPTIONAL_LOCKS", GIT_OPTIONAL_LOCKS_DISABLED)
-        .env("GIT_PAGER", GIT_SAFE_PAGER)
-        // Planner commands must not invoke repository-configured monitors, hooks, pagers, or external diffs.
-        .args([
-            "-c",
-            "core.fsmonitor=false",
-            "-c",
-            hooks_path.as_str(),
-            "-c",
-            "core.pager=cat",
-            "-c",
-            "diff.external=",
-            "-c",
-            "submodule.recurse=false",
-        ])
-        .arg("-C")
-        .arg(repository_root);
 }
 
 fn output_text(output: &Output, command: &str) -> Result<String, BranchDeployError> {

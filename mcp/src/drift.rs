@@ -1,0 +1,1031 @@
+//! Drift guard for the upload tools.
+//!
+//! With `expect_ref` set, `ftp_upload_file`, `ftp_deploy`, and `ftp_deploy_commits` download each
+//! target file's server copy before uploading anything. A file is drifted when the server holds
+//! content that is neither the copy at `expect_ref` nor the copy the tool is about to upload. Any
+//! drifted file refuses the whole run.
+
+use crate::branch_deploy::RemoteFailure;
+use crate::git_process::{is_regular_file, run_git, GitSpawnError};
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+use std::path::{Path, PathBuf};
+use std::process::Output;
+
+/// The server side of a drift check. `FtpClient` implements it through `download_or_missing`.
+pub trait DriftRemote {
+    fn set_binary_mode(&mut self) -> Result<(), RemoteFailure>;
+    /// Downloads a server file. `Ok(None)` means the file is missing, which only an FTP 550
+    /// reply confirmed by the parent listing may report. Every other error is a failure.
+    fn download_bytes(&mut self, path: &str) -> Result<Option<Vec<u8>>, RemoteFailure>;
+}
+
+/// `expect_ref` resolved to a commit inside the repository that holds the target files.
+#[derive(Debug, Clone)]
+pub struct ResolvedRef {
+    repo_root: PathBuf,
+    expect_ref: String,
+    commit: String,
+}
+
+/// One file the tool would upload.
+#[derive(Debug, Clone)]
+pub struct DriftTarget {
+    /// The full server path, including the profile's remote root.
+    pub remote_path: String,
+    /// The file's path relative to the repository root, with `/` separators.
+    pub repo_path: String,
+    /// The size and digest of the exact bytes the tool would upload.
+    pub upload: UploadFingerprint,
+}
+
+/// The size and SHA-256 digest of an upload copy. A target keeps this instead of the bytes, so a
+/// guarded run holds at most one file in memory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadFingerprint {
+    len: u64,
+    digest: [u8; 32],
+}
+
+impl UploadFingerprint {
+    pub fn of(bytes: &[u8]) -> Self {
+        Self {
+            len: bytes.len() as u64,
+            digest: Sha256::digest(bytes).into(),
+        }
+    }
+
+    /// Reads the file in chunks, so computing the fingerprint does not load the whole file.
+    pub fn of_file(path: &Path) -> std::io::Result<Self> {
+        let mut hasher = Sha256::new();
+        let len = std::io::copy(&mut std::fs::File::open(path)?, &mut hasher)?;
+        Ok(Self {
+            len,
+            digest: hasher.finalize().into(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DriftReason {
+    /// The server copy exists and equals neither the expected copy nor the upload copy.
+    ContentDiffers,
+    /// The server copy is missing, but the file exists at `expect_ref`.
+    MissingOnServer,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+pub struct DriftedFile {
+    /// The full server path, including the profile's remote root.
+    pub remote_path: String,
+    pub reason: DriftReason,
+}
+
+/// The drift-check result. It appears in a response only when `expect_ref` was supplied.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+pub struct DriftCheck {
+    /// The ref as requested.
+    pub expect_ref: String,
+    /// The full commit identifier the ref resolved to.
+    pub resolved_commit: String,
+    /// The number of target files checked.
+    #[schemars(transform = crate::schema::remove_unsigned_integer_format)]
+    pub checked: usize,
+    /// True when at least one file drifted. A refused run uploads nothing.
+    pub refused: bool,
+    pub drifted: Vec<DriftedFile>,
+}
+
+impl DriftCheck {
+    /// The result for a run that has no target files, so nothing was downloaded.
+    pub fn without_targets(resolved: &ResolvedRef) -> Self {
+        Self {
+            expect_ref: resolved.expect_ref.clone(),
+            resolved_commit: resolved.commit.clone(),
+            checked: 0,
+            refused: false,
+            drifted: Vec::new(),
+        }
+    }
+}
+
+/// `InvalidArgs` is a mistake the caller can fix. It is always raised before an FTP connection
+/// opens.
+#[derive(thiserror::Error, Debug)]
+pub enum DriftError {
+    #[error("{0}")]
+    InvalidArgs(String),
+    #[error("downloading {remote_path} for the drift check failed: {error}")]
+    Download { remote_path: String, error: String },
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
+impl From<GitSpawnError> for DriftError {
+    fn from(error: GitSpawnError) -> Self {
+        match error {
+            GitSpawnError::NotFound => DriftError::InvalidArgs(error.to_string()),
+            GitSpawnError::Other(error) => DriftError::Other(error),
+        }
+    }
+}
+
+/// Resolves `expect_ref` to a commit in the Git worktree that contains `repo_dir`.
+/// Tags are peeled, and the object must exist.
+pub fn resolve_expect_ref(repo_dir: &Path, expect_ref: &str) -> Result<ResolvedRef, DriftError> {
+    // A leading dash would make git read the ref as an option.
+    if expect_ref.is_empty() || expect_ref.starts_with('-') {
+        return Err(DriftError::InvalidArgs(format!(
+            "expect_ref '{expect_ref}' is not a Git ref"
+        )));
+    }
+    let repo_root = worktree_root(repo_dir)?;
+    let commit = peel_to_commit(&repo_root, expect_ref)?;
+    Ok(ResolvedRef {
+        repo_root,
+        expect_ref: expect_ref.to_string(),
+        commit,
+    })
+}
+
+fn worktree_root(repo_dir: &Path) -> Result<PathBuf, DriftError> {
+    let top_level = run_git(repo_dir, &["rev-parse", "--show-toplevel"])?;
+    if !top_level.status.success() {
+        return Err(DriftError::InvalidArgs(format!(
+            "expect_ref needs a Git worktree, and '{}' is not inside one: {}",
+            repo_dir.display(),
+            stderr_text(&top_level)
+        )));
+    }
+    PathBuf::from(stdout_text(&top_level))
+        .canonicalize()
+        .map_err(|error| {
+            DriftError::InvalidArgs(format!("Git worktree root cannot be resolved: {error}"))
+        })
+}
+
+/// The full commit identifier `expect_ref` names, with tags peeled.
+fn peel_to_commit(repo_root: &Path, expect_ref: &str) -> Result<String, DriftError> {
+    let peeled = format!("{expect_ref}^{{commit}}");
+    let commit_output = run_git(repo_root, &["rev-parse", "--verify", peeled.as_str()])?;
+    if !commit_output.status.success() {
+        return Err(DriftError::InvalidArgs(format!(
+            "expect_ref '{expect_ref}' does not resolve to a commit: {}",
+            stderr_text(&commit_output)
+        )));
+    }
+    let commit = stdout_text(&commit_output);
+    if !is_full_commit_id(&commit) {
+        return Err(DriftError::Other(anyhow::anyhow!(
+            "git returned an invalid commit identifier '{commit}'"
+        )));
+    }
+    Ok(commit)
+}
+
+/// A full SHA-1 or SHA-256 object name in hexadecimal.
+fn is_full_commit_id(text: &str) -> bool {
+    matches!(text.len(), 40 | 64) && text.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// A file's path relative to the repository root, with `/` separators.
+pub fn repo_relative_path(resolved: &ResolvedRef, file: &Path) -> Result<String, DriftError> {
+    let absolute = file.canonicalize().map_err(|error| {
+        DriftError::InvalidArgs(format!("cannot resolve {}: {error}", file.display()))
+    })?;
+    let relative = absolute.strip_prefix(&resolved.repo_root).map_err(|_| {
+        DriftError::InvalidArgs(format!(
+            "{} is not inside the Git worktree {}",
+            file.display(),
+            resolved.repo_root.display()
+        ))
+    })?;
+    Ok(relative
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/"))
+}
+
+/// Targets that passed `validate_expected_paths`, each with the blob ID of its path at
+/// `expect_ref`. A `None` ID means the path has no entry there.
+#[derive(Debug, Clone)]
+pub struct ValidatedTargets {
+    targets: Vec<DriftTarget>,
+    expected_blob_ids: Vec<Option<String>>,
+}
+
+impl ValidatedTargets {
+    pub fn targets(&self) -> &[DriftTarget] {
+        &self.targets
+    }
+}
+
+/// Rejects any target whose path at `expect_ref` is a directory, a submodule, or a symbolic link,
+/// and keeps each blob ID it found so `check_drift` does not look the paths up again. Callers run
+/// this before they open an FTP connection.
+pub fn validate_expected_paths(
+    resolved: &ResolvedRef,
+    targets: Vec<DriftTarget>,
+) -> Result<ValidatedTargets, DriftError> {
+    let expected_blob_ids = targets
+        .iter()
+        .map(|target| expected_blob_id(resolved, &target.repo_path))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ValidatedTargets {
+        targets,
+        expected_blob_ids,
+    })
+}
+
+/// Downloads every target's server copy and classifies it against the copy at `expect_ref` and
+/// the upload copy. It stops at the first download failure and never classifies past it.
+pub fn check_drift<R: DriftRemote>(
+    remote: &mut R,
+    validated: &ValidatedTargets,
+    resolved: &ResolvedRef,
+) -> Result<DriftCheck, DriftError> {
+    select_binary_mode(remote)?;
+    let mut drifted = Vec::new();
+    for (target, expected_blob_id) in validated.targets.iter().zip(&validated.expected_blob_ids) {
+        if let Some(drifted_file) =
+            check_target(remote, target, expected_blob_id.as_deref(), resolved)?
+        {
+            drifted.push(drifted_file);
+        }
+    }
+    Ok(DriftCheck {
+        expect_ref: resolved.expect_ref.clone(),
+        resolved_commit: resolved.commit.clone(),
+        checked: validated.targets.len(),
+        refused: !drifted.is_empty(),
+        drifted,
+    })
+}
+
+fn select_binary_mode<R: DriftRemote>(remote: &mut R) -> Result<(), DriftError> {
+    remote.set_binary_mode().map_err(|failure| {
+        DriftError::Other(anyhow::anyhow!(
+            "selecting binary mode for the drift check failed: {}",
+            failure.error
+        ))
+    })
+}
+
+/// `None` means the target is clean.
+fn check_target<R: DriftRemote>(
+    remote: &mut R,
+    target: &DriftTarget,
+    expected_blob_id: Option<&str>,
+    resolved: &ResolvedRef,
+) -> Result<Option<DriftedFile>, DriftError> {
+    let expected = expected_blob_id
+        .map(|blob_id| read_expected_blob(resolved, &target.repo_path, blob_id))
+        .transpose()?;
+    let server = download_server_copy(remote, target)?;
+    let reason = classify(server.as_deref(), expected.as_deref(), &target.upload);
+    Ok(reason.map(|reason| DriftedFile {
+        remote_path: target.remote_path.clone(),
+        reason,
+    }))
+}
+
+fn download_server_copy<R: DriftRemote>(
+    remote: &mut R,
+    target: &DriftTarget,
+) -> Result<Option<Vec<u8>>, DriftError> {
+    remote
+        .download_bytes(&target.remote_path)
+        .map_err(|failure| DriftError::Download {
+            remote_path: target.remote_path.clone(),
+            error: failure.error,
+        })
+}
+
+/// `None` means the file is clean.
+fn classify(
+    server: Option<&[u8]>,
+    expected: Option<&[u8]>,
+    upload: &UploadFingerprint,
+) -> Option<DriftReason> {
+    let is_upload_copy = |server: &[u8]| UploadFingerprint::of(server) == *upload;
+    match (server, expected) {
+        (Some(server), Some(expected)) => {
+            (server != expected && !is_upload_copy(server)).then_some(DriftReason::ContentDiffers)
+        }
+        (Some(server), None) => (!is_upload_copy(server)).then_some(DriftReason::ContentDiffers),
+        (None, Some(_)) => Some(DriftReason::MissingOnServer),
+        (None, None) => None,
+    }
+}
+
+/// The content of `repo_path` at `expect_ref`, read by its blob ID.
+fn read_expected_blob(
+    resolved: &ResolvedRef,
+    repo_path: &str,
+    blob_id: &str,
+) -> Result<Vec<u8>, DriftError> {
+    let output = run_git(&resolved.repo_root, &["cat-file", "blob", blob_id])?;
+    if !output.status.success() {
+        return Err(DriftError::Other(anyhow::anyhow!(
+            "git cat-file failed for {repo_path} at {}: {}",
+            resolved.commit,
+            stderr_text(&output)
+        )));
+    }
+    Ok(output.stdout)
+}
+
+/// The blob ID of the regular file at `repo_path` in the resolved commit, `None` when the path
+/// has no entry there, and `InvalidArgs` when the entry is anything but a regular file.
+fn expected_blob_id(resolved: &ResolvedRef, repo_path: &str) -> Result<Option<String>, DriftError> {
+    let output = run_git(
+        &resolved.repo_root,
+        &["ls-tree", "-z", resolved.commit.as_str(), "--", repo_path],
+    )?;
+    if !output.status.success() {
+        return Err(DriftError::Other(anyhow::anyhow!(
+            "git ls-tree failed for {repo_path} at {}: {}",
+            resolved.commit,
+            stderr_text(&output)
+        )));
+    }
+    let Some(record) = first_ls_tree_record(&output.stdout) else {
+        return Ok(None);
+    };
+    regular_file_blob_id(resolved, repo_path, record).map(Some)
+}
+
+/// `ls-tree` matches whole path components, so a path prints at most its own entry.
+fn first_ls_tree_record(stdout: &[u8]) -> Option<&[u8]> {
+    stdout
+        .split(|byte| *byte == b'\0')
+        .next()
+        .filter(|record| !record.is_empty())
+}
+
+/// Reads `<mode> <type> <object>\t<path>` and accepts only a regular or executable file blob.
+fn regular_file_blob_id(
+    resolved: &ResolvedRef,
+    repo_path: &str,
+    record: &[u8],
+) -> Result<String, DriftError> {
+    let metadata = record
+        .split(|byte| *byte == b'\t')
+        .next()
+        .map(String::from_utf8_lossy)
+        .unwrap_or_default();
+    let fields: Vec<&str> = metadata.split(' ').collect();
+    let [mode, object_type, object_id] = fields.as_slice() else {
+        return Err(DriftError::Other(anyhow::anyhow!(
+            "malformed git ls-tree record for {repo_path}"
+        )));
+    };
+    if !is_regular_file(object_type, mode) {
+        return Err(DriftError::InvalidArgs(format!(
+            "{repo_path} is not a regular file at expect_ref '{}' (it is a {object_type} with mode {mode})",
+            resolved.expect_ref
+        )));
+    }
+    Ok((*object_id).to_string())
+}
+
+fn stdout_text(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn stderr_text(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).trim().to_string()
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    /// A scripted server. A path with a scripted failure fails, a path in `files` downloads, and
+    /// any other path is missing.
+    #[derive(Default)]
+    pub(crate) struct FakeRemote {
+        pub(crate) files: BTreeMap<String, Vec<u8>>,
+        pub(crate) failures: BTreeMap<String, RemoteFailure>,
+        pub(crate) binary_mode_failure: Option<RemoteFailure>,
+        pub(crate) calls: Vec<String>,
+    }
+
+    impl DriftRemote for FakeRemote {
+        fn set_binary_mode(&mut self) -> Result<(), RemoteFailure> {
+            self.calls.push("TYPE I".to_string());
+            match &self.binary_mode_failure {
+                Some(failure) => Err(failure.clone()),
+                None => Ok(()),
+            }
+        }
+
+        fn download_bytes(&mut self, path: &str) -> Result<Option<Vec<u8>>, RemoteFailure> {
+            self.calls.push(format!("RETR {path}"));
+            if let Some(failure) = self.failures.get(path) {
+                return Err(failure.clone());
+            }
+            Ok(self.files.get(path).cloned())
+        }
+    }
+
+    /// A temporary Git repository with a fixed identity.
+    pub(crate) struct TestRepo {
+        directory: TempDir,
+    }
+
+    impl TestRepo {
+        pub(crate) fn new() -> Self {
+            let repo = Self {
+                directory: TempDir::new().expect("temp directory should be created"),
+            };
+            repo.git_success(&["init", "-q"]);
+            repo
+        }
+
+        pub(crate) fn path(&self) -> &Path {
+            self.directory.path()
+        }
+
+        pub(crate) fn write(&self, relative_path: &str, bytes: &[u8]) {
+            let path = self.path().join(relative_path);
+            std::fs::create_dir_all(path.parent().expect("fixture path has a parent"))
+                .expect("fixture directory should be created");
+            std::fs::write(path, bytes).expect("fixture file should be written");
+        }
+
+        pub(crate) fn commit_all(&self, message: &str) -> String {
+            self.git_success(&["add", "-A"]);
+            self.git_success(&["commit", "-q", "-m", message]);
+            self.git_text(&["rev-parse", "HEAD"])
+        }
+
+        pub(crate) fn git_text(&self, arguments: &[&str]) -> String {
+            let output = self.git_success(arguments);
+            String::from_utf8(output.stdout)
+                .expect("git output should be UTF-8")
+                .trim()
+                .to_string()
+        }
+
+        pub(crate) fn git_success(&self, arguments: &[&str]) -> Output {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(self.path())
+                .args([
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(arguments)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_AUTHOR_NAME", "Drift Test")
+                .env("GIT_AUTHOR_EMAIL", "drift@example.test")
+                .env("GIT_COMMITTER_NAME", "Drift Test")
+                .env("GIT_COMMITTER_EMAIL", "drift@example.test")
+                .output()
+                .expect("git should run");
+            assert!(
+                output.status.success(),
+                "git {arguments:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output
+        }
+    }
+
+    fn target(remote_path: &str, repo_path: &str, upload: &[u8]) -> DriftTarget {
+        DriftTarget {
+            remote_path: remote_path.to_string(),
+            repo_path: repo_path.to_string(),
+            upload: UploadFingerprint::of(upload),
+        }
+    }
+
+    fn expect_invalid_args<T: std::fmt::Debug>(result: Result<T, DriftError>) -> String {
+        match result {
+            Err(DriftError::InvalidArgs(message)) => message,
+            other => panic!("expected InvalidArgs, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn expected_ref_02_unresolvable_expected_ref_is_rejected() {
+        let repo = TestRepo::new();
+        repo.write("a.txt", b"one\n");
+        repo.commit_all("base");
+
+        for bad_ref in [
+            "no-such-branch",
+            "0000000000000000000000000000000000000000",
+            "HEAD:a.txt",
+        ] {
+            let message = expect_invalid_args(resolve_expect_ref(repo.path(), bad_ref));
+            assert!(
+                message.contains("does not resolve to a commit"),
+                "{message}"
+            );
+        }
+        // An empty ref or one git would read as an option never reaches git.
+        for bad_ref in ["", "--all"] {
+            let message = expect_invalid_args(resolve_expect_ref(repo.path(), bad_ref));
+            assert_eq!(message, format!("expect_ref '{bad_ref}' is not a Git ref"));
+        }
+    }
+
+    #[test]
+    fn expect_ref_peels_a_tag_and_a_branch_to_the_full_commit() {
+        let repo = TestRepo::new();
+        repo.write("a.txt", b"one\n");
+        let commit = repo.commit_all("base");
+        repo.git_success(&["tag", "-a", "-m", "release", "release"]);
+        repo.git_success(&["branch", "deployed"]);
+
+        for reference in ["release", "deployed", "HEAD"] {
+            let resolved = resolve_expect_ref(repo.path(), reference).expect("ref should resolve");
+            assert_eq!(resolved.commit, commit, "{reference}");
+            assert_eq!(resolved.expect_ref, reference);
+        }
+    }
+
+    #[test]
+    fn expected_ref_03_upload_source_outside_a_repository() {
+        let outside = TempDir::new().expect("temp directory should be created");
+
+        let message = expect_invalid_args(resolve_expect_ref(outside.path(), "HEAD"));
+
+        assert!(message.contains("Git worktree"), "{message}");
+        let git = Command::new("git")
+            .arg("-C")
+            .arg(outside.path())
+            .args(["rev-parse", "--show-toplevel"])
+            .output()
+            .expect("git should run");
+        let git_error = String::from_utf8_lossy(&git.stderr).trim().to_string();
+        assert!(!git_error.is_empty());
+        assert!(
+            message.ends_with(&format!(": {git_error}")),
+            "the message should end with git's own error: {message}"
+        );
+    }
+
+    #[test]
+    fn a_missing_git_is_invalid_arguments() {
+        let message = expect_invalid_args::<()>(Err(DriftError::from(GitSpawnError::NotFound)));
+
+        assert_eq!(message, GitSpawnError::NotFound.to_string());
+    }
+
+    #[test]
+    fn expect_ref_resolves_from_a_subdirectory_to_the_repository_root() {
+        let repo = TestRepo::new();
+        repo.write("site/a.txt", b"one\n");
+        repo.commit_all("base");
+
+        let resolved = resolve_expect_ref(&repo.path().join("site"), "HEAD")
+            .expect("a subdirectory of the worktree is inside the repository");
+
+        assert_eq!(
+            resolved.repo_root,
+            repo.path().canonicalize().expect("repo path exists")
+        );
+        assert_eq!(
+            repo_relative_path(&resolved, &repo.path().join("site/a.txt"))
+                .expect("file is inside the repository"),
+            "site/a.txt"
+        );
+    }
+
+    #[test]
+    fn repo_relative_path_rejects_a_file_outside_the_repository() {
+        let repo = TestRepo::new();
+        repo.write("a.txt", b"one\n");
+        repo.commit_all("base");
+        let outside = TempDir::new().expect("temp directory should be created");
+        std::fs::write(outside.path().join("loose.txt"), b"x").expect("fixture should be written");
+        let resolved = resolve_expect_ref(repo.path(), "HEAD").expect("ref should resolve");
+
+        expect_invalid_args(repo_relative_path(
+            &resolved,
+            &outside.path().join("loose.txt"),
+        ));
+        expect_invalid_args(repo_relative_path(
+            &resolved,
+            &repo.path().join("missing.txt"),
+        ));
+    }
+
+    #[test]
+    fn expected_ref_04_expected_path_is_not_a_regular_file() {
+        let repo = TestRepo::new();
+        repo.write("folder/inner.txt", b"inner\n");
+        repo.write("target.txt", b"target\n");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("target.txt", repo.path().join("link.txt"))
+            .expect("symlink should be created");
+        repo.git_success(&["add", "-A"]);
+        let gitlink = format!("160000,{},module", "1".repeat(40));
+        repo.git_success(&["update-index", "--add", "--cacheinfo", gitlink.as_str()]);
+        repo.git_success(&["commit", "-q", "-m", "base"]);
+        let resolved = resolve_expect_ref(repo.path(), "HEAD").expect("ref should resolve");
+
+        let mut not_regular = vec!["folder", "module"];
+        if cfg!(unix) {
+            not_regular.push("link.txt");
+        }
+        for repo_path in not_regular {
+            let targets = vec![target("/site/x", repo_path, b"upload")];
+
+            let message = expect_invalid_args(validate_expected_paths(&resolved, targets));
+            assert!(message.contains(repo_path), "{message}");
+        }
+        validate_expected_paths(&resolved, vec![target("/site/x", "target.txt", b"upload")])
+            .expect("a regular file is accepted");
+    }
+
+    /// The content `check_drift` compares with for `repo_path`, or `None` when it has no entry.
+    fn expected_copy(
+        resolved: &ResolvedRef,
+        repo_path: &str,
+    ) -> Result<Option<Vec<u8>>, DriftError> {
+        expected_blob_id(resolved, repo_path)?
+            .map(|blob_id| read_expected_blob(resolved, repo_path, &blob_id))
+            .transpose()
+    }
+
+    fn validated(resolved: &ResolvedRef, targets: Vec<DriftTarget>) -> ValidatedTargets {
+        validate_expected_paths(resolved, targets).expect("targets should validate")
+    }
+
+    #[test]
+    fn expected_copy_matches_the_exact_path_only() {
+        let repo = TestRepo::new();
+        repo.write("a.txt", b"only a.txt\n");
+        repo.write("dir/a", b"nested a\n");
+        repo.commit_all("base");
+        let resolved = resolve_expect_ref(repo.path(), "HEAD").expect("ref should resolve");
+
+        assert_eq!(
+            expected_copy(&resolved, "a").expect("a is absent, not invalid"),
+            None
+        );
+        assert_eq!(
+            expected_copy(&resolved, "dir/a").expect("nested file is a regular file"),
+            Some(b"nested a\n".to_vec())
+        );
+        assert_eq!(
+            expected_copy(&resolved, "a.txt").expect("top-level file is a regular file"),
+            Some(b"only a.txt\n".to_vec())
+        );
+    }
+
+    #[test]
+    fn drift_classification_01_classification_table() {
+        let repo = TestRepo::new();
+        repo.write("site/present.txt", b"expected\n");
+        repo.commit_all("base");
+        let resolved = resolve_expect_ref(repo.path(), "HEAD").expect("ref should resolve");
+        let upload: &[u8] = b"upload\n";
+        struct Row {
+            name: &'static str,
+            server: Option<&'static [u8]>,
+            repo_path: &'static str,
+            reason: Option<DriftReason>,
+        }
+        let rows = [
+            Row {
+                name: "equal to the expected copy, present",
+                server: Some(b"expected\n"),
+                repo_path: "site/present.txt",
+                reason: None,
+            },
+            Row {
+                name: "equal to the upload copy, present",
+                server: Some(b"upload\n"),
+                repo_path: "site/present.txt",
+                reason: None,
+            },
+            Row {
+                name: "equal to the upload copy, absent",
+                server: Some(b"upload\n"),
+                repo_path: "site/absent.txt",
+                reason: None,
+            },
+            Row {
+                name: "missing, absent",
+                server: None,
+                repo_path: "site/absent.txt",
+                reason: None,
+            },
+            Row {
+                name: "different from both copies, present",
+                server: Some(b"server\n"),
+                repo_path: "site/present.txt",
+                reason: Some(DriftReason::ContentDiffers),
+            },
+            Row {
+                name: "different from the upload copy, absent",
+                server: Some(b"server\n"),
+                repo_path: "site/absent.txt",
+                reason: Some(DriftReason::ContentDiffers),
+            },
+            Row {
+                name: "missing, present",
+                server: None,
+                repo_path: "site/present.txt",
+                reason: Some(DriftReason::MissingOnServer),
+            },
+        ];
+
+        for Row {
+            name,
+            server,
+            repo_path,
+            reason: expected_reason,
+        } in rows
+        {
+            let mut remote = FakeRemote::default();
+            if let Some(bytes) = server {
+                remote
+                    .files
+                    .insert("/site/file".to_string(), bytes.to_vec());
+            }
+
+            let check = check_drift(
+                &mut remote,
+                &validated(&resolved, vec![target("/site/file", repo_path, upload)]),
+                &resolved,
+            )
+            .expect("the drift check should complete");
+
+            let reasons: Vec<DriftReason> = check.drifted.iter().map(|d| d.reason).collect();
+            assert_eq!(
+                reasons,
+                expected_reason.into_iter().collect::<Vec<_>>(),
+                "{name}"
+            );
+            assert_eq!(check.refused, expected_reason.is_some(), "{name}");
+            assert_eq!(check.checked, 1, "{name}");
+        }
+    }
+
+    #[test]
+    fn drift_check_lists_every_drifted_file_in_target_order_with_its_full_server_path() {
+        let repo = TestRepo::new();
+        repo.write("a.txt", b"a\n");
+        repo.write("b.txt", b"b\n");
+        repo.write("c.txt", b"c\n");
+        repo.commit_all("base");
+        let resolved = resolve_expect_ref(repo.path(), "HEAD").expect("ref should resolve");
+        let mut remote = FakeRemote::default();
+        remote
+            .files
+            .insert("/root/a.txt".to_string(), b"a\n".to_vec());
+        remote
+            .files
+            .insert("/root/c.txt".to_string(), b"edited c\n".to_vec());
+        let targets = validated(
+            &resolved,
+            vec![
+                target("/root/c.txt", "c.txt", b"new c\n"),
+                target("/root/a.txt", "a.txt", b"new a\n"),
+                target("/root/b.txt", "b.txt", b"new b\n"),
+            ],
+        );
+
+        let check =
+            check_drift(&mut remote, &targets, &resolved).expect("the drift check should complete");
+
+        assert_eq!(check.checked, 3);
+        assert!(check.refused);
+        assert_eq!(
+            check.drifted,
+            vec![
+                DriftedFile {
+                    remote_path: "/root/c.txt".to_string(),
+                    reason: DriftReason::ContentDiffers,
+                },
+                DriftedFile {
+                    remote_path: "/root/b.txt".to_string(),
+                    reason: DriftReason::MissingOnServer,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn drift_check_compares_with_the_blob_validation_found() {
+        let (repo, resolved) = repository_with_a_txt();
+        repo.write("other.txt", b"other\n");
+        let other_commit = repo.commit_all("other");
+        let other_blob = repo.git_text(&["rev-parse", &format!("{other_commit}:other.txt")]);
+        let mut remote = FakeRemote::default();
+        remote
+            .files
+            .insert("/r/a.txt".to_string(), b"other\n".to_vec());
+        let validated = ValidatedTargets {
+            targets: vec![target("/r/a.txt", "a.txt", b"upload\n")],
+            expected_blob_ids: vec![Some(other_blob)],
+        };
+
+        let check = check_drift(&mut remote, &validated, &resolved)
+            .expect("the drift check should complete");
+
+        assert!(
+            check.drifted.is_empty(),
+            "the server copy equals the validated blob, so it is clean: {check:?}"
+        );
+    }
+
+    /// A repository whose one commit holds `a.txt`, resolved at HEAD. Keep the repository alive
+    /// while the resolved ref is in use.
+    fn repository_with_a_txt() -> (TestRepo, ResolvedRef) {
+        let repo = TestRepo::new();
+        repo.write("a.txt", b"a\n");
+        repo.commit_all("base");
+        let resolved = resolve_expect_ref(repo.path(), "HEAD").expect("ref should resolve");
+        (repo, resolved)
+    }
+
+    #[test]
+    fn drift_check_selects_binary_mode_before_the_first_download() {
+        let (_repo, resolved) = repository_with_a_txt();
+        let mut remote = FakeRemote::default();
+
+        check_drift(
+            &mut remote,
+            &validated(&resolved, vec![target("/r/a.txt", "a.txt", b"a\n")]),
+            &resolved,
+        )
+        .expect("the drift check should complete");
+
+        assert_eq!(remote.calls, vec!["TYPE I", "RETR /r/a.txt"]);
+    }
+
+    #[test]
+    fn drift_check_downloads_nothing_when_binary_mode_fails() {
+        let (_repo, resolved) = repository_with_a_txt();
+        let mut remote = FakeRemote {
+            binary_mode_failure: Some(RemoteFailure::operation("500 no TYPE")),
+            ..FakeRemote::default()
+        };
+
+        let error = check_drift(
+            &mut remote,
+            &validated(&resolved, vec![target("/r/a.txt", "a.txt", b"a\n")]),
+            &resolved,
+        )
+        .expect_err("a failed binary mode must fail the check");
+
+        assert!(matches!(error, DriftError::Other(_)), "{error:?}");
+        assert_eq!(remote.calls, vec!["TYPE I"]);
+    }
+
+    #[test]
+    fn drift_classification_03_download_error_is_not_treated_as_missing() {
+        let repo = TestRepo::new();
+        for name in ["one", "two", "three"] {
+            repo.write(&format!("{name}.txt"), b"committed\n");
+        }
+        repo.commit_all("base");
+        let resolved = resolve_expect_ref(repo.path(), "HEAD").expect("ref should resolve");
+        let failures = [
+            (
+                "a 451 local error",
+                RemoteFailure::operation("451 Local error"),
+            ),
+            (
+                "a 550 reply while the parent listing contains the file name",
+                RemoteFailure::operation("550 Failed to open file"),
+            ),
+            (
+                "a lost connection",
+                RemoteFailure::connection_lost("connection reset"),
+            ),
+        ];
+
+        for (name, failure) in failures {
+            let mut remote = FakeRemote::default();
+            remote
+                .files
+                .insert("/r/one.txt".to_string(), b"server edit\n".to_vec());
+            remote
+                .failures
+                .insert("/r/two.txt".to_string(), failure.clone());
+            let targets = validated(
+                &resolved,
+                vec![
+                    target("/r/one.txt", "one.txt", b"upload\n"),
+                    target("/r/two.txt", "two.txt", b"upload\n"),
+                    target("/r/three.txt", "three.txt", b"upload\n"),
+                ],
+            );
+
+            let error = check_drift(&mut remote, &targets, &resolved)
+                .expect_err("a download failure must fail the whole check");
+
+            match error {
+                DriftError::Download { remote_path, error } => {
+                    assert_eq!(remote_path, "/r/two.txt", "{name}");
+                    assert_eq!(error, failure.error, "{name}");
+                }
+                other => panic!("{name}: expected a download error, got {other:?}"),
+            }
+            assert_eq!(
+                remote.calls,
+                vec!["TYPE I", "RETR /r/one.txt", "RETR /r/two.txt"],
+                "{name}: nothing is downloaded after the failure"
+            );
+        }
+    }
+
+    #[test]
+    fn a_full_commit_id_is_40_or_64_hexadecimal_digits() {
+        assert!(is_full_commit_id(&"a".repeat(40)));
+        assert!(is_full_commit_id(&"0123456789abcdef".repeat(4)));
+        for not_an_id in [
+            String::new(),
+            "abc".to_string(),
+            "g".repeat(40),
+            "a".repeat(41),
+        ] {
+            assert!(!is_full_commit_id(&not_an_id), "{not_an_id}");
+        }
+    }
+
+    #[test]
+    fn a_malformed_ls_tree_record_is_an_internal_error() {
+        let resolved = ResolvedRef {
+            repo_root: PathBuf::from("/unused"),
+            expect_ref: "HEAD".to_string(),
+            commit: "a".repeat(40),
+        };
+
+        for record in [
+            &b""[..],
+            &b"100644 blob\tpath"[..],
+            &b"100644 blob abc extra\tpath"[..],
+        ] {
+            match regular_file_blob_id(&resolved, "path", record) {
+                Err(DriftError::Other(error)) => {
+                    assert!(error.to_string().contains("malformed"), "{error}");
+                }
+                other => panic!("expected an internal error, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            regular_file_blob_id(&resolved, "path", b"100755 blob abc123\tpath")
+                .expect("an executable file is a regular file"),
+            "abc123"
+        );
+    }
+
+    #[test]
+    fn drift_check_result_serializes_to_the_documented_shape() {
+        let refused = DriftCheck {
+            expect_ref: "base".to_string(),
+            resolved_commit: "a".repeat(40),
+            checked: 2,
+            refused: true,
+            drifted: vec![
+                DriftedFile {
+                    remote_path: "/home/test/c.txt".to_string(),
+                    reason: DriftReason::ContentDiffers,
+                },
+                DriftedFile {
+                    remote_path: "/home/test/d.txt".to_string(),
+                    reason: DriftReason::MissingOnServer,
+                },
+            ],
+        };
+        let clean = DriftCheck {
+            refused: false,
+            drifted: Vec::new(),
+            ..refused.clone()
+        };
+
+        assert_eq!(
+            serde_json::to_value(&refused).expect("result should serialize"),
+            serde_json::json!({
+                "expect_ref": "base",
+                "resolved_commit": "a".repeat(40),
+                "checked": 2,
+                "refused": true,
+                "drifted": [
+                    {"remote_path": "/home/test/c.txt", "reason": "content_differs"},
+                    {"remote_path": "/home/test/d.txt", "reason": "missing_on_server"}
+                ]
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(&clean).expect("result should serialize")["drifted"],
+            serde_json::json!([])
+        );
+    }
+}

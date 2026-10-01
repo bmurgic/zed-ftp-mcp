@@ -1,8 +1,24 @@
+//! Runs a planned branch deployment: overwrite uploads, the two merge phases, merge previews,
+//! and explicit deletions.
+//!
+//! The executor reaches the server only through `BranchRemote` and Git blobs only through
+//! `BlobSource`, so it names no FTP, Git, or process module. Every executor test runs against
+//! fakes of those two traits. `ftp::FtpClient` and `git::BatchBlobReader` are the real
+//! implementations.
+
+use super::merge::{self, MergeDecision};
+use super::uniform_results;
 use super::{
     deletion_manifest, BranchDeleteManifest, BranchDeletePlan, BranchDeployError,
-    BranchDeployManifest, BranchDeployPlan, DeletePathResult, DeletePathStatus, FailureRecord,
-    ManifestCounts, UploadResult, UploadStatus, VerificationStatus,
+    BranchDeployManifest, BranchDeployPlan, ConflictReason, DeletePathResult, DeletePathStatus,
+    DeployMode, FailureRecord, ManifestCounts, MergeStatus, PlannedUpload, UploadResult,
+    UploadStatus, UploadedFrom, VerificationStatus,
 };
+use crate::remote_path::parent_to_create;
+use std::borrow::Cow;
+
+/// The longest `marked_text` a manifest carries.
+const MAX_MARKED_TEXT_BYTES: usize = 65_536;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemoteFailureKind {
@@ -39,6 +55,27 @@ pub struct RemoteComparison {
     pub bytes_read: u64,
 }
 
+/// Whether a run deploys or only previews. A preview never writes to the server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RunKind {
+    Deploy,
+    Preview,
+}
+
+impl RunKind {
+    pub(super) fn from_dry_run(dry_run: bool) -> Self {
+        if dry_run {
+            RunKind::Preview
+        } else {
+            RunKind::Deploy
+        }
+    }
+
+    fn is_dry_run(self) -> bool {
+        self == RunKind::Preview
+    }
+}
+
 pub trait BranchRemote {
     fn set_binary_mode(&mut self) -> Result<(), RemoteFailure>;
     fn mkdir_p(&mut self, path: &str) -> Result<(), RemoteFailure>;
@@ -49,6 +86,9 @@ pub trait BranchRemote {
         expected: &[u8],
     ) -> Result<RemoteComparison, RemoteFailure>;
     fn delete_file(&mut self, path: &str) -> Result<(), RemoteFailure>;
+    /// Downloads a server file. `Ok(None)` means the file is missing, which only an FTP 550
+    /// reply confirmed by the parent listing may report. Every other error is a failure.
+    fn download_bytes(&mut self, path: &str) -> Result<Option<Vec<u8>>, RemoteFailure>;
 }
 
 pub trait BlobSource {
@@ -61,112 +101,633 @@ pub fn execute_deploy<R: BranchRemote, B: BlobSource>(
     blobs: &mut B,
     remote: &mut R,
 ) -> BranchDeployManifest {
-    let mut failures = plan.failures.clone();
-    let mut uploads = plan
-        .uploads
-        .iter()
-        .map(|upload| UploadResult {
-            git_path: upload.git_path.clone(),
-            remote_path: upload.remote_path.clone(),
-            object_id: upload.object_id.clone(),
-            bytes: upload.bytes,
-            remote_bytes_read: None,
-            upload_status: UploadStatus::Planned,
-            verification_status: if verify {
-                VerificationStatus::Planned
-            } else {
-                VerificationStatus::NotRequested
-            },
-        })
-        .collect::<Vec<_>>();
-
     if let Err(error) = remote.set_binary_mode() {
-        failures.push(remote_failure("binary_mode", None, &error));
-        mark_not_attempted(&mut uploads, 0, verify);
-        return manifest_from_execution(plan, verify, uploads, failures);
+        let failure = remote_failure("binary_mode", None, &error);
+        return nothing_transferred_manifest(plan, verify, failure, RunKind::Deploy);
     }
 
-    let mut connection_lost = false;
-    for index in 0..plan.uploads.len() {
-        if connection_lost {
-            break;
+    let mut failures = plan.failures.clone();
+    let (mut uploads, sources) = match plan.mode {
+        DeployMode::Overwrite => (
+            uniform_results(
+                &plan.uploads,
+                UploadStatus::Planned,
+                VerificationStatus::planned_for(verify),
+            ),
+            vec![Some(UploadSource::HeadBlob); plan.uploads.len()],
+        ),
+        DeployMode::Merge => {
+            let phase = decide_merge(&plan, blobs, remote);
+            let report = SourceReport::for_deploy(phase.is_blocked);
+            let uploads = merge_results(&plan, &phase, verify, report);
+            failures.extend(phase.failures);
+            if phase.is_blocked {
+                return manifest_from_execution(
+                    plan,
+                    verify,
+                    uploads,
+                    failures,
+                    true,
+                    RunKind::Deploy,
+                );
+            }
+            let sources = phase
+                .outcomes
+                .into_iter()
+                .map(|outcome| outcome.source)
+                .collect();
+            (uploads, sources)
         }
-        let upload = &plan.uploads[index];
-        let result = &mut uploads[index];
-        let bytes = match blobs.read_blob(&upload.object_id) {
+    };
+
+    upload_phase(
+        &plan,
+        verify,
+        blobs,
+        remote,
+        &sources,
+        &mut uploads,
+        &mut failures,
+    );
+    manifest_from_execution(plan, verify, uploads, failures, false, RunKind::Deploy)
+}
+
+/// A merge preview: binary mode, then phase 1 through the real connector, and nothing else. It
+/// returns before phase 2, so it never uploads, creates a directory, verifies, or deletes. A
+/// file that would upload reports `planned`, even when a blocking cause stops the real run.
+/// Call it with a merge-mode plan only.
+pub fn preview_merge<R: BranchRemote, B: BlobSource>(
+    plan: BranchDeployPlan,
+    verify: bool,
+    blobs: &mut B,
+    remote: &mut R,
+) -> BranchDeployManifest {
+    if let Err(error) = remote.set_binary_mode() {
+        let failure = remote_failure("binary_mode", None, &error);
+        return nothing_transferred_manifest(plan, verify, failure, RunKind::Preview);
+    }
+
+    let phase = decide_merge(&plan, blobs, remote);
+    let uploads = merge_results(&plan, &phase, verify, SourceReport::Planned);
+    let mut failures = plan.failures.clone();
+    failures.extend(phase.failures);
+    manifest_from_execution(
+        plan,
+        verify,
+        uploads,
+        failures,
+        phase.is_blocked,
+        RunKind::Preview,
+    )
+}
+
+/// The manifest for a run that transferred nothing because the connection or binary mode
+/// failed. `failure` records that cause. A merge-mode run is blocked.
+pub(super) fn nothing_transferred_manifest(
+    plan: BranchDeployPlan,
+    verify: bool,
+    failure: FailureRecord,
+    run: RunKind,
+) -> BranchDeployManifest {
+    let mut failures = plan.failures.clone();
+    failures.push(failure);
+    let uploads = not_attempted_results(&plan, verify);
+    let is_blocked = plan.mode == DeployMode::Merge;
+    manifest_from_execution(plan, verify, uploads, failures, is_blocked, run)
+}
+
+/// Results for a run that transferred nothing because the connection or binary mode failed.
+/// In merge mode, files that rule 1 settles are `unchanged_in_range`, and the rest are
+/// `not_decided`.
+fn not_attempted_results(plan: &BranchDeployPlan, verify: bool) -> Vec<UploadResult> {
+    match plan.mode {
+        DeployMode::Overwrite => uniform_results(
+            &plan.uploads,
+            UploadStatus::NotAttempted,
+            VerificationStatus::not_attempted_for(verify),
+        ),
+        DeployMode::Merge => plan
+            .uploads
+            .iter()
+            .map(|upload| {
+                let outcome = FileOutcome::without_upload(status_before_download(upload));
+                merge_result(upload, &outcome, verify, SourceReport::NotAttempted)
+            })
+            .collect(),
+    }
+}
+
+/// Whether the connection can carry the next transfer after one file's upload ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Connection {
+    Usable,
+    Lost,
+}
+
+impl Connection {
+    fn after(error: &RemoteFailure) -> Self {
+        match error.kind {
+            RemoteFailureKind::ConnectionLost => Self::Lost,
+            RemoteFailureKind::Operation => Self::Usable,
+        }
+    }
+}
+
+/// Phase 2: uploads each file that has a source, and verifies it against the uploaded bytes.
+fn upload_phase<R: BranchRemote, B: BlobSource>(
+    plan: &BranchDeployPlan,
+    verify: bool,
+    blobs: &mut B,
+    remote: &mut R,
+    sources: &[Option<UploadSource>],
+    uploads: &mut [UploadResult],
+    failures: &mut Vec<FailureRecord>,
+) {
+    for (index, upload) in plan.uploads.iter().enumerate() {
+        let Some(source) = &sources[index] else {
+            continue;
+        };
+        let file = FileUpload {
+            upload,
+            source,
+            result: &mut uploads[index],
+        };
+        let connection = file.run(verify, blobs, remote, failures);
+        if connection == Connection::Lost {
+            mark_not_attempted(uploads, index + 1, verify);
+            return;
+        }
+    }
+}
+
+/// One planned file in phase 2, with the result it fills in.
+struct FileUpload<'a> {
+    upload: &'a PlannedUpload,
+    source: &'a UploadSource,
+    result: &'a mut UploadResult,
+}
+
+impl FileUpload<'_> {
+    fn run<R: BranchRemote, B: BlobSource>(
+        self,
+        verify: bool,
+        blobs: &mut B,
+        remote: &mut R,
+        failures: &mut Vec<FailureRecord>,
+    ) -> Connection {
+        let bytes = match self.source.bytes(self.upload, blobs) {
             Ok(bytes) => bytes,
             Err(error) => {
-                result.upload_status = UploadStatus::Failed;
-                result.verification_status = VerificationStatus::NotAttempted;
-                failures.push(FailureRecord {
-                    stage: "read_blob".to_string(),
-                    git_path: Some(upload.git_path.clone()),
-                    error: error.to_string(),
-                });
-                continue;
+                self.result.upload_status = UploadStatus::Failed;
+                self.result.verification_status = VerificationStatus::NotAttempted;
+                failures.push(read_blob_failure(self.upload, &error));
+                return Connection::Usable;
             }
         };
-
-        let parent = parent_directory(&upload.remote_path);
-        if let Some(parent) = parent {
-            if let Err(error) = remote.mkdir_p(parent) {
-                result.upload_status = UploadStatus::Failed;
-                result.verification_status = VerificationStatus::NotAttempted;
-                failures.push(remote_failure("mkdir", Some(&upload.git_path), &error));
-                if error.kind == RemoteFailureKind::ConnectionLost {
-                    connection_lost = true;
-                    mark_not_attempted(&mut uploads, index + 1, verify);
-                }
-                continue;
-            }
+        if let Err((stage, error)) = send_file(&self.upload.remote_path, &bytes, remote) {
+            self.result.upload_status = UploadStatus::Failed;
+            self.result.verification_status = VerificationStatus::NotAttempted;
+            failures.push(remote_failure(stage, Some(&self.upload.git_path), &error));
+            return Connection::after(&error);
         }
-
-        if let Err(error) = remote.upload_bytes(&upload.remote_path, &bytes) {
-            result.upload_status = UploadStatus::Failed;
-            result.verification_status = VerificationStatus::NotAttempted;
-            failures.push(remote_failure("upload", Some(&upload.git_path), &error));
-            if error.kind == RemoteFailureKind::ConnectionLost {
-                connection_lost = true;
-                mark_not_attempted(&mut uploads, index + 1, verify);
-            }
-            continue;
-        }
-        result.upload_status = UploadStatus::Uploaded;
-
+        self.result.upload_status = UploadStatus::Uploaded;
         if !verify {
-            continue;
+            return Connection::Usable;
         }
+        self.verify(&bytes, remote, failures)
+    }
 
-        match remote.compare_remote_bytes(&upload.remote_path, &bytes) {
-            Ok(comparison) => {
-                result.remote_bytes_read = Some(comparison.bytes_read);
-                if comparison.matches {
-                    result.verification_status = VerificationStatus::Verified;
-                } else {
-                    result.verification_status = VerificationStatus::Mismatch;
-                    failures.push(FailureRecord {
-                        stage: "verification".to_string(),
-                        git_path: Some(upload.git_path.clone()),
-                        error: "remote bytes do not match the committed blob".to_string(),
-                    });
-                }
-            }
+    fn verify<R: BranchRemote>(
+        self,
+        bytes: &[u8],
+        remote: &mut R,
+        failures: &mut Vec<FailureRecord>,
+    ) -> Connection {
+        let comparison = match remote.compare_remote_bytes(&self.upload.remote_path, bytes) {
+            Ok(comparison) => comparison,
             Err(error) => {
-                result.verification_status = VerificationStatus::Failed;
+                self.result.verification_status = VerificationStatus::Failed;
                 failures.push(remote_failure(
                     "verification",
-                    Some(&upload.git_path),
+                    Some(&self.upload.git_path),
                     &error,
                 ));
-                if error.kind == RemoteFailureKind::ConnectionLost {
-                    connection_lost = true;
-                    mark_not_attempted(&mut uploads, index + 1, verify);
-                }
+                return Connection::after(&error);
             }
+        };
+        self.result.remote_bytes_read = Some(comparison.bytes_read);
+        if comparison.matches {
+            self.result.verification_status = VerificationStatus::Verified;
+        } else {
+            self.result.verification_status = VerificationStatus::Mismatch;
+            failures.push(FailureRecord {
+                stage: "verification".to_string(),
+                git_path: Some(self.upload.git_path.clone()),
+                error: self.source.mismatch_message().to_string(),
+            });
+        }
+        Connection::Usable
+    }
+}
+
+/// Creates the parent directory and uploads the bytes. An error names the failed stage.
+fn send_file<R: BranchRemote>(
+    remote_path: &str,
+    bytes: &[u8],
+    remote: &mut R,
+) -> Result<(), (&'static str, RemoteFailure)> {
+    if let Some(parent) = parent_to_create(remote_path) {
+        remote.mkdir_p(parent).map_err(|error| ("mkdir", error))?;
+    }
+    remote
+        .upload_bytes(remote_path, bytes)
+        .map_err(|error| ("upload", error))?;
+    Ok(())
+}
+
+/// What the upload phase sends for one file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UploadSource {
+    /// Overwrite mode reads the head blob when it uploads, because it has no phase 1.
+    HeadBlob,
+    /// Merge mode uploads the head bytes phase 1 already read, so a blob source that fails
+    /// between the phases cannot leave a partial deployment.
+    HeadBytes(Vec<u8>),
+    Merged(Vec<u8>),
+}
+
+impl UploadSource {
+    fn bytes<B: BlobSource>(
+        &self,
+        upload: &PlannedUpload,
+        blobs: &mut B,
+    ) -> Result<Cow<'_, [u8]>, BranchDeployError> {
+        match self {
+            Self::HeadBlob => Ok(Cow::Owned(blobs.read_blob(&upload.object_id)?)),
+            Self::HeadBytes(bytes) | Self::Merged(bytes) => Ok(Cow::Borrowed(bytes.as_slice())),
         }
     }
 
-    manifest_from_execution(plan, verify, uploads, failures)
+    fn mismatch_message(&self) -> &'static str {
+        match self {
+            Self::HeadBlob | Self::HeadBytes(_) => "remote bytes do not match the committed blob",
+            Self::Merged(_) => "remote bytes do not match the merged bytes",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConflictDetail {
+    pub reason: ConflictReason,
+    pub marked_text: Option<Vec<u8>>,
+}
+
+/// The phase 1 result for one planned file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileOutcome {
+    pub status: MergeStatus,
+    /// The bytes phase 2 uploads. `None` for a file that does not upload.
+    pub source: Option<UploadSource>,
+    pub conflict: Option<ConflictDetail>,
+}
+
+impl FileOutcome {
+    fn without_upload(status: MergeStatus) -> Self {
+        Self {
+            status,
+            source: None,
+            conflict: None,
+        }
+    }
+
+    fn uploading(status: MergeStatus, source: UploadSource) -> Self {
+        Self {
+            status,
+            source: Some(source),
+            conflict: None,
+        }
+    }
+}
+
+/// Phase 1 of a merge-mode run: one outcome per planned file, in plan order.
+#[derive(Debug, Clone)]
+pub struct MergePhase {
+    pub outcomes: Vec<FileOutcome>,
+    pub failures: Vec<FailureRecord>,
+    /// True when phase 2 must not run: a conflict, a failed download or blob read, a merge
+    /// tool failure, a lost connection, or a planning failure.
+    pub is_blocked: bool,
+}
+
+pub fn decide_merge<R: BranchRemote, B: BlobSource>(
+    plan: &BranchDeployPlan,
+    blobs: &mut B,
+    remote: &mut R,
+) -> MergePhase {
+    decide_merge_with(plan, blobs, remote, merge::decide)
+}
+
+pub(super) fn decide_merge_with<R: BranchRemote, B: BlobSource>(
+    plan: &BranchDeployPlan,
+    blobs: &mut B,
+    remote: &mut R,
+    mut decide: impl FnMut(
+        Option<&[u8]>,
+        &[u8],
+        Option<&[u8]>,
+    ) -> Result<MergeDecision, BranchDeployError>,
+) -> MergePhase {
+    let mut outcomes: Vec<FileOutcome> = plan
+        .uploads
+        .iter()
+        .map(|upload| FileOutcome::without_upload(status_before_download(upload)))
+        .collect();
+    let mut failures = Vec::new();
+
+    for (outcome, upload) in outcomes.iter_mut().zip(&plan.uploads) {
+        if outcome.status != MergeStatus::NotDecided {
+            continue;
+        }
+        let file = decide_file(upload, blobs, remote, &mut decide);
+        *outcome = file.outcome;
+        failures.extend(file.failure);
+        if file.connection_lost {
+            break;
+        }
+    }
+
+    let is_blocked = !failures.is_empty() || !plan.failures.is_empty();
+    MergePhase {
+        outcomes,
+        failures,
+        is_blocked,
+    }
+}
+
+/// Rule 1 needs only blob IDs, so it is settled before any download. Every other file waits
+/// for phase 1 as `not_decided`.
+fn status_before_download(upload: &PlannedUpload) -> MergeStatus {
+    if upload.is_unchanged_in_range() {
+        MergeStatus::UnchangedInRange
+    } else {
+        MergeStatus::NotDecided
+    }
+}
+
+struct FileDecision {
+    outcome: FileOutcome,
+    failure: Option<FailureRecord>,
+    connection_lost: bool,
+}
+
+impl FileDecision {
+    fn stopped(status: MergeStatus, failure: FailureRecord) -> Self {
+        Self {
+            outcome: FileOutcome::without_upload(status),
+            failure: Some(failure),
+            connection_lost: false,
+        }
+    }
+
+    fn with_conflict(mut self, conflict: ConflictDetail) -> Self {
+        self.outcome.conflict = Some(conflict);
+        self
+    }
+}
+
+/// The three versions of one file that the merge decision reads.
+struct FileVersions {
+    base: Option<Vec<u8>>,
+    head: Vec<u8>,
+    server: Option<Vec<u8>>,
+}
+
+fn decide_file<R: BranchRemote, B: BlobSource>(
+    upload: &PlannedUpload,
+    blobs: &mut B,
+    remote: &mut R,
+    decide: &mut impl FnMut(
+        Option<&[u8]>,
+        &[u8],
+        Option<&[u8]>,
+    ) -> Result<MergeDecision, BranchDeployError>,
+) -> FileDecision {
+    let versions = match read_versions(upload, blobs, remote) {
+        Ok(versions) => versions,
+        Err(failure) => return stopped_before_decision(upload, failure),
+    };
+    let decision = decide(
+        versions.base.as_deref(),
+        &versions.head,
+        versions.server.as_deref(),
+    );
+    match decision {
+        Ok(decision) => outcome_for_decision(upload, decision, versions.head),
+        Err(error) => FileDecision::stopped(
+            MergeStatus::NotDecided,
+            merge_failure(upload, error.to_string()),
+        ),
+    }
+}
+
+/// Why a file stopped before all three of its versions were read.
+enum VersionReadFailure {
+    Blob(BranchDeployError),
+    Download(RemoteFailure),
+}
+
+/// Reads the head and base blobs, then downloads the server copy.
+fn read_versions<R: BranchRemote, B: BlobSource>(
+    upload: &PlannedUpload,
+    blobs: &mut B,
+    remote: &mut R,
+) -> Result<FileVersions, VersionReadFailure> {
+    let (head, base) = read_head_and_base(upload, blobs).map_err(VersionReadFailure::Blob)?;
+    let server = remote
+        .download_bytes(&upload.remote_path)
+        .map_err(VersionReadFailure::Download)?;
+    Ok(FileVersions { base, head, server })
+}
+
+fn stopped_before_decision(upload: &PlannedUpload, failure: VersionReadFailure) -> FileDecision {
+    match failure {
+        VersionReadFailure::Blob(error) => {
+            FileDecision::stopped(MergeStatus::NotDecided, read_blob_failure(upload, &error))
+        }
+        VersionReadFailure::Download(error) => download_failure_decision(upload, &error),
+    }
+}
+
+fn read_head_and_base<B: BlobSource>(
+    upload: &PlannedUpload,
+    blobs: &mut B,
+) -> Result<(Vec<u8>, Option<Vec<u8>>), BranchDeployError> {
+    let head = blobs.read_blob(&upload.object_id)?;
+    let base = match &upload.base_object_id {
+        Some(object_id) => Some(blobs.read_blob(object_id)?),
+        None => None,
+    };
+    Ok((head, base))
+}
+
+/// A lost connection leaves the file undecided and ends phase 1. Any other download error
+/// makes the file `download_failed`, and phase 1 goes on to the next file.
+fn download_failure_decision(upload: &PlannedUpload, error: &RemoteFailure) -> FileDecision {
+    let failure = remote_failure("download", Some(&upload.git_path), error);
+    match error.kind {
+        RemoteFailureKind::ConnectionLost => FileDecision {
+            connection_lost: true,
+            ..FileDecision::stopped(MergeStatus::NotDecided, failure)
+        },
+        RemoteFailureKind::Operation => FileDecision::stopped(MergeStatus::DownloadFailed, failure),
+    }
+}
+
+/// `head` is the head blob phase 1 read. A file that uploads it keeps it for phase 2.
+fn outcome_for_decision(
+    upload: &PlannedUpload,
+    decision: MergeDecision,
+    head: Vec<u8>,
+) -> FileDecision {
+    let outcome = match decision {
+        MergeDecision::AlreadyDeployed => FileOutcome::without_upload(MergeStatus::AlreadyDeployed),
+        MergeDecision::FastForward => {
+            FileOutcome::uploading(MergeStatus::FastForward, UploadSource::HeadBytes(head))
+        }
+        MergeDecision::Merged(bytes) => {
+            FileOutcome::uploading(MergeStatus::Merged, UploadSource::Merged(bytes))
+        }
+        MergeDecision::NewFile => {
+            FileOutcome::uploading(MergeStatus::NewFile, UploadSource::HeadBytes(head))
+        }
+        MergeDecision::Conflict {
+            reason,
+            marked_text,
+        } => {
+            let failure = merge_failure(upload, reason.failure_message().to_string());
+            return FileDecision::stopped(MergeStatus::Conflict, failure).with_conflict(
+                ConflictDetail {
+                    reason,
+                    marked_text,
+                },
+            );
+        }
+    };
+    FileDecision {
+        outcome,
+        failure: None,
+        connection_lost: false,
+    }
+}
+
+/// How a merge-mode result reports a file that has an upload source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceReport {
+    /// The file will upload, or a preview says it would.
+    Planned,
+    /// A blocked run uploads nothing.
+    NotAttempted,
+}
+
+impl SourceReport {
+    /// A real run uploads nothing once phase 1 is blocked.
+    fn for_deploy(is_blocked: bool) -> Self {
+        if is_blocked {
+            SourceReport::NotAttempted
+        } else {
+            SourceReport::Planned
+        }
+    }
+}
+
+/// The manifest results after phase 1, one per planned file.
+fn merge_results(
+    plan: &BranchDeployPlan,
+    phase: &MergePhase,
+    verify: bool,
+    report: SourceReport,
+) -> Vec<UploadResult> {
+    plan.uploads
+        .iter()
+        .zip(&phase.outcomes)
+        .map(|(upload, outcome)| merge_result(upload, outcome, verify, report))
+        .collect()
+}
+
+/// One merge-mode result, filled from its phase 1 outcome. A file with no upload source that
+/// still needs settling, such as a conflict or an undecided file, is never `planned`.
+fn merge_result(
+    upload: &PlannedUpload,
+    outcome: &FileOutcome,
+    verify: bool,
+    report: SourceReport,
+) -> UploadResult {
+    let (upload_status, verification_status) = merge_statuses(outcome, verify, report);
+    let mut result = UploadResult::new(upload, upload_status, verification_status);
+    result.merge_status = Some(outcome.status);
+    if let Some(source) = &outcome.source {
+        record_upload_source(&mut result, source);
+    }
+    if let Some(conflict) = &outcome.conflict {
+        record_conflict(&mut result, conflict);
+    }
+    result
+}
+
+fn merge_statuses(
+    outcome: &FileOutcome,
+    verify: bool,
+    report: SourceReport,
+) -> (UploadStatus, VerificationStatus) {
+    match outcome.status {
+        MergeStatus::UnchangedInRange | MergeStatus::AlreadyDeployed => {
+            (UploadStatus::NotNeeded, VerificationStatus::NotNeeded)
+        }
+        _ if report == SourceReport::Planned && outcome.source.is_some() => (
+            UploadStatus::Planned,
+            VerificationStatus::planned_for(verify),
+        ),
+        _ => (
+            UploadStatus::NotAttempted,
+            VerificationStatus::not_attempted_for(verify),
+        ),
+    }
+}
+
+/// A merged file reports the merged byte count. `object_id` stays the head blob.
+fn record_upload_source(result: &mut UploadResult, source: &UploadSource) {
+    match source {
+        UploadSource::HeadBlob | UploadSource::HeadBytes(_) => {
+            result.uploaded_from = Some(UploadedFrom::HeadBlob)
+        }
+        UploadSource::Merged(merged) => {
+            result.uploaded_from = Some(UploadedFrom::Merged);
+            result.bytes = merged.len() as u64;
+        }
+    }
+}
+
+fn record_conflict(result: &mut UploadResult, conflict: &ConflictDetail) {
+    result.conflict_reason = Some(conflict.reason);
+    if let Some(marked_text) = &conflict.marked_text {
+        let (text, is_truncated) = marked_text_for_manifest(marked_text);
+        result.marked_text = Some(text);
+        result.marked_text_truncated = Some(is_truncated);
+    }
+}
+
+/// Converts conflict-marked bytes to manifest text. Invalid UTF-8 becomes U+FFFD, and the text
+/// is cut to at most 65,536 bytes without splitting a character. The flag reports a cut.
+pub(super) fn marked_text_for_manifest(marked_text: &[u8]) -> (String, bool) {
+    let text = String::from_utf8_lossy(marked_text);
+    if text.len() <= MAX_MARKED_TEXT_BYTES {
+        return (text.into_owned(), false);
+    }
+    let mut cut = MAX_MARKED_TEXT_BYTES;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    (text[..cut].to_string(), true)
 }
 
 pub fn execute_deletion<R: BranchRemote>(
@@ -216,19 +777,30 @@ fn mark_delete_not_attempted(paths: &mut [DeletePathResult], start: usize) {
     }
 }
 
-fn parent_directory(path: &str) -> Option<&str> {
-    path.rsplit_once('/')
-        .and_then(|(parent, _)| (!parent.is_empty()).then_some(parent))
-}
-
+/// Marks the still-planned results from `start` on as not attempted. A `not_needed` result
+/// stays `not_needed`, because it was never going to upload.
 fn mark_not_attempted(uploads: &mut [UploadResult], start: usize, verify: bool) {
     for upload in &mut uploads[start..] {
-        upload.upload_status = UploadStatus::NotAttempted;
-        upload.verification_status = if verify {
-            VerificationStatus::NotAttempted
-        } else {
-            VerificationStatus::NotRequested
-        };
+        if upload.upload_status == UploadStatus::Planned {
+            upload.upload_status = UploadStatus::NotAttempted;
+            upload.verification_status = VerificationStatus::not_attempted_for(verify);
+        }
+    }
+}
+
+fn merge_failure(upload: &PlannedUpload, error: String) -> FailureRecord {
+    FailureRecord {
+        stage: "merge".to_string(),
+        git_path: Some(upload.git_path.clone()),
+        error,
+    }
+}
+
+fn read_blob_failure(upload: &PlannedUpload, error: &BranchDeployError) -> FailureRecord {
+    FailureRecord {
+        stage: "read_blob".to_string(),
+        git_path: Some(upload.git_path.clone()),
+        error: error.to_string(),
     }
 }
 
@@ -245,6 +817,8 @@ fn manifest_from_execution(
     verify: bool,
     uploads: Vec<UploadResult>,
     failures: Vec<FailureRecord>,
+    blocked_by_conflicts: bool,
+    run: RunKind,
 ) -> BranchDeployManifest {
     let counts = ManifestCounts {
         commits: plan.commits.len(),
@@ -267,7 +841,9 @@ fn manifest_from_execution(
         repository: plan.repository,
         refs: plan.refs,
         merge_rule: "first_parent".to_string(),
-        dry_run: false,
+        mode: plan.mode,
+        blocked_by_conflicts,
+        dry_run: run.is_dry_run(),
         verify,
         counts,
         uploads,

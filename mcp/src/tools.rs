@@ -3,7 +3,7 @@
 //! Each tool is a thin async wrapper that loads config, then runs blocking
 //! FTP work on a tokio blocking thread (suppaftp is sync).
 
-use crate::{branch_deploy, config::Config, deploy};
+use crate::{branch_deploy, config::Config, deploy, drift::DriftCheck};
 use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::{tool, tool_handler, tool_router, ErrorData, ServerHandler};
 use schemars::JsonSchema;
@@ -46,6 +46,11 @@ pub struct UploadFileArgs {
     /// current working-tree content. Requires the file to be inside a git repo.
     #[serde(default)]
     pub before_changes: bool,
+    /// Git ref (for example the branch or commit the server was last deployed from). When set,
+    /// the file's server copy is downloaded first, and nothing is uploaded if it differs from
+    /// both the copy at this ref and the copy being uploaded.
+    #[serde(default)]
+    pub expect_ref: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -83,6 +88,12 @@ pub struct DeployArgs {
     /// If true, list what *would* be uploaded without sending anything.
     #[serde(default)]
     pub dry_run: bool,
+    /// Git ref (for example the branch or commit the server was last deployed from). When set,
+    /// each file's server copy is downloaded first, and the whole run is refused if any file
+    /// differs from both the copy at this ref and the copy being uploaded. A dry run with this
+    /// set connects to the server to check, and never writes.
+    #[serde(default)]
+    pub expect_ref: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -93,6 +104,12 @@ pub struct DeployCommitsArgs {
     /// If true, list what *would* be uploaded without sending anything.
     #[serde(default)]
     pub dry_run: bool,
+    /// Git ref (for example the branch or commit the server was last deployed from). When set,
+    /// each file's server copy is downloaded first, and the whole run is refused if any file
+    /// differs from both the copy at this ref and the copy being uploaded. A dry run with this
+    /// set connects to the server to check, and never writes.
+    #[serde(default)]
+    pub expect_ref: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -108,9 +125,12 @@ pub struct DeployBranchArgs {
     /// Verify each uploaded file by default.
     #[serde(default = "default_verify")]
     pub verify: bool,
-    /// Return the plan without reading credentials or accessing FTP.
+    /// Preview instead of deploying. In overwrite mode, dry_run=true avoids credential and FTP access. In merge mode, dry_run=true connects to the server to preview the merge and never writes.
     #[serde(default)]
     pub dry_run: bool,
+    /// `overwrite` (default) uploads head blobs as they are. `merge` three-way merges each file with its server copy.
+    #[serde(default)]
+    pub mode: branch_deploy::DeployMode,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -180,8 +200,12 @@ pub struct UploadResponse {
     pub profile: String,
     pub local_path: String,
     pub remote_path: String,
+    /// The bytes uploaded. 0 when a drift check refused the upload.
     #[schemars(transform = crate::schema::remove_unsigned_integer_format)]
     pub bytes: u64,
+    /// Present only when `expect_ref` was supplied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub drift_check: Option<DriftCheck>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -319,7 +343,10 @@ impl FtpServer {
     #[tool(description = "Upload a single local file to the FTP server. \
             Parent directories are created if missing. \
             Set before_changes=true to upload the last-committed (git HEAD) \
-            version instead of the current working-tree content.")]
+            version instead of the current working-tree content. \
+            Set expect_ref (e.g. the branch or commit the server was last \
+            deployed from) when the user asks to deploy without clobbering \
+            server-side changes.")]
     async fn ftp_upload_file(
         &self,
         Parameters(args): Parameters<UploadFileArgs>,
@@ -334,79 +361,43 @@ impl FtpServer {
             local_path,
             remote_path,
             before_changes,
+            expect_ref,
         } = args;
         let pname = profile.clone();
-        let remote_root = p.remote_root.trim_end_matches('/').to_string();
-        let full_remote = if remote_root.is_empty() {
-            remote_path.clone()
-        } else {
-            format!("{remote_root}/{}", remote_path.trim_start_matches('/'))
-        };
+        let full_remote =
+            deploy::upload_file_remote_path(&p.remote_root, &remote_path).map_err(deploy_error)?;
         let local_for_blocking = local_path.clone();
         let remote_for_blocking = full_remote.clone();
-        let bytes = tokio::task::spawn_blocking(move || -> anyhow::Result<u64> {
-            let content = if before_changes {
-                let local = std::path::Path::new(&local_for_blocking);
-                let parent = local.parent().unwrap_or(std::path::Path::new("."));
-                let root_out = std::process::Command::new("git")
-                    .args(["rev-parse", "--show-toplevel"])
-                    .current_dir(parent)
-                    .output()
-                    .map_err(|e| anyhow::anyhow!("git rev-parse: {e}"))?;
-                if !root_out.status.success() {
-                    return Err(anyhow::anyhow!(
-                        "not a git repo: {}",
-                        String::from_utf8_lossy(&root_out.stderr).trim()
-                    ));
-                }
-                let git_root =
-                    std::path::PathBuf::from(String::from_utf8_lossy(&root_out.stdout).trim());
-                let abs = local
-                    .canonicalize()
-                    .map_err(|e| anyhow::anyhow!("canonicalize {local_for_blocking}: {e}"))?;
-                let rel = abs.strip_prefix(&git_root).map_err(|_| {
-                    anyhow::anyhow!("file not under git root {}", git_root.display())
-                })?;
-                let rel_str = rel.to_string_lossy();
-                let show_out = std::process::Command::new("git")
-                    .args(["show", &format!("HEAD:{rel_str}")])
-                    .current_dir(&git_root)
-                    .output()
-                    .map_err(|e| anyhow::anyhow!("git show: {e}"))?;
-                if !show_out.status.success() {
-                    return Err(anyhow::anyhow!(
-                        "git show HEAD:{rel_str} failed: {}",
-                        String::from_utf8_lossy(&show_out.stderr).trim()
-                    ));
-                }
-                show_out.stdout
-            } else {
-                std::fs::read(&local_for_blocking)
-                    .map_err(|e| anyhow::anyhow!("read {local_for_blocking}: {e}"))?
-            };
-            let mut c = crate::ftp::FtpClient::connect(&pname, &p)?;
-            let written = c.put_bytes(&remote_for_blocking, &content)?;
-            c.quit();
-            Ok(written)
+        let result = tokio::task::spawn_blocking(move || {
+            deploy::upload_file(
+                &deploy::UploadFileRequest {
+                    local_path: &local_for_blocking,
+                    remote_path: &remote_for_blocking,
+                    before_changes,
+                    expect_ref: expect_ref.as_deref(),
+                },
+                || crate::ftp::FtpClient::connect(&pname, &p),
+            )
         })
         .await
-        .map_err(internal)?
         .map_err(internal)?;
 
-        Ok(Json(UploadResponse {
-            profile,
-            local_path,
-            remote_path: full_remote,
-            bytes,
-        }))
+        upload_response_from_result(profile, local_path, full_remote, result).map(Json)
     }
 
     #[tool(description = "Recursively deploy a local directory to the FTP \
             server. Respects .gitignore and per-profile ignore patterns. \
-            Set dry_run=true to preview the file list without uploading.")]
+            Set dry_run=true to preview the file list without uploading. \
+            Set expect_ref (e.g. the branch or commit the server was last \
+            deployed from) when the user asks to deploy without clobbering \
+            server-side changes.")]
     async fn ftp_deploy(
         &self,
-        Parameters(DeployArgs { profile, dry_run }): Parameters<DeployArgs>,
+        Parameters(DeployArgs {
+            profile,
+            dry_run,
+            expect_ref,
+        }): Parameters<DeployArgs>,
     ) -> Result<Json<deploy::DeployPlan>, ErrorData> {
         let cfg = Config::load().map_err(internal)?;
         let p = cfg
@@ -414,17 +405,23 @@ impl FtpServer {
             .ok_or_else(|| invalid(format!("no profile '{profile}'")))?
             .clone();
         let pname = profile.clone();
-        let plan = tokio::task::spawn_blocking(move || deploy::deploy(&pname, &p, dry_run))
-            .await
-            .map_err(internal)?
-            .map_err(internal)?;
-        Ok(Json(plan))
+        let result = tokio::task::spawn_blocking(move || {
+            deploy::deploy(&pname, &p, dry_run, expect_ref.as_deref(), || {
+                crate::ftp::FtpClient::connect(&pname, &p)
+            })
+        })
+        .await
+        .map_err(internal)?;
+        deploy_plan_from_result(result)
     }
 
     #[tool(description = "Upload only the files changed by the given commits. \
             Each commit SHA is resolved via `git diff-tree` against its \
             parent. Files deleted in those commits are skipped. Set \
-            dry_run=true to preview.")]
+            dry_run=true to preview. \
+            Set expect_ref (e.g. the branch or commit the server was last \
+            deployed from) when the user asks to deploy without clobbering \
+            server-side changes.")]
     async fn ftp_deploy_commits(
         &self,
         Parameters(args): Parameters<DeployCommitsArgs>,
@@ -438,23 +435,33 @@ impl FtpServer {
             profile,
             commits,
             dry_run,
+            expect_ref,
         } = args;
         let result = tokio::task::spawn_blocking(move || {
-            deploy::deploy_commits(&profile, &p, &commits, dry_run)
+            deploy::deploy_commits(
+                &profile,
+                &p,
+                &commits,
+                dry_run,
+                expect_ref.as_deref(),
+                || crate::ftp::FtpClient::connect(&profile, &p),
+            )
         })
         .await
         .map_err(internal)?;
-
-        match result {
-            Ok(plan) => Ok(Json(plan)),
-            Err(deploy::DeployCommitsError::InvalidArgs(m)) => Err(invalid(m)),
-            Err(deploy::DeployCommitsError::Other(e)) => Err(internal(e)),
-        }
+        deploy_plan_from_result(result)
     }
 
-    #[tool(description = "Plan a committed Git range from an explicit worktree. \
+    #[tool(
+        description = "Deploy a committed Git range from an explicit worktree. \
             The plan uses exact head-commit blobs and reports removed Git paths. \
-            Set dry_run=true to avoid credential and FTP access.")]
+            In overwrite mode, dry_run=true avoids credential and FTP access. \
+            In merge mode, dry_run=true connects to the server to preview the merge \
+            and never writes. \
+            When the user asks to merge into a server or profile (for example \
+            'merge into staging') or to preserve server-side changes, set \
+            mode=\"merge\"; run with dry_run=true first to preview conflicts."
+    )]
     async fn ftp_deploy_branch(
         &self,
         Parameters(args): Parameters<DeployBranchArgs>,
@@ -471,6 +478,7 @@ impl FtpServer {
             head_ref: args.head_ref,
             verify: args.verify,
             dry_run: args.dry_run,
+            mode: args.mode,
         };
         let result =
             tokio::task::spawn_blocking(move || branch_deploy::deploy_branch(&request, &profile))
@@ -695,6 +703,36 @@ fn invalid(msg: impl Into<String>) -> ErrorData {
     ErrorData::invalid_params(msg.into(), None)
 }
 
+fn upload_response_from_result(
+    profile: String,
+    local_path: String,
+    remote_path: String,
+    result: Result<deploy::UploadFileOutcome, deploy::DeployError>,
+) -> Result<UploadResponse, ErrorData> {
+    let outcome = result.map_err(deploy_error)?;
+    Ok(UploadResponse {
+        profile,
+        local_path,
+        remote_path,
+        bytes: outcome.bytes,
+        drift_check: outcome.drift_check,
+    })
+}
+
+fn deploy_plan_from_result(
+    result: Result<deploy::DeployPlan, deploy::DeployError>,
+) -> Result<Json<deploy::DeployPlan>, ErrorData> {
+    result.map(Json).map_err(deploy_error)
+}
+
+/// A mistake the caller can fix is `invalid_params`. Everything else is `internal_error`.
+fn deploy_error(error: deploy::DeployError) -> ErrorData {
+    match error {
+        deploy::DeployError::InvalidArgs(message) => invalid(message),
+        deploy::DeployError::Other(error) => internal(error),
+    }
+}
+
 fn branch_deploy_error(error: branch_deploy::BranchDeployError) -> ErrorData {
     match error {
         branch_deploy::BranchDeployError::InvalidArgs(message) => invalid(message),
@@ -780,14 +818,199 @@ fn use_base64(bytes: &[u8]) -> String {
 mod tests {
     use super::{
         branch_deploy_error, branch_deploy_manifest_from_operation, branch_deploy_manifest_output,
-        deletion_manifest_from_operation, deletion_manifest_output, use_base64,
-        DeleteBranchFilesArgs, DeployBranchArgs,
+        deletion_manifest_from_operation, deletion_manifest_output, deploy_plan_from_result,
+        upload_response_from_result, use_base64, DeleteBranchFilesArgs, DeployArgs,
+        DeployBranchArgs, DeployCommitsArgs, UploadFileArgs,
     };
     use crate::branch_deploy::{
         deletion_dry_run_manifest, dry_run_manifest, BranchDeletePlan, BranchDeployError,
         BranchDeployPlan, FailureRecord, PlannedUpload,
     };
     use rmcp::model::ErrorCode;
+
+    fn listed_tool(name: &str) -> rmcp::model::Tool {
+        super::FtpServer::tool_router()
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name == name)
+            .unwrap_or_else(|| panic!("{name} should be listed"))
+    }
+
+    fn deploy_branch_tool() -> rmcp::model::Tool {
+        listed_tool("ftp_deploy_branch")
+    }
+
+    #[test]
+    fn upload_tool_descriptions_tell_the_agent_when_to_set_expect_ref() {
+        const EXPECT_REF_WORDING: &str =
+            "Set expect_ref (e.g. the branch or commit the server was \
+             last deployed from) when the user asks to deploy without clobbering server-side \
+             changes.";
+
+        for name in ["ftp_upload_file", "ftp_deploy", "ftp_deploy_commits"] {
+            let tool = listed_tool(name);
+            let description = tool.description.as_deref().unwrap_or_default();
+            let expect_ref_doc = tool
+                .input_schema
+                .get("properties")
+                .and_then(|properties| properties.get("expect_ref"))
+                .and_then(|expect_ref| expect_ref.get("description"))
+                .and_then(|description| description.as_str());
+
+            assert!(
+                description.contains(EXPECT_REF_WORDING),
+                "{name}: {description}"
+            );
+            assert!(
+                expect_ref_doc.is_some(),
+                "{name} should document expect_ref"
+            );
+        }
+        for name in ["ftp_deploy_branch", "ftp_delete_file"] {
+            let tool = listed_tool(name);
+            assert!(
+                !tool
+                    .description
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("expect_ref"),
+                "{name} has no drift guard"
+            );
+        }
+    }
+
+    #[test]
+    fn deploy_branch_tool_description_tells_the_agent_when_to_merge() {
+        let tool = deploy_branch_tool();
+        let description = tool.description.as_deref().unwrap_or_default();
+
+        assert!(description.contains(
+            "When the user asks to merge into a server or profile (for example 'merge into \
+             staging') or to preserve server-side changes, set mode=\"merge\"; run with \
+             dry_run=true first to preview conflicts."
+        ));
+    }
+
+    #[test]
+    fn deploy_branch_docs_say_a_merge_preview_connects_but_never_writes() {
+        const PREVIEW_WORDING: &str = "In merge mode, dry_run=true connects to the server to \
+             preview the merge and never writes.";
+        let tool = deploy_branch_tool();
+        let description = tool.description.as_deref().unwrap_or_default();
+        let dry_run_doc = tool
+            .input_schema
+            .get("properties")
+            .and_then(|properties| properties.get("dry_run"))
+            .and_then(|dry_run| dry_run.get("description"))
+            .and_then(|description| description.as_str())
+            .expect("dry_run should carry a description");
+
+        assert!(description.contains(PREVIEW_WORDING), "{description}");
+        assert!(dry_run_doc.contains(PREVIEW_WORDING), "{dry_run_doc}");
+        for text in [description, dry_run_doc] {
+            assert!(
+                text.contains("In overwrite mode, dry_run=true avoids credential and FTP access."),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn deploy_tools_take_an_optional_expect_ref_that_defaults_to_none() {
+        let without: DeployArgs = serde_json::from_value(serde_json::json!({"profile": "qa"}))
+            .expect("ftp_deploy arguments without expect_ref should deserialize");
+        let with: DeployArgs = serde_json::from_value(
+            serde_json::json!({"profile": "qa", "dry_run": true, "expect_ref": "base"}),
+        )
+        .expect("ftp_deploy arguments with expect_ref should deserialize");
+        let commits_without: DeployCommitsArgs =
+            serde_json::from_value(serde_json::json!({"profile": "qa", "commits": ["abc"]}))
+                .expect("ftp_deploy_commits arguments without expect_ref should deserialize");
+        let commits_with: DeployCommitsArgs = serde_json::from_value(
+            serde_json::json!({"profile": "qa", "commits": ["abc"], "expect_ref": "base"}),
+        )
+        .expect("ftp_deploy_commits arguments with expect_ref should deserialize");
+
+        let upload_without: UploadFileArgs = serde_json::from_value(
+            serde_json::json!({"profile": "qa", "local_path": "a", "remote_path": "b"}),
+        )
+        .expect("ftp_upload_file arguments without expect_ref should deserialize");
+        let upload_with: UploadFileArgs = serde_json::from_value(serde_json::json!({
+            "profile": "qa", "local_path": "a", "remote_path": "b", "expect_ref": "HEAD"
+        }))
+        .expect("ftp_upload_file arguments with expect_ref should deserialize");
+
+        assert_eq!(upload_without.expect_ref, None);
+        assert_eq!(upload_with.expect_ref.as_deref(), Some("HEAD"));
+        assert_eq!(without.expect_ref, None);
+        assert_eq!(with.expect_ref.as_deref(), Some("base"));
+        assert_eq!(commits_without.expect_ref, None);
+        assert_eq!(commits_with.expect_ref.as_deref(), Some("base"));
+    }
+
+    #[test]
+    fn deploy_errors_map_invalid_args_to_invalid_params_and_the_rest_to_internal() {
+        let invalid = deploy_plan_from_result(Err(crate::deploy::DeployError::InvalidArgs(
+            "expect_ref 'nope' does not resolve to a commit".to_string(),
+        )))
+        .err()
+        .expect("invalid arguments must be an error");
+        let internal = deploy_plan_from_result(Err(crate::deploy::DeployError::Other(
+            anyhow::anyhow!("downloading /site/a.txt for the drift check failed"),
+        )))
+        .err()
+        .expect("an internal failure must be an error");
+
+        assert_eq!(invalid.code, ErrorCode::INVALID_PARAMS);
+        assert!(invalid.message.contains("does not resolve"), "{invalid:?}");
+        assert_eq!(internal.code, ErrorCode::INTERNAL_ERROR);
+        assert!(internal.message.contains("/site/a.txt"), "{internal:?}");
+    }
+
+    #[test]
+    fn upload_response_carries_the_drift_check_and_maps_errors() {
+        let refused = crate::deploy::UploadFileOutcome {
+            bytes: 0,
+            drift_check: Some(crate::drift::DriftCheck {
+                expect_ref: "HEAD".to_string(),
+                resolved_commit: "a".repeat(40),
+                checked: 1,
+                refused: true,
+                drifted: vec![crate::drift::DriftedFile {
+                    remote_path: "/home/test/Mails.php".to_string(),
+                    reason: crate::drift::DriftReason::ContentDiffers,
+                }],
+            }),
+        };
+
+        let response = upload_response_from_result(
+            "qa".to_string(),
+            "/site/Mails.php".to_string(),
+            "/home/test/Mails.php".to_string(),
+            Ok(refused),
+        )
+        .expect("a refusal is a response");
+        let value = serde_json::to_value(response).expect("response should serialize");
+
+        assert_eq!(value["bytes"], serde_json::json!(0));
+        assert_eq!(value["remote_path"], "/home/test/Mails.php");
+        assert_eq!(value["drift_check"]["refused"], serde_json::json!(true));
+        assert_eq!(
+            value["drift_check"]["drifted"][0]["reason"],
+            "content_differs"
+        );
+
+        let invalid = upload_response_from_result(
+            "qa".to_string(),
+            "a".to_string(),
+            "b".to_string(),
+            Err(crate::deploy::DeployError::InvalidArgs(
+                "expect_ref needs a Git worktree".to_string(),
+            )),
+        )
+        .expect_err("invalid arguments must be an error");
+        assert_eq!(invalid.code, ErrorCode::INVALID_PARAMS);
+    }
 
     #[test]
     fn deploy_branch_contract_mcp_defaults_and_invalid_params() {
@@ -802,10 +1025,33 @@ mod tests {
         assert_eq!(args.head_ref, "HEAD");
         assert!(args.verify);
         assert!(args.dry_run);
+        assert_eq!(args.mode, crate::branch_deploy::DeployMode::Overwrite);
         assert_eq!(
             branch_deploy_error(BranchDeployError::InvalidArgs("bad repository".to_string())).code,
             ErrorCode::INVALID_PARAMS
         );
+    }
+
+    #[test]
+    fn branch_range_05_mcp_rejects_an_unknown_mode() {
+        for bad_mode in ["rebase", "MERGE"] {
+            let result = serde_json::from_value::<DeployBranchArgs>(serde_json::json!({
+                "profile": "staging",
+                "repo_root": "/repo",
+                "base_ref": "origin/dev",
+                "mode": bad_mode
+            }));
+
+            assert!(result.is_err(), "mode {bad_mode} must not deserialize");
+        }
+        let merge: DeployBranchArgs = serde_json::from_value(serde_json::json!({
+            "profile": "staging",
+            "repo_root": "/repo",
+            "base_ref": "origin/dev",
+            "mode": "merge"
+        }))
+        .expect("merge mode should deserialize");
+        assert_eq!(merge.mode, crate::branch_deploy::DeployMode::Merge);
     }
 
     #[test]
@@ -916,6 +1162,7 @@ mod tests {
             remote_path: "/remote/app.bin".to_string(),
             object_id: "object".to_string(),
             bytes: 4,
+            base_object_id: None,
         });
         let manifest = dry_run_manifest(plan, true);
         let response = branch_deploy_manifest_output(manifest);
@@ -932,6 +1179,7 @@ mod tests {
             remote_path: "/remote/app.bin".to_string(),
             object_id: "object".to_string(),
             bytes: 4,
+            base_object_id: None,
         });
         let mut manifest = dry_run_manifest(plan, true);
         manifest.uploads[0].remote_bytes_read = Some(11);

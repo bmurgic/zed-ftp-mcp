@@ -91,7 +91,10 @@ Or just call the tools directly without the agent doing any reasoning:
 Use `deploy-branch` to deploy the committed files from a selected Git
 worktree. The command requires the absolute path to the exact worktree root
 and a base ref. The head ref defaults to `HEAD`. Pass `--dry-run` to preview
-the manifest without accessing saved credentials, Git blob contents, or FTP.
+the manifest. In the default overwrite mode, a dry run does not access saved
+credentials, Git blob contents, or FTP. In merge mode, a dry run connects to
+the server to preview the merge and never writes. "Preview a merge" below
+covers what it reads and reports.
 
 ```sh
 zed-ftp-mcp deploy-branch staging \
@@ -101,10 +104,11 @@ zed-ftp-mcp deploy-branch staging \
 ```
 
 The MCP equivalent is `ftp_deploy_branch`. It accepts `profile`, `repo_root`,
-and `base_ref`, plus optional `head_ref`, `verify`, and `dry_run` fields.
+and `base_ref`, plus optional `head_ref`, `verify`, `dry_run`, and `mode`
+fields. `mode` is `overwrite` (the default) or `merge`.
 
-The dry-run manifest lists the union of paths touched by every commit in the
-range. Each surviving path uses the blob from the resolved head commit, even
+The overwrite dry-run manifest lists the union of paths touched by every
+commit in the range. Each surviving path uses the blob from the resolved head commit, even
 when the worktree is dirty or the profile's `local_root` and ignore rules point
 somewhere else. The manifest records the dirty state and reports removed Git
 paths. A reported removal never deletes a remote file.
@@ -120,6 +124,171 @@ or per-file FTP failure leaves the other planned paths eligible to run, while a
 lost connection marks the remaining paths as not attempted. The CLI always
 prints this complete manifest and exits nonzero when any upload or verification
 does not succeed. The MCP tool returns the same unsuccessful manifest as data.
+
+### Merging into a server
+
+By default `deploy-branch` overwrites. It uploads every file in the range as
+the head commit has it, so any edit someone made to that file on the server is
+lost. To keep those edits, pass `--mode merge`. The MCP equivalent is
+`mode="merge"` on `ftp_deploy_branch`.
+
+```sh
+zed-ftp-mcp deploy-branch staging \
+	--repo-root /absolute/path/to/repository \
+	--base origin/main \
+	--mode merge
+```
+
+In merge mode the base ref is the common ancestor. For each file in the range,
+zed-ftp downloads the server copy and compares three versions: the file at the
+base commit, the file at the head commit, and the file on the server. The
+result is the file's `merge_status`.
+
+| `merge_status` | When | What happens |
+| --- | --- | --- |
+| `unchanged_in_range` | Base and head hold the same content. | Nothing is downloaded or uploaded. |
+| `already_deployed` | The server copy equals head. | Nothing is uploaded. |
+| `fast_forward` | The server copy equals base. | Head is uploaded as it is. |
+| `merged` | Server and head both changed the file, and the changes combine cleanly. | The merged content is uploaded. |
+| `new_file` | The file is new in head and absent on the server. | Head is uploaded. |
+| `conflict` | The changes cannot be combined. `conflict_reason` says why. | The whole run is blocked. |
+| `download_failed` | The server copy could not be read for a reason other than being absent. | The whole run is blocked. |
+| `not_decided` | The run stopped before or while this file was checked. `failures` names the cause. | Nothing is uploaded. |
+
+A `conflict` has one of four reasons in `conflict_reason`:
+
+- `text_conflict`: server and head changed nearby lines of a text file.
+- `binary_changed`: a version contains a NUL byte and the server copy differs from both base and head.
+- `deleted_on_server`: the file exists at base but is missing on the server.
+- `added_on_both`: the file is new in head, and the server already has a different copy.
+
+Merge mode is all or nothing. It decides every file before it uploads
+anything, and it uploads nothing when any of these happens:
+
+- A file conflicts.
+- A server copy cannot be downloaded.
+- The connection does not open, or it drops during the decisions.
+- The server refuses binary mode.
+- A blob cannot be read from the repository.
+- `git merge-file` fails.
+- A path fails planning.
+
+The manifest then has `blocked_by_conflicts: true` and `success: false`, and
+the CLI exits nonzero. In a real run, files that would have uploaded show
+`upload_status: not_attempted`. Each cause has an entry in `failures`.
+
+For a `text_conflict`, the upload result carries `marked_text`. It holds the
+file with `<<<<<<< server`, `||||||| base`, `=======`, and `>>>>>>> head`
+markers, so you can see both edits and the original. Non-UTF-8 bytes appear as
+replacement characters. `marked_text` stops at 65,536 bytes and sets
+`marked_text_truncated` to true when it does. The server copy is never
+changed by a blocked run.
+
+To resolve a conflict, put the file you want on the branch and on the server
+yourself, then run the merge again. Fixing the branch and rerunning merge mode
+is not enough. Merge mode compares each file with its version at `--base`, and
+that version still lacks the server edit. A server edit you copy into the
+branch still counts as a change on both sides, so the same lines conflict
+again. A server edit you leave out counts as a change on the server only, so a
+clean merge puts it back.
+
+1. Read `marked_text` and the `conflict_reason` for each conflicting file.
+2. Edit the file on the branch so it holds exactly the content the server should have, with the server edit kept or dropped. Commit the change.
+3. Upload that one file with the MCP tool `ftp_upload_file`. Set `local_path` to the file in your worktree, `remote_path` to the file's `git_path` from the manifest, and `before_changes=true` so the tool sends the committed bytes. Do not set `expect_ref`. The server copy still holds the server edit, so the drift check would refuse the upload.
+4. Run the same `deploy-branch --mode merge` command again, with the same `--base`. The uploaded file now equals head and reports `already_deployed`. The other files merge as before and keep their server edits.
+
+Both tools must write the same server path. Merge mode writes each file to
+`<remote_root>/<git_path>`, and `ftp_upload_file` writes to
+`<remote_root>/<remote_path>`, using the same profile's `remote_root`. With
+`remote_root = "/var/www/staging"` and the `git_path` `app/Mailer.php`, both
+write `/var/www/staging/app/Mailer.php`. The `remote_path` field of the file's
+upload result shows the full path merge mode uses. If `remote_root` is empty
+or `/`, `ftp_upload_file` uses `remote_path` as given, so pass it with a
+leading `/`, for example `/app/Mailer.php`.
+
+A merged file uploads content that no commit contains. Its `object_id` is still
+the head blob, and `bytes` is the size of the merged content. `uploaded_from`
+is `merged` for those files and `head_blob` for the others, and verification
+compares the server against the uploaded content.
+
+Merging works on lines. When the server edit and the head edit touch adjacent
+lines, Git treats them as one overlapping change and reports a
+`text_conflict`, even if a person would see two independent edits. A clean
+`merged` result also means only that the two edits did not overlap, not that
+the combined file is correct. Review the file after a merge.
+
+### Preview a merge
+
+Add `--dry-run` to see every file's `merge_status` before anything changes on
+the server. A merge preview connects to the server, but it never writes.
+
+```sh
+zed-ftp-mcp deploy-branch staging \
+	--repo-root /absolute/path/to/repository \
+	--base origin/main \
+	--mode merge \
+	--dry-run
+```
+
+The preview reads blob contents and saved credentials, opens one FTP session in
+binary mode, and downloads each server copy that needs a decision. It does not
+upload, create directories, verify, or delete. The manifest has `dry_run: true`
+and the same merge fields as a real run. A file that would upload shows
+`upload_status: planned`. When a file conflicts, the manifest has
+`blocked_by_conflicts: true` and `success: false`, and the CLI exits nonzero.
+The files that would have uploaded still show `planned`, so you can see what a
+real run would send once the conflict is resolved. The conflicting file shows
+`not_attempted`. Run the same command without `--dry-run` to deploy.
+
+### Refuse to overwrite server edits
+
+`ftp_upload_file`, `ftp_deploy`, and `ftp_deploy_commits` overwrite by default.
+To stop them from replacing a file someone edited on the server, pass
+`expect_ref`. Use the branch or commit the server was last deployed from, for
+example `expect_ref="origin/main"`.
+
+For each file the tool would upload, zed-ftp downloads the server copy and
+compares it with two versions: the file at `expect_ref` and the bytes it is
+about to upload. The file is clean when the server copy equals either one. It is
+also clean when the file is missing on the server and absent at `expect_ref`.
+Otherwise the file has drifted, for one of two reasons.
+
+- `content_differs`: the server copy exists and equals neither version.
+- `missing_on_server`: the file is missing on the server but present at `expect_ref`.
+
+One drifted file refuses the whole run. The tool creates no directories and
+uploads nothing. The response carries a `drift_check` object.
+
+| Field | Meaning |
+| --- | --- |
+| `expect_ref` | The ref you passed. |
+| `resolved_commit` | The full commit ID the ref resolved to. |
+| `checked` | How many files were compared. |
+| `refused` | `true` when at least one file drifted. |
+| `drifted` | One entry per drifted file, with the full server `remote_path` (including `remote_root`) and the `reason`. |
+
+To resolve a refusal, look at each drifted file on the server, bring the edit
+into your branch, and run the tool again. To overwrite on purpose, run it again
+without `expect_ref`.
+
+Without `expect_ref` nothing changes. The tools make the same requests, upload
+the same files, and return the same fields as before, and a dry run stays
+offline. With `expect_ref`, a dry run connects and downloads to run the check,
+and still writes nothing.
+
+Some problems stop the tool before it connects. It returns an invalid-arguments
+error when `expect_ref` is empty or is not a commit, when the source directory
+is not a Git repository, when a file to upload cannot be read, or when a file's
+path at `expect_ref` is a symlink, directory, or submodule instead of a regular
+file. If a download fails for any reason other than a missing file, the tool
+returns an error that names the file and uploads nothing.
+
+The check compares raw Git blob bytes with the bytes in your working tree. A
+`core.autocrlf` setting or a clean or smudge filter (Git LFS, for example)
+makes those bytes differ even when the content is the same. The guard then
+reports `content_differs` for a file nobody edited. It fails safe. It refuses
+and never overwrites. If you hit this, upload from a checkout without the
+conversion, or deploy without `expect_ref`.
 
 ### Delete a reported branch path explicitly
 
@@ -161,14 +330,21 @@ exit nonzero.
 | `ftp_test` | Connect, log in, return PWD, disconnect |
 | `ftp_list` | List a remote directory (relative to `remote_root`) |
 | `ftp_download_file` | Download a remote file; returns UTF-8 text or base64 for binary |
-| `ftp_upload_file` | Upload one local file; `before_changes=true` uploads the last-committed (git HEAD) version instead of the working tree |
-| `ftp_deploy` | Recursive upload of the full local project, gitignore-aware, optional `dry_run` |
-| `ftp_deploy_commits` | Upload only the files changed by specific commit SHAs, optional `dry_run` |
-| `ftp_deploy_branch` | Plan a committed range from an explicit Git worktree, optional `dry_run` |
+| `ftp_upload_file` | Upload one local file; `before_changes=true` uploads the last-committed (git HEAD) version instead of the working tree. Optional `expect_ref` refuses the upload when the server copy has drifted |
+| `ftp_deploy` | Recursive upload of the full local project, gitignore-aware, optional `dry_run`. Optional `expect_ref` refuses the whole run when a server file has drifted |
+| `ftp_deploy_commits` | Upload only the files changed by specific commit SHAs, optional `dry_run`. Optional `expect_ref` refuses the whole run when a server file has drifted |
+| `ftp_deploy_branch` | Deploy a committed range from an explicit Git worktree, optional `dry_run`. `mode="merge"` merges into server-side edits, and a merge `dry_run` connects to preview without writing |
 | `ftp_delete_branch_files` | Delete exact files from a pinned branch range after explicit approval |
 | `ftp_mkdir` | Create a directory and any missing parents |
 | `ftp_delete_file` | Delete a single remote file |
 | `ftp_delete_dir` | Delete an empty remote directory |
+
+`ftp_upload_file`, `ftp_deploy`, and `ftp_deploy_commits` refuse a server path
+that could leave `remote_root` or carry a second FTP command. Before they
+connect, they return an invalid-arguments error when the path has an empty,
+`.`, or `..` component, a backslash, or a control character such as a line
+break. `ftp_upload_file` checks its `remote_path` argument. `ftp_deploy` and
+`ftp_deploy_commits` check each file's path below `local_root`.
 
 ## Limitations / scope
 
