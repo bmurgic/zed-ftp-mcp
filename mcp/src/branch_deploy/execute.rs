@@ -340,12 +340,15 @@ fn send_file<R: BranchRemote>(
 /// What the upload phase sends for one file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UploadSource {
+    /// Overwrite mode reads the head blob when it uploads, because it has no phase 1.
     HeadBlob,
+    /// Merge mode uploads the head bytes phase 1 already read, so a blob source that fails
+    /// between the phases cannot leave a partial deployment.
+    HeadBytes(Vec<u8>),
     Merged(Vec<u8>),
 }
 
 impl UploadSource {
-    /// A head blob is read again here rather than held in memory since phase 1.
     fn bytes<B: BlobSource>(
         &self,
         upload: &PlannedUpload,
@@ -353,13 +356,13 @@ impl UploadSource {
     ) -> Result<Cow<'_, [u8]>, BranchDeployError> {
         match self {
             Self::HeadBlob => Ok(Cow::Owned(blobs.read_blob(&upload.object_id)?)),
-            Self::Merged(merged) => Ok(Cow::Borrowed(merged.as_slice())),
+            Self::HeadBytes(bytes) | Self::Merged(bytes) => Ok(Cow::Borrowed(bytes.as_slice())),
         }
     }
 
     fn mismatch_message(&self) -> &'static str {
         match self {
-            Self::HeadBlob => "remote bytes do not match the committed blob",
+            Self::HeadBlob | Self::HeadBytes(_) => "remote bytes do not match the committed blob",
             Self::Merged(_) => "remote bytes do not match the merged bytes",
         }
     }
@@ -511,7 +514,7 @@ fn decide_file<R: BranchRemote, B: BlobSource>(
         versions.server.as_deref(),
     );
     match decision {
-        Ok(decision) => outcome_for_decision(upload, decision),
+        Ok(decision) => outcome_for_decision(upload, decision, versions.head),
         Err(error) => FileDecision::stopped(
             MergeStatus::NotDecided,
             merge_failure(upload, error.to_string()),
@@ -572,17 +575,22 @@ fn download_failure_decision(upload: &PlannedUpload, error: &RemoteFailure) -> F
     }
 }
 
-fn outcome_for_decision(upload: &PlannedUpload, decision: MergeDecision) -> FileDecision {
+/// `head` is the head blob phase 1 read. A file that uploads it keeps it for phase 2.
+fn outcome_for_decision(
+    upload: &PlannedUpload,
+    decision: MergeDecision,
+    head: Vec<u8>,
+) -> FileDecision {
     let outcome = match decision {
         MergeDecision::AlreadyDeployed => FileOutcome::without_upload(MergeStatus::AlreadyDeployed),
         MergeDecision::FastForward => {
-            FileOutcome::uploading(MergeStatus::FastForward, UploadSource::HeadBlob)
+            FileOutcome::uploading(MergeStatus::FastForward, UploadSource::HeadBytes(head))
         }
         MergeDecision::Merged(bytes) => {
             FileOutcome::uploading(MergeStatus::Merged, UploadSource::Merged(bytes))
         }
         MergeDecision::NewFile => {
-            FileOutcome::uploading(MergeStatus::NewFile, UploadSource::HeadBlob)
+            FileOutcome::uploading(MergeStatus::NewFile, UploadSource::HeadBytes(head))
         }
         MergeDecision::Conflict {
             reason,
@@ -681,7 +689,9 @@ fn merge_statuses(
 /// A merged file reports the merged byte count. `object_id` stays the head blob.
 fn record_upload_source(result: &mut UploadResult, source: &UploadSource) {
     match source {
-        UploadSource::HeadBlob => result.uploaded_from = Some(UploadedFrom::HeadBlob),
+        UploadSource::HeadBlob | UploadSource::HeadBytes(_) => {
+            result.uploaded_from = Some(UploadedFrom::HeadBlob)
+        }
         UploadSource::Merged(merged) => {
             result.uploaded_from = Some(UploadedFrom::Merged);
             result.bytes = merged.len() as u64;

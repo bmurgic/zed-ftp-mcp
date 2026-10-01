@@ -2837,6 +2837,35 @@ fn merge_tool_failure_blocks_the_run_with_a_merge_stage_failure() {
 }
 
 #[test]
+fn merge_uploads_the_head_bytes_phase_1_read_without_reading_the_blob_again() {
+    let head = merge_head();
+    let (plan, mut blobs, mut remote) = merge_setup(vec![
+        merge_file("a.txt", Some(MERGE_BASE), &head, Some(MERGE_BASE)),
+        merge_file("b.txt", None, &head, None),
+    ]);
+
+    let manifest = execute_deploy(plan, true, &mut blobs, &mut remote);
+
+    assert!(manifest.success, "{:?}", manifest.failures);
+    for head_blob in ["head:a.txt", "head:b.txt"] {
+        assert_eq!(
+            blobs.reads.iter().filter(|read| *read == head_blob).count(),
+            1,
+            "{head_blob} should be read once: {:?}",
+            blobs.reads
+        );
+    }
+    assert!(remote.calls.contains(&RemoteCall::Upload(
+        "/remote/a.txt".to_string(),
+        head.clone()
+    )));
+    assert_eq!(
+        result_for(&manifest, "b.txt").uploaded_from,
+        Some(UploadedFrom::HeadBlob)
+    );
+}
+
+#[test]
 fn merge_upload_failure_after_a_clean_decision_is_not_a_conflict_block() {
     let head = merge_head();
     let (plan, mut blobs, mut remote) = merge_setup(vec![
