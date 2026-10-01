@@ -342,6 +342,16 @@ exit nonzero.
 | `ftp_delete_file` | Delete a single remote file |
 | `ftp_delete_dir` | Delete an empty remote directory |
 
+`ftp_list`, `ftp_download_file`, `ftp_upload_file`, `ftp_mkdir`,
+`ftp_delete_file`, and `ftp_delete_dir` take a path relative to the profile's
+`remote_root`. With `remote_root = "/var/www/staging"`, the path
+`app/Mailer.php` means `/var/www/staging/app/Mailer.php`. A path that starts
+with `/` and already begins with `remote_root` is used as given, so the full
+server path `/var/www/staging/app/Mailer.php` means the same file. Any other
+leading `/` is dropped, so `/app/Mailer.php` also means that file. To reach a
+folder named like the root below the root, write the path without a leading
+`/`: `var/www/staging/x` means `/var/www/staging/var/www/staging/x`.
+
 `ftp_upload_file`, `ftp_deploy`, and `ftp_deploy_commits` refuse a server path
 that could leave `remote_root` or carry a second FTP command. Before they
 connect, they return an invalid-arguments error when the path has an empty,
