@@ -185,21 +185,19 @@ fn reject_option_shaped_commits(commits: &[String]) -> std::result::Result<(), D
     }
 }
 
-/// The full server path for an `ftp_upload_file` call. `remote_path` is relative to the
-/// profile's remote root, and a leading `/` is ignored. With no remote root, `remote_path` is
-/// used as given. A path that could leave the remote root or inject an FTP command is
-/// `InvalidArgs`.
+/// The full server path for an `ftp_upload_file` call, resolved as
+/// [`crate::remote_path::resolve_remote_path`] does. A path that could leave the remote root or
+/// inject an FTP command is `InvalidArgs`.
 pub(crate) fn upload_file_remote_path(
     remote_root: &str,
     remote_path: &str,
 ) -> std::result::Result<String, DeployError> {
-    let relative = remote_path.trim_start_matches('/');
+    let relative = crate::remote_path::path_below_remote_root(remote_root, remote_path);
     reject_unsafe_relative_path(relative, &format!("remote_path {relative:?}"))?;
-    let remote_root = remote_root.trim_end_matches('/');
-    if remote_root.is_empty() {
-        return Ok(remote_path.to_string());
-    }
-    Ok(format!("{remote_root}/{relative}"))
+    Ok(crate::remote_path::resolve_remote_path(
+        remote_root,
+        remote_path,
+    ))
 }
 
 fn reject_unsafe_relative_path(path: &str, label: &str) -> std::result::Result<(), DeployError> {
@@ -1850,6 +1848,15 @@ mod tests {
         assert_eq!(
             upload_file_remote_path("", "sub/a.txt").expect("a safe path maps"),
             "sub/a.txt"
+        );
+    }
+
+    #[test]
+    fn an_upload_remote_path_that_already_starts_with_the_remote_root_is_not_prefixed_twice() {
+        assert_eq!(
+            upload_file_remote_path("/home/test", "/home/test/sub/a.txt")
+                .expect("a safe path maps"),
+            "/home/test/sub/a.txt"
         );
     }
 

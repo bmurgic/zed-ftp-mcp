@@ -29,6 +29,32 @@ pub(crate) fn map_remote_path(
     Ok((git_path.to_string(), remote_path))
 }
 
+/// The full server path for a tool's `remote_path`, which is relative to the profile's remote
+/// root. With no remote root, `remote_path` is used as given.
+pub(crate) fn resolve_remote_path(remote_root: &str, remote_path: &str) -> String {
+    let root = remote_root.trim_end_matches('/');
+    if root.is_empty() {
+        return remote_path.to_string();
+    }
+    let below_root = path_below_remote_root(root, remote_path);
+    if below_root.is_empty() {
+        return root.to_string();
+    }
+    format!("{root}/{below_root}")
+}
+
+/// The part of a tool's `remote_path` below the remote root, without a leading `/`. Agents often
+/// pass the full server path they saw in a listing, so an absolute path that already starts with
+/// the root loses the root instead of getting it twice. Any other leading `/` is ignored.
+pub(crate) fn path_below_remote_root<'a>(remote_root: &str, remote_path: &'a str) -> &'a str {
+    let root = remote_root.trim_end_matches('/');
+    let below_root = match remote_path.strip_prefix(root) {
+        Some(rest) if root.starts_with('/') && (rest.is_empty() || rest.starts_with('/')) => rest,
+        _ => remote_path,
+    };
+    below_root.trim_start_matches('/')
+}
+
 fn normalize_remote_root(remote_root: &str) -> Result<String, PathFailure> {
     let trimmed = remote_root.trim();
     if trimmed.is_empty() || trimmed == "/" {
@@ -116,6 +142,52 @@ mod tests {
     #[test]
     fn planner_path_rejects_non_utf8() {
         assert!(map_remote_path("/remote/root", b"invalid-\xff").is_err());
+    }
+
+    #[test]
+    fn a_tool_path_relative_to_the_remote_root_gets_the_root_prepended() {
+        assert_eq!(
+            resolve_remote_path("/tmsfalcon/", "application/Foo.php"),
+            "/tmsfalcon/application/Foo.php"
+        );
+        assert_eq!(
+            resolve_remote_path("/tmsfalcon", "/application/Foo.php"),
+            "/tmsfalcon/application/Foo.php"
+        );
+    }
+
+    #[test]
+    fn a_tool_path_that_already_starts_with_the_remote_root_is_used_as_given() {
+        assert_eq!(
+            resolve_remote_path("/tmsfalcon", "/tmsfalcon/application/Foo.php"),
+            "/tmsfalcon/application/Foo.php"
+        );
+        assert_eq!(
+            resolve_remote_path("/tmsfalcon/", "/tmsfalcon"),
+            "/tmsfalcon"
+        );
+        assert_eq!(
+            resolve_remote_path("/tmsfalcon", "/tmsfalcon/"),
+            "/tmsfalcon"
+        );
+    }
+
+    #[test]
+    fn a_relative_tool_path_that_names_a_folder_like_the_root_stays_below_the_root() {
+        assert_eq!(
+            resolve_remote_path("/tmsfalcon", "tmsfalcon/a.txt"),
+            "/tmsfalcon/tmsfalcon/a.txt"
+        );
+        assert_eq!(
+            resolve_remote_path("/tmsfalcon", "/tmsfalcon-old/a.txt"),
+            "/tmsfalcon/tmsfalcon-old/a.txt"
+        );
+    }
+
+    #[test]
+    fn a_tool_path_with_no_remote_root_is_used_as_given() {
+        assert_eq!(resolve_remote_path("", "sub/a.txt"), "sub/a.txt");
+        assert_eq!(resolve_remote_path("/", "/sub/a.txt"), "/sub/a.txt");
     }
 
     #[test]

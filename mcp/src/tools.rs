@@ -3,7 +3,9 @@
 //! Each tool is a thin async wrapper that loads config, then runs blocking
 //! FTP work on a tokio blocking thread (suppaftp is sync).
 
-use crate::{branch_deploy, config::Config, deploy, drift::DriftCheck};
+use crate::{
+    branch_deploy, config::Config, deploy, drift::DriftCheck, remote_path::resolve_remote_path,
+};
 use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::{tool, tool_handler, tool_router, ErrorData, ServerHandler};
 use schemars::JsonSchema;
@@ -40,7 +42,8 @@ pub struct UploadFileArgs {
     pub profile: String,
     /// Absolute or relative path to the local file to upload.
     pub local_path: String,
-    /// Server-relative remote path (parent dirs created if missing).
+    /// Remote file path (parent dirs created if missing), relative to the profile's remote_root, for example `app/a.txt`. A full
+    /// server path that already starts with remote_root is used as given.
     pub remote_path: String,
     /// If true, upload the last-committed version (git HEAD) instead of the
     /// current working-tree content. Requires the file to be inside a git repo.
@@ -56,21 +59,24 @@ pub struct UploadFileArgs {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct DownloadFileArgs {
     pub profile: String,
-    /// Remote path of the file to download (remote_root prepended automatically).
+    /// Remote path of the file to download, relative to the profile's remote_root, for example `app/a.txt`. A full
+    /// server path that already starts with remote_root is used as given.
     pub remote_path: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct MkdirArgs {
     pub profile: String,
-    /// Remote path of the directory to create (remote_root prepended automatically).
+    /// Remote path of the directory to create, relative to the profile's remote_root, for example `app/a.txt`. A full
+    /// server path that already starts with remote_root is used as given.
     pub remote_path: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct DeleteDirArgs {
     pub profile: String,
-    /// Remote path of the directory to delete (remote_root prepended automatically).
+    /// Remote path of the directory to delete, relative to the profile's remote_root, for example `app/a.txt`. A full
+    /// server path that already starts with remote_root is used as given.
     /// The directory must be empty.
     pub remote_path: String,
 }
@@ -78,7 +84,8 @@ pub struct DeleteDirArgs {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct DeleteFileArgs {
     pub profile: String,
-    /// Server-absolute path of the file to delete (remote_root is prepended automatically).
+    /// Remote path of the file to delete, relative to the profile's remote_root, for example `app/a.txt`. A full
+    /// server path that already starts with remote_root is used as given.
     pub remote_path: String,
 }
 
@@ -295,7 +302,8 @@ impl FtpServer {
     }
 
     #[tool(description = "List a directory on the FTP server. \
-        path is relative to the profile's remote_root (prepended automatically). \
+        path is relative to the profile's remote_root; a full server path that already \
+        starts with remote_root is used as given. \
         Omit path to list remote_root itself.")]
     async fn ftp_list(
         &self,
@@ -309,11 +317,7 @@ impl FtpServer {
         let pname = profile.clone();
         let remote_root = p.remote_root.trim_end_matches('/').to_string();
         let resolved_path: Option<String> = match &path {
-            Some(sub) => Some(if remote_root.is_empty() {
-                sub.clone()
-            } else {
-                format!("{remote_root}/{}", sub.trim_start_matches('/'))
-            }),
+            Some(sub) => Some(resolve_remote_path(&remote_root, sub)),
             None => {
                 if remote_root.is_empty() {
                     None
@@ -521,7 +525,8 @@ impl FtpServer {
     #[tool(
         description = "Download a file from the FTP server and return its contents. \
             UTF-8 text is returned as-is; binary files are base64-encoded. \
-            remote_root is prepended automatically."
+            remote_path is relative to the profile's remote_root; a full server path that \
+            already starts with remote_root is used as given."
     )]
     async fn ftp_download_file(
         &self,
@@ -537,12 +542,7 @@ impl FtpServer {
             remote_path,
         } = args;
         let pname = profile.clone();
-        let remote_root = p.remote_root.trim_end_matches('/').to_string();
-        let full_path = if remote_root.is_empty() {
-            remote_path.clone()
-        } else {
-            format!("{remote_root}/{}", remote_path.trim_start_matches('/'))
-        };
+        let full_path = resolve_remote_path(&p.remote_root, &remote_path);
         let full_path_blocking = full_path.clone();
         let raw = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
             let mut c = crate::ftp::FtpClient::connect(&pname, &p)?;
@@ -570,7 +570,8 @@ impl FtpServer {
 
     #[tool(
         description = "Create a directory (and any missing parents) on the FTP server. \
-            remote_root is prepended automatically."
+            remote_path is relative to the profile's remote_root; a full server path that \
+            already starts with remote_root is used as given."
     )]
     async fn ftp_mkdir(
         &self,
@@ -586,12 +587,7 @@ impl FtpServer {
             remote_path,
         } = args;
         let pname = profile.clone();
-        let remote_root = p.remote_root.trim_end_matches('/').to_string();
-        let full_path = if remote_root.is_empty() {
-            remote_path.clone()
-        } else {
-            format!("{remote_root}/{}", remote_path.trim_start_matches('/'))
-        };
+        let full_path = resolve_remote_path(&p.remote_root, &remote_path);
         let full_path_blocking = full_path.clone();
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let mut c = crate::ftp::FtpClient::connect(&pname, &p)?;
@@ -611,7 +607,8 @@ impl FtpServer {
 
     #[tool(description = "Delete a directory from the FTP server. \
             The directory must be empty. \
-            remote_root is prepended automatically.")]
+            remote_path is relative to the profile's remote_root; a full server path that \
+            already starts with remote_root is used as given.")]
     async fn ftp_delete_dir(
         &self,
         Parameters(args): Parameters<DeleteDirArgs>,
@@ -626,12 +623,7 @@ impl FtpServer {
             remote_path,
         } = args;
         let pname = profile.clone();
-        let remote_root = p.remote_root.trim_end_matches('/').to_string();
-        let full_path = if remote_root.is_empty() {
-            remote_path.clone()
-        } else {
-            format!("{remote_root}/{}", remote_path.trim_start_matches('/'))
-        };
+        let full_path = resolve_remote_path(&p.remote_root, &remote_path);
         let full_path_blocking = full_path.clone();
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let mut c = crate::ftp::FtpClient::connect(&pname, &p)?;
@@ -650,8 +642,8 @@ impl FtpServer {
     }
 
     #[tool(description = "Delete a single file from the FTP server. \
-            The profile's remote_root is prepended to remote_path, \
-            matching the behavior of ftp_deploy.")]
+            remote_path is relative to the profile's remote_root; a full server path that \
+            already starts with remote_root is used as given.")]
     async fn ftp_delete_file(
         &self,
         Parameters(args): Parameters<DeleteFileArgs>,
@@ -666,12 +658,7 @@ impl FtpServer {
             remote_path,
         } = args;
         let pname = profile.clone();
-        let remote_root = p.remote_root.trim_end_matches('/').to_string();
-        let full_path = if remote_root.is_empty() {
-            remote_path.clone()
-        } else {
-            format!("{remote_root}/{}", remote_path.trim_start_matches('/'))
-        };
+        let full_path = resolve_remote_path(&p.remote_root, &remote_path);
         let full_path_blocking = full_path.clone();
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let mut c = crate::ftp::FtpClient::connect(&pname, &p)?;

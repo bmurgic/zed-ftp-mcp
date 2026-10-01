@@ -202,7 +202,10 @@ Both tools must write the same server path. Merge mode writes each file to
 `<remote_root>/<remote_path>`, using the same profile's `remote_root`. With
 `remote_root = "/var/www/staging"` and the `git_path` `app/Mailer.php`, both
 write `/var/www/staging/app/Mailer.php`. The `remote_path` field of the file's
-upload result shows the full path merge mode uses. If `remote_root` is empty
+upload result shows the full path merge mode uses. You can also pass that full
+path to `ftp_upload_file`. A `remote_path` that already starts with
+`remote_root` is used as given, so `/var/www/staging/app/Mailer.php` does not
+become `/var/www/staging/var/www/staging/app/Mailer.php`. If `remote_root` is empty
 or `/`, `ftp_upload_file` uses `remote_path` as given, so pass it with a
 leading `/`, for example `/app/Mailer.php`.
 
@@ -338,6 +341,16 @@ exit nonzero.
 | `ftp_mkdir` | Create a directory and any missing parents |
 | `ftp_delete_file` | Delete a single remote file |
 | `ftp_delete_dir` | Delete an empty remote directory |
+
+`ftp_list`, `ftp_download_file`, `ftp_upload_file`, `ftp_mkdir`,
+`ftp_delete_file`, and `ftp_delete_dir` take a path relative to the profile's
+`remote_root`. With `remote_root = "/var/www/staging"`, the path
+`app/Mailer.php` means `/var/www/staging/app/Mailer.php`. A path that starts
+with `/` and already begins with `remote_root` is used as given, so the full
+server path `/var/www/staging/app/Mailer.php` means the same file. Any other
+leading `/` is dropped, so `/app/Mailer.php` also means that file. To reach a
+folder named like the root below the root, write the path without a leading
+`/`: `var/www/staging/x` means `/var/www/staging/var/www/staging/x`.
 
 `ftp_upload_file`, `ftp_deploy`, and `ftp_deploy_commits` refuse a server path
 that could leave `remote_root` or carry a second FTP command. Before they
