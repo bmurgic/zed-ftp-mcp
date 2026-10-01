@@ -12,14 +12,16 @@ image cannot restart a stopped container, each procedure starts its own containe
 Reuses the helpers of qa/slice-1/run_qa.py. Note: with the user home at "/", drifted remote paths are "/c.txt",
 where qa.md writes "/home/test/c.txt".
 """
-import ctypes, importlib.util, json, os, pty, subprocess, sys, tempfile, time
+import ctypes, importlib.util, json, os, platform, pty, subprocess, sys, tempfile, time
 
 QA_HOME = tempfile.mkdtemp(prefix="qa3-home-")
 os.environ["QA_HOME"] = QA_HOME
 os.environ["QA_SITE"] = tempfile.mkdtemp(prefix="qa3-site-")
 open("/tmp/qa-cp", "a").close() if os.path.exists("/tmp/qa-cp") else open("/tmp/qa-cp", "w").write("0")
-# join a fresh session keyring so the keychain works (KEYCTL_JOIN_SESSION_KEYRING = 1)
-ctypes.CDLL(None, use_errno=True).syscall(250, 1, None)
+# join a fresh session keyring so the keychain works
+nr = 250 if platform.machine() == "x86_64" else 219  # keyctl
+if ctypes.CDLL(None, use_errno=True).syscall(nr, 1, None) < 0:  # KEYCTL_JOIN_SESSION_KEYRING
+    sys.exit("could not join a fresh session keyring")
 
 spec = importlib.util.spec_from_file_location("s1", os.path.join(os.path.dirname(__file__), "..", "slice-1", "run_qa.py"))
 s1 = importlib.util.module_from_spec(spec); spec.loader.exec_module(s1)

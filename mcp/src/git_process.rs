@@ -33,13 +33,32 @@ pub(crate) fn git_spawn_error(error: std::io::Error, action: &str) -> GitSpawnEr
     }
 }
 
-/// Runs `git -C <directory> <arguments>` with the caller's environment and returns its output,
-/// whatever the exit status.
+/// Variables that would point git at a repository, index, or object store other than
+/// `directory`. `run_git` removes them from the child environment.
+const REPOSITORY_OVERRIDE_VARIABLES: [&str; 8] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_NAMESPACE",
+    "GIT_CEILING_DIRECTORIES",
+];
+
+fn git_command(directory: &Path, arguments: &[&str]) -> Command {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(directory).args(arguments);
+    for variable in REPOSITORY_OVERRIDE_VARIABLES {
+        command.env_remove(variable);
+    }
+    command
+}
+
+/// Runs `git -C <directory> <arguments>` and returns its output, whatever the exit status. The
+/// child keeps the caller's environment minus the repository override variables.
 pub(crate) fn run_git(directory: &Path, arguments: &[&str]) -> Result<Output, GitSpawnError> {
-    Command::new("git")
-        .arg("-C")
-        .arg(directory)
-        .args(arguments)
+    git_command(directory, arguments)
         .output()
         .map_err(|error| git_spawn_error(error, "spawning git"))
 }
@@ -99,6 +118,22 @@ pub(crate) fn configure_git_command(command: &mut Command, repository_root: &Pat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_git_removes_repository_override_variables_from_the_child_environment() {
+        let command = git_command(Path::new("."), &["status"]);
+        let removed: Vec<_> = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(name, _)| name.to_string_lossy().into_owned())
+            .collect();
+        for variable in REPOSITORY_OVERRIDE_VARIABLES {
+            assert!(
+                removed.iter().any(|name| name == variable),
+                "{variable} is not removed"
+            );
+        }
+    }
 
     #[test]
     fn git_spawn_error_reports_a_missing_git_as_not_found() {

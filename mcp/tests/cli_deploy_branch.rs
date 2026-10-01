@@ -26,7 +26,13 @@ fn git(repo: &Path, arguments: &[&str]) {
 fn branch_range_04_cli_forwards_merge_mode_to_the_deployment() {
     let root = tempfile::TempDir::new().expect("temp directory should be created");
     let repo = root.path().join("repo");
-    let config = root.path().join("config");
+    // The binary reads `dirs::config_dir()`: `$HOME/Library/Application Support` on macOS,
+    // `$XDG_CONFIG_HOME` on Linux.
+    let config = if cfg!(target_os = "macos") {
+        root.path().join("Library").join("Application Support")
+    } else {
+        root.path().join("config")
+    };
     std::fs::create_dir_all(&repo).expect("repo directory should be created");
     std::fs::create_dir_all(config.join("zed-ftp")).expect("config directory should be created");
     git(&repo, &["init", "-q"]);
