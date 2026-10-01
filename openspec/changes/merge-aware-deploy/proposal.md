@@ -10,7 +10,7 @@ Every upload path overwrites the server copy without checking it first. On 2026-
 - `dry_run=true` with merge mode becomes an online preview. It reads credentials and downloads server copies, but it never uploads.
 - With merge mode, verification compares the server bytes with the bytes actually uploaded, which may be merged bytes.
 - The branch manifest gains `mode`, `blocked_by_conflicts`, per-file `merge_status`, `uploaded_from`, and conflict-marked text.
-- `ftp_upload_file`, `ftp_deploy`, and `ftp_deploy_commits` gain an optional `expect_ref`. When it is set, any server file that matches neither the file at that ref nor the bytes about to be uploaded refuses the whole run. When it is not set, behavior is unchanged.
+- `ftp_upload_file`, `ftp_deploy`, and `ftp_deploy_commits` gain an optional `expect_ref`. When it is set, any server file that matches neither the file at that ref nor the bytes about to be uploaded refuses the whole run. When it is not set, behavior is unchanged, except that these tools now reject server paths with empty, `.`, or `..` parts, backslashes, or control characters.
 - Tool descriptions and the README tell an agent to use merge mode when the user asks to merge into a server.
 
 ## Capabilities

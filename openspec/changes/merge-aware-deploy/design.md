@@ -79,7 +79,7 @@ Only the branch tool knows a real BASE (the file at `base_ref`), so a true three
 - Format: `cargo fmt --all -- --check`
 - Lint: `cargo clippy --workspace --all-targets -- -D warnings`
 - Disposable FTP tests (Docker required): `ZED_FTP_RUN_FTP_INTEGRATION=1 cargo test -p zed-ftp-mcp ftp::tests::disposable_ -- --ignored --nocapture`
-- Default behavior is frozen. With `mode` omitted or `overwrite`, and with `expect_ref` omitted, every tool's inputs, uploads, network activity, and response fields stay as they are today. Exception: branch manifests gain `mode` and `blocked_by_conflicts`.
+- Default behavior is frozen. With `mode` omitted or `overwrite`, and with `expect_ref` omitted, every tool's inputs, uploads, network activity, and response fields stay as they are today. Exceptions: branch manifests gain `mode` and `blocked_by_conflicts`, and `ftp_upload_file`, `ftp_deploy`, and `ftp_deploy_commits` reject server paths with empty, `.`, or `..` parts, backslashes, or control characters (GDD-F0026).
 - An overwrite dry run stays free of blob-content reads, keychain access, and FTP connections. A merge dry run and a drift dry run never upload, create directories, or delete.
 - Never merge a file that contains a NUL byte in any version.
 - A merge-mode run uploads nothing when any file is `conflict` or `download_failed`, or when the connection was lost.
