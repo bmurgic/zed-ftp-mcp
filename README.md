@@ -202,7 +202,10 @@ Both tools must write the same server path. Merge mode writes each file to
 `<remote_root>/<remote_path>`, using the same profile's `remote_root`. With
 `remote_root = "/var/www/staging"` and the `git_path` `app/Mailer.php`, both
 write `/var/www/staging/app/Mailer.php`. The `remote_path` field of the file's
-upload result shows the full path merge mode uses. If `remote_root` is empty
+upload result shows the full path merge mode uses. You can also pass that full
+path to `ftp_upload_file`. A `remote_path` that already starts with
+`remote_root` is used as given, so `/var/www/staging/app/Mailer.php` does not
+become `/var/www/staging/var/www/staging/app/Mailer.php`. If `remote_root` is empty
 or `/`, `ftp_upload_file` uses `remote_path` as given, so pass it with a
 leading `/`, for example `/app/Mailer.php`.
 
