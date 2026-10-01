@@ -310,7 +310,7 @@ exit nonzero.
 | `ftp_upload_file` | Upload one local file; `before_changes=true` uploads the last-committed (git HEAD) version instead of the working tree. Optional `expect_ref` refuses the upload when the server copy has drifted |
 | `ftp_deploy` | Recursive upload of the full local project, gitignore-aware, optional `dry_run`. Optional `expect_ref` refuses the whole run when a server file has drifted |
 | `ftp_deploy_commits` | Upload only the files changed by specific commit SHAs, optional `dry_run`. Optional `expect_ref` refuses the whole run when a server file has drifted |
-| `ftp_deploy_branch` | Plan a committed range from an explicit Git worktree, optional `dry_run`. `mode="merge"` merges into server-side edits, and a merge `dry_run` connects to preview without writing |
+| `ftp_deploy_branch` | Deploy a committed range from an explicit Git worktree, optional `dry_run`. `mode="merge"` merges into server-side edits, and a merge `dry_run` connects to preview without writing |
 | `ftp_delete_branch_files` | Delete exact files from a pinned branch range after explicit approval |
 | `ftp_mkdir` | Create a directory and any missing parents |
 | `ftp_delete_file` | Delete a single remote file |

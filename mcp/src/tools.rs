@@ -452,7 +452,7 @@ impl FtpServer {
         deploy_plan_from_result(result)
     }
 
-    #[tool(description = "Plan a committed Git range from an explicit worktree. \
+    #[tool(description = "Deploy a committed Git range from an explicit worktree. \
             The plan uses exact head-commit blobs and reports removed Git paths. \
             In overwrite mode, dry_run=true avoids credential and FTP access. \
             In merge mode, dry_run=true connects to the server to preview the merge \
