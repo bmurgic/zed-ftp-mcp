@@ -153,7 +153,7 @@ result is the file's `merge_status`.
 | `new_file` | The file is new in head and absent on the server. | Head is uploaded. |
 | `conflict` | The changes cannot be combined. `conflict_reason` says why. | The whole run is blocked. |
 | `download_failed` | The server copy could not be read for a reason other than being absent. | The whole run is blocked. |
-| `not_decided` | The run was blocked before this file was checked. | Nothing is uploaded. |
+| `not_decided` | The run stopped before or while this file was checked. `failures` names the cause. | Nothing is uploaded. |
 
 A `conflict` has one of four reasons in `conflict_reason`:
 
@@ -163,10 +163,18 @@ A `conflict` has one of four reasons in `conflict_reason`:
 - `added_on_both`: the file is new in head, and the server already has a different copy.
 
 Merge mode is all or nothing. It decides every file before it uploads
-anything. If any file conflicts or fails to download, or the connection drops
-during the decisions, zed-ftp uploads nothing. The manifest then has
-`blocked_by_conflicts: true` and `success: false`, and the CLI exits nonzero.
-In a real run, files that would have uploaded show
+anything, and it uploads nothing when any of these happens:
+
+- A file conflicts.
+- A server copy cannot be downloaded.
+- The connection does not open, or it drops during the decisions.
+- The server refuses binary mode.
+- A blob cannot be read from the repository.
+- `git merge-file` fails.
+- A path fails planning.
+
+The manifest then has `blocked_by_conflicts: true` and `success: false`, and
+the CLI exits nonzero. In a real run, files that would have uploaded show
 `upload_status: not_attempted`. Each cause has an entry in `failures`.
 
 For a `text_conflict`, the upload result carries `marked_text`. It holds the
@@ -176,12 +184,27 @@ replacement characters. `marked_text` stops at 65,536 bytes and sets
 `marked_text_truncated` to true when it does. The server copy is never
 changed by a blocked run.
 
-To resolve a conflict, fix it on the branch and deploy again.
+To resolve a conflict, put the file you want on the branch and on the server
+yourself, then run the merge again. Fixing the branch and rerunning merge mode
+is not enough. Merge mode compares each file with its version at `--base`, and
+that version still lacks the server edit. A server edit you copy into the
+branch still counts as a change on both sides, so the same lines conflict
+again. A server edit you leave out counts as a change on the server only, so a
+clean merge puts it back.
 
 1. Read `marked_text` and the `conflict_reason` for each conflicting file.
-2. Change the file on the branch so it includes the server-side edit or drops it on purpose.
-3. Commit the change.
-4. Run the same `deploy-branch --mode merge` command again.
+2. Edit the file on the branch so it holds exactly the content the server should have, with the server edit kept or dropped. Commit the change.
+3. Upload that one file with the MCP tool `ftp_upload_file`. Set `local_path` to the file in your worktree, `remote_path` to the file's `git_path` from the manifest, and `before_changes=true` so the tool sends the committed bytes. Do not set `expect_ref`. The server copy still holds the server edit, so the drift check would refuse the upload.
+4. Run the same `deploy-branch --mode merge` command again, with the same `--base`. The uploaded file now equals head and reports `already_deployed`. The other files merge as before and keep their server edits.
+
+Both tools must write the same server path. Merge mode writes each file to
+`<remote_root>/<git_path>`, and `ftp_upload_file` writes to
+`<remote_root>/<remote_path>`, using the same profile's `remote_root`. With
+`remote_root = "/var/www/staging"` and the `git_path` `app/Mailer.php`, both
+write `/var/www/staging/app/Mailer.php`. The `remote_path` field of the file's
+upload result shows the full path merge mode uses. If `remote_root` is empty
+or `/`, `ftp_upload_file` uses `remote_path` as given, so pass it with a
+leading `/`, for example `/app/Mailer.php`.
 
 A merged file uploads content that no commit contains. Its `object_id` is still
 the head blob, and `bytes` is the size of the merged content. `uploaded_from`
