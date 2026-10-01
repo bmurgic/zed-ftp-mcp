@@ -331,8 +331,9 @@ fn canon_local_root(profile: &Profile) -> Result<PathBuf> {
         .with_context(|| format!("local_root '{}' does not exist", profile.local_root))
 }
 
-/// Run `git diff-tree --no-commit-id -r --name-only --diff-filter=ACMRT <sha>`
-/// inside `local_root`. Returns relative paths.
+/// Run `git diff-tree --no-commit-id -r --name-only --relative --diff-filter=ACMRT <sha>`
+/// inside `local_root`. `--relative` keeps only paths under `local_root` and
+/// makes them relative to it, so a subdirectory `local_root` works.
 fn changed_paths_for_commit(
     local_root: &Path,
     sha: &str,
@@ -344,6 +345,7 @@ fn changed_paths_for_commit(
             "--no-commit-id",
             "-r",
             "--name-only",
+            "--relative",
             "--diff-filter=ACMRT",
             "--first-parent",
             // `--end-of-options` makes git read the commit as a revision even when it looks like
@@ -1888,5 +1890,109 @@ mod tests {
             "{error}"
         );
         assert_eq!(state.borrow().connections, 0);
+    }
+
+    /// Ported from main (bmurgic/zed-ftp-mcp#1): a subdirectory `local_root` deploys its changed files.
+    mod subdirectory_local_root {
+        use super::super::*;
+        use std::fs;
+        use std::process::Command;
+        use tempfile::TempDir;
+
+        fn git(repo: &Path, args: &[&str]) -> String {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .expect("git should run");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        }
+
+        /// Repo whose HEAD commit touches `site/index.html` and `other/notes.txt`.
+        /// HEAD has a parent because diff-tree prints nothing for a root commit.
+        fn repo_with_commit() -> (TempDir, String) {
+            let dir = TempDir::new().expect("temp dir");
+            let root = dir.path();
+            git(root, &["init", "--initial-branch=main"]);
+            git(root, &["config", "user.name", "Deploy Test"]);
+            git(root, &["config", "user.email", "deploy@example.test"]);
+            git(root, &["commit", "--allow-empty", "-m", "root"]);
+            for rel in ["site/index.html", "other/notes.txt"] {
+                let path = root.join(rel);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, rel).unwrap();
+            }
+            git(root, &["add", "."]);
+            git(root, &["commit", "-m", "initial"]);
+            let sha = git(root, &["rev-parse", "HEAD"]);
+            (dir, sha)
+        }
+
+        fn profile_for(local_root: &Path) -> Profile {
+            Profile {
+                host: "example.test".to_string(),
+                port: 21,
+                user: "deploy".to_string(),
+                remote_root: "/www".to_string(),
+                local_root: local_root.display().to_string(),
+                passive: true,
+                tls: false,
+                accept_invalid_certs: false,
+                ignore: Vec::new(),
+            }
+        }
+
+        fn remotes(plan: &DeployPlan) -> Vec<&str> {
+            plan.uploaded.iter().map(|f| f.remote.as_str()).collect()
+        }
+
+        #[test]
+        fn deploy_commits_with_subdirectory_local_root_uploads_its_changed_files() {
+            let (dir, sha) = repo_with_commit();
+            let profile = profile_for(&dir.path().join("site"));
+
+            let plan = deploy_commits(
+                "test",
+                &profile,
+                &[sha],
+                true,
+                None,
+                || -> Result<super::FakeDeployRemote> {
+                    unreachable!("a dry run must not connect")
+                },
+            )
+            .expect("dry run");
+
+            assert_eq!(remotes(&plan), ["/www/index.html"]);
+        }
+
+        #[test]
+        fn deploy_commits_with_repo_root_local_root_uploads_all_changed_files() {
+            let (dir, sha) = repo_with_commit();
+            let profile = profile_for(dir.path());
+
+            let plan = deploy_commits(
+                "test",
+                &profile,
+                &[sha],
+                true,
+                None,
+                || -> Result<super::FakeDeployRemote> {
+                    unreachable!("a dry run must not connect")
+                },
+            )
+            .expect("dry run");
+
+            assert_eq!(
+                remotes(&plan),
+                ["/www/other/notes.txt", "/www/site/index.html"]
+            );
+        }
     }
 }
