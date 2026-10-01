@@ -12,7 +12,9 @@
 //! what would have happened, in `dry_run` mode).
 
 use crate::config::Profile;
-use crate::drift::{self, DriftCheck, DriftError, DriftRemote, DriftTarget, ResolvedRef};
+use crate::drift::{
+    self, DriftCheck, DriftError, DriftRemote, DriftTarget, ResolvedRef, ValidatedTargets,
+};
 use crate::git_process::run_git;
 use crate::remote_path::{parent_to_create, validate_relative_path};
 use anyhow::{Context, Result};
@@ -271,7 +273,10 @@ fn upload_guarded<R: DeployRemote>(
     let written = if check.refused {
         0
     } else {
-        client.put_bytes(request.remote_path, &guard.targets[0].upload_bytes)?
+        client.put_bytes(
+            request.remote_path,
+            &guard.targets.targets()[0].upload_bytes,
+        )?
     };
     client.quit();
     Ok(UploadFileOutcome {
@@ -541,7 +546,7 @@ fn upload_each<R: DeployRemote>(
     guard: Option<&DriftGuard>,
 ) -> Result<()> {
     match guard {
-        Some(guard) => upload_checked_bytes(client, plan, planned, &guard.targets),
+        Some(guard) => upload_checked_bytes(client, plan, planned, guard.targets.targets()),
         None => upload_from_disk(client, plan, planned),
     }
 }
@@ -604,7 +609,7 @@ fn record_upload(plan: &mut DeployPlan, file: PlannedFile, written: u64) {
 /// `InvalidArgs`, and none of them opens a connection.
 struct DriftGuard {
     resolved: ResolvedRef,
-    targets: Vec<DriftTarget>,
+    targets: ValidatedTargets,
 }
 
 impl DriftGuard {
@@ -651,7 +656,7 @@ impl DriftGuard {
         resolved: ResolvedRef,
         targets: Vec<DriftTarget>,
     ) -> std::result::Result<Self, DeployError> {
-        drift::validate_expected_paths(&resolved, &targets)?;
+        let targets = drift::validate_expected_paths(&resolved, targets)?;
         Ok(Self { resolved, targets })
     }
 

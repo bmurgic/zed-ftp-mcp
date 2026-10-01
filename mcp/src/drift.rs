@@ -83,7 +83,7 @@ impl DriftCheck {
 }
 
 /// `InvalidArgs` is a mistake the caller can fix. It is always raised before an FTP connection
-/// opens, except when `check_drift` itself finds a target whose path at `expect_ref` is not a file.
+/// opens.
 #[derive(thiserror::Error, Debug)]
 pub enum DriftError {
     #[error("{0}")]
@@ -180,36 +180,57 @@ pub fn repo_relative_path(resolved: &ResolvedRef, file: &Path) -> Result<String,
         .join("/"))
 }
 
-/// Rejects any target whose path at `expect_ref` is a directory, a submodule, or a symbolic link.
-/// Callers run this before they open an FTP connection. `check_drift` repeats the same rule.
+/// Targets that passed `validate_expected_paths`, each with the blob ID of its path at
+/// `expect_ref`. A `None` ID means the path has no entry there.
+#[derive(Debug, Clone)]
+pub struct ValidatedTargets {
+    targets: Vec<DriftTarget>,
+    expected_blob_ids: Vec<Option<String>>,
+}
+
+impl ValidatedTargets {
+    pub fn targets(&self) -> &[DriftTarget] {
+        &self.targets
+    }
+}
+
+/// Rejects any target whose path at `expect_ref` is a directory, a submodule, or a symbolic link,
+/// and keeps each blob ID it found so `check_drift` does not look the paths up again. Callers run
+/// this before they open an FTP connection.
 pub fn validate_expected_paths(
     resolved: &ResolvedRef,
-    targets: &[DriftTarget],
-) -> Result<(), DriftError> {
-    for target in targets {
-        expected_blob_id(resolved, &target.repo_path)?;
-    }
-    Ok(())
+    targets: Vec<DriftTarget>,
+) -> Result<ValidatedTargets, DriftError> {
+    let expected_blob_ids = targets
+        .iter()
+        .map(|target| expected_blob_id(resolved, &target.repo_path))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ValidatedTargets {
+        targets,
+        expected_blob_ids,
+    })
 }
 
 /// Downloads every target's server copy and classifies it against the copy at `expect_ref` and
 /// the upload copy. It stops at the first download failure and never classifies past it.
 pub fn check_drift<R: DriftRemote>(
     remote: &mut R,
-    targets: &[DriftTarget],
+    validated: &ValidatedTargets,
     resolved: &ResolvedRef,
 ) -> Result<DriftCheck, DriftError> {
     select_binary_mode(remote)?;
     let mut drifted = Vec::new();
-    for target in targets {
-        if let Some(drifted_file) = check_target(remote, target, resolved)? {
+    for (target, expected_blob_id) in validated.targets.iter().zip(&validated.expected_blob_ids) {
+        if let Some(drifted_file) =
+            check_target(remote, target, expected_blob_id.as_deref(), resolved)?
+        {
             drifted.push(drifted_file);
         }
     }
     Ok(DriftCheck {
         expect_ref: resolved.expect_ref.clone(),
         resolved_commit: resolved.commit.clone(),
-        checked: targets.len(),
+        checked: validated.targets.len(),
         refused: !drifted.is_empty(),
         drifted,
     })
@@ -228,9 +249,12 @@ fn select_binary_mode<R: DriftRemote>(remote: &mut R) -> Result<(), DriftError> 
 fn check_target<R: DriftRemote>(
     remote: &mut R,
     target: &DriftTarget,
+    expected_blob_id: Option<&str>,
     resolved: &ResolvedRef,
 ) -> Result<Option<DriftedFile>, DriftError> {
-    let expected = expected_copy(resolved, &target.repo_path)?;
+    let expected = expected_blob_id
+        .map(|blob_id| read_expected_blob(resolved, &target.repo_path, blob_id))
+        .transpose()?;
     let server = download_server_copy(remote, target)?;
     let reason = classify(server.as_deref(), expected.as_deref(), &target.upload_bytes);
     Ok(reason.map(|reason| DriftedFile {
@@ -263,12 +287,13 @@ fn classify(server: Option<&[u8]>, expected: Option<&[u8]>, upload: &[u8]) -> Op
     }
 }
 
-/// The file's content at `expect_ref`, or `None` when the path does not exist there.
-fn expected_copy(resolved: &ResolvedRef, repo_path: &str) -> Result<Option<Vec<u8>>, DriftError> {
-    let Some(blob_id) = expected_blob_id(resolved, repo_path)? else {
-        return Ok(None);
-    };
-    let output = run_git(&resolved.repo_root, &["cat-file", "blob", blob_id.as_str()])?;
+/// The content of `repo_path` at `expect_ref`, read by its blob ID.
+fn read_expected_blob(
+    resolved: &ResolvedRef,
+    repo_path: &str,
+    blob_id: &str,
+) -> Result<Vec<u8>, DriftError> {
+    let output = run_git(&resolved.repo_root, &["cat-file", "blob", blob_id])?;
     if !output.status.success() {
         return Err(DriftError::Other(anyhow::anyhow!(
             "git cat-file failed for {repo_path} at {}: {}",
@@ -276,7 +301,7 @@ fn expected_copy(resolved: &ResolvedRef, repo_path: &str) -> Result<Option<Vec<u
             stderr_text(&output)
         )));
     }
-    Ok(Some(output.stdout))
+    Ok(output.stdout)
 }
 
 /// The blob ID of the regular file at `repo_path` in the resolved commit, `None` when the path
@@ -582,15 +607,27 @@ pub(crate) mod tests {
             not_regular.push("link.txt");
         }
         for repo_path in not_regular {
-            let targets = [target("/site/x", repo_path, b"upload")];
+            let targets = vec![target("/site/x", repo_path, b"upload")];
 
-            let message = expect_invalid_args(validate_expected_paths(&resolved, &targets));
+            let message = expect_invalid_args(validate_expected_paths(&resolved, targets));
             assert!(message.contains(repo_path), "{message}");
-            let mut remote = FakeRemote::default();
-            expect_invalid_args(check_drift(&mut remote, &targets, &resolved));
         }
-        validate_expected_paths(&resolved, &[target("/site/x", "target.txt", b"upload")])
+        validate_expected_paths(&resolved, vec![target("/site/x", "target.txt", b"upload")])
             .expect("a regular file is accepted");
+    }
+
+    /// The content `check_drift` compares with for `repo_path`, or `None` when it has no entry.
+    fn expected_copy(
+        resolved: &ResolvedRef,
+        repo_path: &str,
+    ) -> Result<Option<Vec<u8>>, DriftError> {
+        expected_blob_id(resolved, repo_path)?
+            .map(|blob_id| read_expected_blob(resolved, repo_path, &blob_id))
+            .transpose()
+    }
+
+    fn validated(resolved: &ResolvedRef, targets: Vec<DriftTarget>) -> ValidatedTargets {
+        validate_expected_paths(resolved, targets).expect("targets should validate")
     }
 
     #[test]
@@ -689,7 +726,7 @@ pub(crate) mod tests {
 
             let check = check_drift(
                 &mut remote,
-                &[target("/site/file", repo_path, upload)],
+                &validated(&resolved, vec![target("/site/file", repo_path, upload)]),
                 &resolved,
             )
             .expect("the drift check should complete");
@@ -720,11 +757,14 @@ pub(crate) mod tests {
         remote
             .files
             .insert("/root/c.txt".to_string(), b"edited c\n".to_vec());
-        let targets = [
-            target("/root/c.txt", "c.txt", b"new c\n"),
-            target("/root/a.txt", "a.txt", b"new a\n"),
-            target("/root/b.txt", "b.txt", b"new b\n"),
-        ];
+        let targets = validated(
+            &resolved,
+            vec![
+                target("/root/c.txt", "c.txt", b"new c\n"),
+                target("/root/a.txt", "a.txt", b"new a\n"),
+                target("/root/b.txt", "b.txt", b"new b\n"),
+            ],
+        );
 
         let check =
             check_drift(&mut remote, &targets, &resolved).expect("the drift check should complete");
@@ -746,6 +786,30 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn drift_check_compares_with_the_blob_validation_found() {
+        let (repo, resolved) = repository_with_a_txt();
+        repo.write("other.txt", b"other\n");
+        let other_commit = repo.commit_all("other");
+        let other_blob = repo.git_text(&["rev-parse", &format!("{other_commit}:other.txt")]);
+        let mut remote = FakeRemote::default();
+        remote
+            .files
+            .insert("/r/a.txt".to_string(), b"other\n".to_vec());
+        let validated = ValidatedTargets {
+            targets: vec![target("/r/a.txt", "a.txt", b"upload\n")],
+            expected_blob_ids: vec![Some(other_blob)],
+        };
+
+        let check = check_drift(&mut remote, &validated, &resolved)
+            .expect("the drift check should complete");
+
+        assert!(
+            check.drifted.is_empty(),
+            "the server copy equals the validated blob, so it is clean: {check:?}"
+        );
+    }
+
     /// A repository whose one commit holds `a.txt`, resolved at HEAD. Keep the repository alive
     /// while the resolved ref is in use.
     fn repository_with_a_txt() -> (TestRepo, ResolvedRef) {
@@ -763,7 +827,7 @@ pub(crate) mod tests {
 
         check_drift(
             &mut remote,
-            &[target("/r/a.txt", "a.txt", b"a\n")],
+            &validated(&resolved, vec![target("/r/a.txt", "a.txt", b"a\n")]),
             &resolved,
         )
         .expect("the drift check should complete");
@@ -781,7 +845,7 @@ pub(crate) mod tests {
 
         let error = check_drift(
             &mut remote,
-            &[target("/r/a.txt", "a.txt", b"a\n")],
+            &validated(&resolved, vec![target("/r/a.txt", "a.txt", b"a\n")]),
             &resolved,
         )
         .expect_err("a failed binary mode must fail the check");
@@ -821,11 +885,14 @@ pub(crate) mod tests {
             remote
                 .failures
                 .insert("/r/two.txt".to_string(), failure.clone());
-            let targets = [
-                target("/r/one.txt", "one.txt", b"upload\n"),
-                target("/r/two.txt", "two.txt", b"upload\n"),
-                target("/r/three.txt", "three.txt", b"upload\n"),
-            ];
+            let targets = validated(
+                &resolved,
+                vec![
+                    target("/r/one.txt", "one.txt", b"upload\n"),
+                    target("/r/two.txt", "two.txt", b"upload\n"),
+                    target("/r/three.txt", "three.txt", b"upload\n"),
+                ],
+            );
 
             let error = check_drift(&mut remote, &targets, &resolved)
                 .expect_err("a download failure must fail the whole check");

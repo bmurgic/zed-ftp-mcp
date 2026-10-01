@@ -426,7 +426,10 @@ mod tests {
     };
     use crate::deploy::{deploy, upload_file, UploadFileRequest};
     use crate::drift::tests::TestRepo;
-    use crate::drift::{check_drift, resolve_expect_ref, DriftReason, DriftTarget, DriftedFile};
+    use crate::drift::{
+        check_drift, resolve_expect_ref, validate_expected_paths, DriftReason, DriftTarget,
+        DriftedFile,
+    };
     use std::io::{self, BufRead, BufReader, Read, Write};
     use std::net::AddrParseError;
     use std::net::{TcpListener, TcpStream};
@@ -1530,6 +1533,8 @@ mod tests {
             upload_bytes: upload.to_vec(),
         })
         .collect();
+        let targets =
+            validate_expected_paths(&resolved, targets).expect("the targets should validate");
         clear_commands(&commands);
 
         let check = check_drift(&mut client, &targets, &resolved)
