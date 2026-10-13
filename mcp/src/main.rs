@@ -183,13 +183,16 @@ fn list_profiles() -> Result<()> {
         return Ok(());
     }
     for (name, p) in &cfg.profiles {
-        let has_pw = config::has_password(name).unwrap_or(false);
+        let pw = match config::has_password(name) {
+            Ok(true) => "stored".to_string(),
+            Ok(false) => "MISSING".to_string(),
+            Err(e) => format!("UNREADABLE ({e})"),
+        };
         println!(
             "{name:<20} {host}:{port:<5} user={user} pw={pw}",
             host = p.host,
             port = p.port,
             user = p.user,
-            pw = if has_pw { "stored" } else { "MISSING" },
         );
     }
     Ok(())
